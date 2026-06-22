@@ -1,0 +1,121 @@
+name: Sync Godot extension_api.json
+
+# Godot-sync watcher (Phase 0, Workstream E.3 / GODOT-SYNC.md).
+#
+# Resolves the latest Godot stable tag, fetches extension_api.json from
+# godot-cpp at the matching tag, and — if it changed against the vendored copy —
+# vendors it, runs `cargo xtask codegen-api`, and opens/updates a PR with
+# base: master.
+#
+# CAVEATS (load-bearing GitHub Actions behaviour):
+#   - `schedule` runs ONLY on the latest commit of the DEFAULT branch, has a
+#     5-minute minimum, is delayed under load (hence cron at :17, off-peak),
+#     and is AUTO-DISABLED after 60 days of repo inactivity (a commit re-enables
+#     it; `workflow_dispatch` always works).
+#   - Requires repo setting: Settings -> Actions -> General ->
+#     "Allow GitHub Actions to create and approve pull requests."
+#   - PRs opened by the default GITHUB_TOKEN do NOT trigger downstream CI. If the
+#     sync PR must run CI, swap `token:` for a PAT / GitHub App token
+#     (e.g. secrets.GODOT_SYNC_TOKEN).
+on:
+  schedule:
+    - cron: '17 6 * * *' # daily 06:17 UTC (off-peak)
+  workflow_dispatch:
+    inputs:
+      godot_tag:
+        description: 'Override Godot tag (e.g. 4.4.1-stable). Empty = latest stable.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: godot-api-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: sync
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve latest stable Godot tag # PIPELINE STEP 1 (detect)
+        id: godot
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.godot_tag }}" ]; then
+            TAG="${{ inputs.godot_tag }}"
+          else
+            TAG="$(gh release list -R godotengine/godot --exclude-pre-releases --exclude-drafts \
+                     --limit 1 --json tagName --jq '.[0].tagName')"
+          fi
+          echo "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?-stable$' \
+            || { echo "::error::bad tag $TAG"; exit 1; }
+          VER="${TAG%-stable}"
+          MINOR="$(echo "$VER" | cut -d. -f1,2)"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "ver=$VER"     >> "$GITHUB_OUTPUT"
+          echo "minor=$MINOR" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream extension_api.json (godot-cpp @ tag) # PIPELINE STEP 2 (obtain)
+        run: |
+          set -euo pipefail
+          VER="${{ steps.godot.outputs.ver }}"
+          # NOTE: godot-cpp tags are PREFIXED with `godot-`.
+          curl -fsSL \
+            "https://raw.githubusercontent.com/godotengine/godot-cpp/godot-${VER}-stable/gdextension/extension_api.json" \
+            -o new_extension_api.json
+          # Fallback (B): download the matching Godot editor release binary and run
+          #   ./Godot --headless --dump-extension-api --dump-extension-api-with-docs
+          # (use when godot-cpp lags the tag or for doc XML the JSON omits).
+
+      - name: Diff, vendor, regenerate # PIPELINE STEPS 3-4 (diff + regenerate)
+        id: diff
+        run: |
+          set -euo pipefail
+          VER="${{ steps.godot.outputs.ver }}"
+          DEST="vendor/godot/${VER}-stable"
+          if [ -f "${DEST}/extension_api.json" ] \
+             && cmp -s new_extension_api.json "${DEST}/extension_api.json"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No change vs vendored ${VER}-stable."
+            exit 0
+          fi
+          mkdir -p "${DEST}"
+          cp new_extension_api.json "${DEST}/extension_api.json"
+          # Regenerate the gdscript-api data artifact from the newest vendored JSON.
+          cargo xtask codegen-api
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open / update PR # PIPELINE STEP 6 (surface)
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # Default GITHUB_TOKEN works to open the PR but won't trigger CI on it;
+          # swap for a PAT/App token (secrets.GODOT_SYNC_TOKEN) if CI must run.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: master
+          branch: chore/godot-api-sync # stable branch => idempotent (updates existing PR)
+          delete-branch: false
+          commit-message: 'chore(api): sync to Godot ${{ steps.godot.outputs.tag }}'
+          title: 'chore(api): sync to Godot ${{ steps.godot.outputs.tag }}'
+          body: |
+            Automated sync to **Godot ${{ steps.godot.outputs.tag }}**
+            (source: godot-cpp @ `godot-${{ steps.godot.outputs.ver }}-stable`).
+
+            - Vendored `vendor/godot/${{ steps.godot.outputs.ver }}-stable/extension_api.json`
+            - Ran `cargo xtask codegen-api`
+
+            See `plans/GODOT-SYNC.md` for the full delta/triage process.
+          labels: |
+            dependencies
+            godot-sync

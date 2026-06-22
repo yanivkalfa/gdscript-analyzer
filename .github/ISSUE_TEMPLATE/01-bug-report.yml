@@ -1,0 +1,84 @@
+name: Bug report
+description: A wrong diagnostic, hover, completion, crash, or other incorrect behavior.
+title: "bug: "
+labels: ["C-bug", "S-needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. A minimal GDScript snippet that reproduces the
+        problem is the single most useful thing you can provide.
+  - type: textarea
+    id: snippet
+    attributes:
+      label: GDScript snippet
+      description: Minimal `.gd` code that reproduces the issue.
+      render: gdscript
+      placeholder: |
+        extends Node
+
+        func _ready() -> void:
+            var x: int = "oops"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected diagnostic / behavior
+      description: What should the analyzer report or do?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual diagnostic / behavior
+      description: What does it actually report or do? Include the exact message and span if any.
+    validations:
+      required: true
+  - type: input
+    id: godot-version
+    attributes:
+      label: Godot version
+      description: The Godot version the project targets (e.g. 4.4.1-stable).
+      placeholder: "4.4.1-stable"
+    validations:
+      required: true
+  - type: input
+    id: analyzer-version
+    attributes:
+      label: Analyzer version
+      description: gdscript-analyzer crate / npm / LSP version (or git commit).
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: consumed-via
+    attributes:
+      label: Consumed via
+      description: How are you using the analyzer?
+      options:
+        - Rust crate (crates.io)
+        - npm package (@gdscript-analyzer/*)
+        - LSP server
+        - wasm / browser
+        - Other / unsure
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Logs, screenshots, or anything else relevant.
+    validations:
+      required: false

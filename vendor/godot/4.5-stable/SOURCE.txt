@@ -1,0 +1,19 @@
+source:        godotengine/godot-cpp @ tag `godot-4.5-stable`
+file:           gdextension/extension_api.json
+url:            https://raw.githubusercontent.com/godotengine/godot-cpp/godot-4.5-stable/gdextension/extension_api.json
+godot_version:  4.5.0-stable  (header.version_full_name = "Godot Engine v4.5.stable.official")
+precision:      single (float_32 / float_64 build configs present)
+size:           6,581,513 bytes
+fetched:        2026-06-22
+
+notes:
+  - godot-cpp's latest *stable tag* is 4.5 at fetch time, while the engine's latest
+    stable release is 4.7. This lag is expected; per GODOT-SYNC.md the binary
+    `godot --headless --dump-extension-api` fallback covers engine releases newer than
+    godot-cpp's tagged JSON until godot-cpp catches up.
+  - doc/classes/*.xml (the BBCode hover source) is intentionally NOT vendored in Phase 0.
+    Hover is a Phase 2 feature; vendoring ~1000 XML files now would bloat the repo with
+    data nothing yet consumes. The empty doc/classes/ dir marks where it will land.
+  - This is the FIRST bundled Godot API version. Multi-version bundling + the automated
+    sync pipeline that adds future versions are specified in GODOT-SYNC.md.
+  - License: Godot is MIT/Expat; this file is MIT-derived Godot output. See THIRD-PARTY-NOTICES.md.

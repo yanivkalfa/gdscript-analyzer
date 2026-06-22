@@ -1,0 +1,60 @@
+# Virtual workspace manifest for gdscript-analyzer (no root [package]).
+# See plans/01-ARCHITECTURE.md §1/§8 and plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md §A.2.
+
+[workspace]
+resolver = "3"
+members = ["crates/*", "bindings/wasm", "xtask"]
+
+# Shared metadata inherited by every crate via `*.workspace = true`.
+[workspace.package]
+version = "0.1.0" # single shared version across crates.io + npm
+edition = "2024"
+rust-version = "1.88.0" # MSRV = napi-rs v3 floor (asserted by the `msrv` CI job)
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yanivkalfa/gdscript-analyzer"
+homepage = "https://github.com/yanivkalfa/gdscript-analyzer"
+authors = ["Yaniv Kalfa <yanivkalfa@gmail.com>"]
+categories = ["development-tools", "parser-implementations"]
+keywords = ["gdscript", "godot", "analyzer", "lsp", "language-server"]
+
+# Single source of truth for dependency versions; crates opt in with `{ workspace = true }`.
+[workspace.dependencies]
+# Internal crates (path + version so they publish correctly).
+gdscript-base = { path = "crates/gdscript-base", version = "0.1.0" }
+gdscript-syntax = { path = "crates/gdscript-syntax", version = "0.1.0" }
+gdscript-api = { path = "crates/gdscript-api", version = "0.1.0" }
+gdscript-db = { path = "crates/gdscript-db", version = "0.1.0" }
+gdscript-hir = { path = "crates/gdscript-hir", version = "0.1.0" }
+gdscript-ide = { path = "crates/gdscript-ide", version = "0.1.0" }
+gdscript-scene = { path = "crates/gdscript-scene", version = "0.1.0" }
+# Third-party (pinned centrally; actual use grows in later phases).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# Lints applied workspace-wide; each crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "warn" # ffi/wasm crates locally `#![allow(unsafe_code)]` when they wire napi/wasm
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pragmatic opt-outs (documented rationale: noise vs. value for this codebase).
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+# ---- profiles ----
+[profile.release]
+lto = true
+codegen-units = 1
+
+# A dedicated size-optimized profile for the wasm artifacts (plans/research/08 §4).
+# Build wasm with `--profile wasm-release`; keep `release` fast for the native LSP/CLI.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z" # measure "z" vs "s" per artifact in Phase 5
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
