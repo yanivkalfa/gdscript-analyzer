@@ -25,7 +25,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain (rustfmt)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain (clippy)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,7 +55,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -66,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pin to the declared MSRV (napi-rs v3 floor); the whole workspace must
       # build on this toolchain.
       - name: Install MSRV toolchain
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain (+ wasm target)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -102,7 +102,7 @@ jobs:
     # Non-blocking at Phase 0 (no real code yet) but wired so it grows.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain (llvm-tools)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -127,7 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
