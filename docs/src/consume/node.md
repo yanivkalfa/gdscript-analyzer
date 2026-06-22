@@ -1,7 +1,7 @@
 # Consuming from Node
 
 > **Status:** the binding structure exists as an empty stub in Phase 0; the
-> real surface is wired in **Phase 1+** ([`plans/ROADMAP.md`](../../../plans/ROADMAP.md)).
+> real surface is wired in **Phase 1+** ([`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md)).
 
 Node consumers install the napi-rs native addon:
 
@@ -59,4 +59,4 @@ where you don't need an incremental cache.
 The core emits **byte offsets**. LSP uses **UTF-16** code units. The binding
 glue ships a byte→UTF-16 converter (backed by `gdscript-base`'s `LineIndex`) —
 do the conversion at the boundary, not in your application code. This is
-discussed in [`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §4.
+discussed in [`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §4.

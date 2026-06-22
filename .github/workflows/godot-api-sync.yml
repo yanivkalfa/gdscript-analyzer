@@ -14,9 +14,10 @@ name: Sync Godot extension_api.json
 #     it; `workflow_dispatch` always works).
 #   - Requires repo setting: Settings -> Actions -> General ->
 #     "Allow GitHub Actions to create and approve pull requests."
-#   - PRs opened by the default GITHUB_TOKEN do NOT trigger downstream CI. If the
-#     sync PR must run CI, swap `token:` for a PAT / GitHub App token
-#     (e.g. secrets.GODOT_SYNC_TOKEN).
+#   - PRs opened by the default GITHUB_TOKEN do NOT trigger downstream CI, so this
+#     workflow opens the PR with a PAT (secrets.GODOT_SYNC_TOKEN) — that makes the
+#     required CI checks run on it (the branch ruleset would otherwise leave a
+#     GITHUB_TOKEN-opened PR unmergeable). Falls back to GITHUB_TOKEN if unset.
 on:
   schedule:
     - cron: '17 6 * * *' # daily 06:17 UTC (off-peak)
@@ -100,9 +101,11 @@ jobs:
         if: steps.diff.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          # Default GITHUB_TOKEN works to open the PR but won't trigger CI on it;
-          # swap for a PAT/App token (secrets.GODOT_SYNC_TOKEN) if CI must run.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Use a PAT (GODOT_SYNC_TOKEN) so the sync PR is created by a real identity
+          # and therefore TRIGGERS the required CI checks. The default GITHUB_TOKEN
+          # would open the PR but suppress its CI, leaving it unmergeable under the
+          # branch ruleset. Falls back to GITHUB_TOKEN if the secret is unset.
+          token: ${{ secrets.GODOT_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
           base: master
           branch: chore/godot-api-sync # stable branch => idempotent (updates existing PR)
           delete-branch: false

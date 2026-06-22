@@ -1,7 +1,7 @@
 # Build & test
 
 The exact commands a brand-new contributor runs. These mirror Workstream G of
-[`plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md`](../../../plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md)
+[`plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md)
 and the `CONTRIBUTING.md` at the repo root.
 
 ## 0. Prerequisites
@@ -94,7 +94,7 @@ mdbook serve docs        # http://localhost:3000
 - [ ] `cargo xtask dist` builds the napi + wasm stubs.
 - [ ] `mdbook serve docs` renders this guide.
 - [ ] You have read [Architecture](./architecture.md),
-      [`plans/ROADMAP.md`](../../../plans/ROADMAP.md), and the
+      [`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md), and the
       [ADRs](../adr/README.md).
 
 ## Conventions

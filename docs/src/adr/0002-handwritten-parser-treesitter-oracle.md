@@ -10,7 +10,7 @@ including comments and whitespace, recoverable from the tree), error-recovering
 (an IDE parses broken code on every keystroke), and able to produce precise
 diagnostics. GDScript adds a specific hazard — Python-like **significant
 indentation** — that must be handled deliberately. See
-[`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §6 and the
+[`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §6 and the
 parsing-strategy research it cites.
 
 There is an existing grammar, **tree-sitter-gdscript** (MIT, mature, with Rust

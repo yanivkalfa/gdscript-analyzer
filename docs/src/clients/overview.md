@@ -2,7 +2,7 @@
 
 > **Status: forthcoming.** A standalone LSP server (`gdscript-lsp`) and the
 > editor setup matrix land in **Phase 5**
-> ([`plans/ROADMAP.md`](../../../plans/ROADMAP.md)). This page is the seed for
+> ([`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md)). This page is the seed for
 > the "add an LSP client" guide and will grow as the server matures — modeled on
 > rust-analyzer's "Other Editors" documentation.
 
@@ -49,5 +49,5 @@ deliberately stays out of:
 - **Re-issuing cancelled reads.** A concurrent edit cancels in-flight queries;
   the client re-issues.
 
-See [`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §2 for the
+See [`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §2 for the
 full contract.
