@@ -24,7 +24,7 @@ the layers above them. The authoritative version is in
 
 ## Dependency direction
 
-```
+```text
 base ◀── syntax ◀── db ◀── hir ◀── ide ◀── ffi ◀── (bindings: node, wasm)
   ▲         ▲       ▲       ▲       ▲  ◀── lsp
   └── api ──┘───────┘───────┘       └── cli
