@@ -2,7 +2,7 @@
 
 > **Status:** the wasm binding is an empty stub in Phase 0; the real surface is
 > wired in **Phase 1+**, and the published web playground lands in **Phase 5**
-> ([`plans/ROADMAP.md`](../../../plans/ROADMAP.md)).
+> ([`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md)).
 
 For in-page analysis — web playgrounds, browser-based editors (Monaco /
 CodeMirror), or any client that can't load a native addon — there is a
@@ -21,7 +21,7 @@ kept for cases where we want a smaller artifact with no `SharedArrayBuffer` /
 COOP-COEP requirement (the approach Biome and Ruff take). The choice between the
 two is made per measured bundle size in Phase 5. See
 [ADR-0003](../adr/0003-napi-rs-v3-dual-target.md) and
-[`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §4.
+[`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §4.
 
 ## The shape across the boundary (forthcoming)
 
@@ -55,4 +55,4 @@ The core crates must compile to `wasm32` — no `std::fs`, no
 `Instant::now()`/`SystemTime::now()`, no threads in the hot path, and
 `getrandom`'s JS backend only in the wasm binding. CI runs
 `cargo check -p gdscript-ide --target wasm32-unknown-unknown` on every PR. The
-full rules are in [`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §7.
+full rules are in [`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §7.

@@ -19,7 +19,7 @@ different constraints:
 The naive approach is to write and maintain **two separate bindings** (a napi
 addon and a wasm-bindgen module), duplicating the FFI surface and its
 serialization glue. That doubles maintenance and invites the two surfaces to
-drift. See [`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §4 and
+drift. See [`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §4 and
 the WASM/bindings research it cites.
 
 A key enabling fact: **napi-rs v3 can compile the same binding source to both a

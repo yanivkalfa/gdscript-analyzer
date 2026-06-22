@@ -22,7 +22,7 @@ toolchain such as guitkx — each map those neutral results onto their own
 protocol. This is rust-analyzer's discipline: the `ide` crate "knows nothing
 about LSP"; only a thin server crate does. See
 [ADR-0001](adr/0001-rust-library-not-server.md) and
-[`plans/00-VISION-AND-SCOPE.md`](../../plans/00-VISION-AND-SCOPE.md).
+[`plans/00-VISION-AND-SCOPE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/00-VISION-AND-SCOPE.md).
 
 ## Who consumes it
 
@@ -45,7 +45,7 @@ editor and talk to its built-in LSP over TCP. Every other tool in the space is
 either syntactic-only, Python/.NET-locked, or editor-bound. The empty
 quadrant — **semantic-grade + engine-independent + Rust→multi-target +
 library-first** — is exactly what this project fills. The full landscape
-analysis is in [`plans/00-VISION-AND-SCOPE.md`](../../plans/00-VISION-AND-SCOPE.md).
+analysis is in [`plans/00-VISION-AND-SCOPE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/00-VISION-AND-SCOPE.md).
 
 ## Project status — Phase 0
 
@@ -57,8 +57,8 @@ the build/release machinery, and this documentation scaffold.
 
 The analysis APIs sketched throughout these docs **land in Phase 1 and later**
 and are marked as forthcoming where relevant. For the full sequencing, see
-[`plans/ROADMAP.md`](../../plans/ROADMAP.md); for the foundation work itself,
-[`plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md`](../../plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md).
+[`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md); for the foundation work itself,
+[`plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md).
 
 ## Next steps
 

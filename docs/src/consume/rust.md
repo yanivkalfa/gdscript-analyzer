@@ -1,7 +1,7 @@
 # Consuming from Rust
 
 > **Status:** the API surface is fixed here; the implementation lands in
-> **Phase 1+** ([`plans/ROADMAP.md`](../../../plans/ROADMAP.md)).
+> **Phase 1+** ([`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md)).
 
 Native Rust consumers depend on a single crate, **`gdscript-ide`**:
 
@@ -55,7 +55,7 @@ analysis.format(file)?;             // Option<SourceChange>
 - **Inputs are injected.** The host owns a virtual file system; you push text
   via `apply_change`. The library **never** touches `std::fs` — this is what
   keeps it portable to WASM (see [the portability rules in
-  `plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §7).
+  `plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §7).
 - **Outputs are POD.** A `Diagnostic` carries a byte `TextRange`, a code
   (e.g. `GDSCRIPT_UNSAFE_CALL`), a severity, a message, and optional fixes —
   never an `lsp_types::Diagnostic`. You convert at your boundary.

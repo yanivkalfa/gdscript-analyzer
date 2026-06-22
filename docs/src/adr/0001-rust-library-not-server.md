@@ -10,7 +10,7 @@ intelligence without a running Godot editor. Godot's built-in LSP requires the
 editor process and a TCP connection (`:6005`); every other tool in the space is
 syntactic-only, runtime-locked (Python, .NET), or otherwise editor-bound. The
 landscape analysis in
-[`plans/00-VISION-AND-SCOPE.md`](../../../plans/00-VISION-AND-SCOPE.md) §2 found
+[`plans/00-VISION-AND-SCOPE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/00-VISION-AND-SCOPE.md) §2 found
 exactly one empty quadrant: **semantic-grade + engine-independent +
 multi-target + library-first.** Filling it requires two foundational choices.
 
@@ -47,7 +47,7 @@ library — not as an LSP server.**
   web playground, the guitkx adapter — each map our neutral results onto their
   own protocol. The LSP server is *just one client*, not the core.
 
-See [`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §1–2.
+See [`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §1–2.
 
 ## Consequences
 

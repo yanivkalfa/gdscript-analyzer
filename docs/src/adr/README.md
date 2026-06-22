@@ -34,5 +34,5 @@ violate an invariant without knowing it was deliberate.
    `Deprecated` or `Superseded by ADR-NNNN`. ADRs are **append-only**: you don't
    rewrite history, you supersede it with a new record that links back.
 4. **Source.** The three seeded ADRs distill decisions already settled in
-   [`plans/00-VISION-AND-SCOPE.md`](../../../plans/00-VISION-AND-SCOPE.md) and
-   [`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md).
+   [`plans/00-VISION-AND-SCOPE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/00-VISION-AND-SCOPE.md) and
+   [`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md).

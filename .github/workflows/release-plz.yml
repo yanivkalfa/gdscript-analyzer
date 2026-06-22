@@ -10,8 +10,13 @@ name: release-plz
 # (.changeset/*) and the release-napi / release-wasm workflows; release-plz has
 # no package.json awareness. The §D.2 version-sync step bridges the two.
 on:
-  push:
-    branches: [master]
+  # Phase 0: MANUAL-ONLY (dormant). Publishing isn't set up yet, so auto-running
+  # on master only produces red noise. Before Phase 5, restore the
+  # `push: branches: [master]` trigger AND: (a) configure crates.io Trusted
+  # Publishing (OIDC), (b) pin release-plz/action to a valid version -- the `@v0`
+  # major tag below does NOT exist (use e.g. @v0.5.x), (c) wire GODOT_SYNC_TOKEN
+  # for the Release PR so its required CI checks run.
+  workflow_dispatch:
 
 permissions:
   contents: write
