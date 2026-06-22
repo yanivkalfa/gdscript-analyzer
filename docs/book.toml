@@ -12,12 +12,10 @@ authors     = ["Yaniv Kalfa <yanivkalfa@gmail.com>"]
 language    = "en"
 src         = "src"
 
-[rust]
-edition = "2024"
-
 [output.html]
 git-repository-url      = "https://github.com/yanivkalfa/gdscript-analyzer"
-git-repository-icon     = "fa-github"
+# git-repository-icon omitted: mdbook supplies the correct default GitHub icon.
+# (mdbook 0.5's Font Awesome 6 helper mis-parses an explicit "fa-…" value.)
 edit-url-template       = "https://github.com/yanivkalfa/gdscript-analyzer/edit/master/docs/{path}"
 default-theme           = "rust"
 preferred-dark-theme    = "ayu"
