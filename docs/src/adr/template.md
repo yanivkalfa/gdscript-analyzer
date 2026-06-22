@@ -1,4 +1,4 @@
-# ADR-NNNN: <short decision title>
+# ADR-NNNN: short decision title
 
 - **Status:** Proposed | Accepted | Deprecated | Superseded by ADR-NNNN
 - **Date:** YYYY-MM-DD
