@@ -1,0 +1,81 @@
+# cargo-deny — license, advisory, ban, and source policy for the workspace.
+#
+# Enforced in CI (`cargo deny check`) and via `cargo xtask ci`. Schema: the
+# cargo-deny v2 layout (cargo-deny >= 0.14; current keys for >= 0.16). See
+# plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md §F.6 and the portability rules in
+# plans/01-ARCHITECTURE.md §7.
+
+# ---------------------------------------------------------------------------
+# Licenses — only permissive, SPDX-clear licenses are allowed. The workspace
+# itself is `MIT OR Apache-2.0`; this list covers what the Rust dependency tree
+# commonly pulls in (the Rust core ecosystem is overwhelmingly MIT/Apache-2.0).
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+# Fail if a crate's license can't be determined to this confidence.
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+# No blanket exceptions yet; add per-crate `{ allow = [...], name = "..." }`
+# entries here with a recorded rationale if a dependency ever needs one.
+exceptions = []
+
+# ---------------------------------------------------------------------------
+# Advisories — RustSec database. Yanked crates are hard-denied so a pulled
+# release can't silently stay in the lockfile.
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+yanked  = "deny"
+# `vulnerability` / `unmaintained` / `unsound` severities default to "deny"
+# under the v2 schema, so they are intentionally omitted here. Add a narrowly
+# scoped `ignore = ["RUSTSEC-XXXX-YYYY"]` entry (with a justification) only when
+# a specific advisory is reviewed and accepted.
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Bans — duplicate versions are a warning (noise, not a hard failure, early on);
+# deny crates known to be wasm-hostile or unmaintained (portability rules,
+# 01-ARCHITECTURE.md §7).
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards         = "warn"
+# Prefer the highest semver-compatible version when several match.
+highlight = "all"
+
+# Crates we never want pulled in. `wee_alloc` is unmaintained (01 §7.6);
+# `openssl`/`openssl-sys` would break the wasm + cross-compile story (use
+# rustls). Extend this list as wasm-hostile deps are identified at the PR that
+# would introduce them.
+deny = [
+    { crate = "wee_alloc" },
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+]
+allow = []
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources — only crates.io and first-party GitHub are permitted.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+allow-git        = []
+
+[sources.allow-org]
+github = ["yanivkalfa"]

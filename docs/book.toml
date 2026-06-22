@@ -1,0 +1,35 @@
+# mdBook configuration for the gdscript-analyzer guide.
+#
+# Build:   mdbook build docs
+# Serve:   mdbook serve docs        # http://localhost:3000
+# CI runs `mdbook test` (validates Rust samples) + mdbook-linkcheck, then
+# deploys to GitHub Pages. See plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md §F.1.
+
+[book]
+title       = "gdscript-analyzer"
+description = "Roslyn / rust-analyzer for Godot — an engine-independent GDScript static-analysis library."
+authors     = ["Yaniv Kalfa <yanivkalfa@gmail.com>"]
+language    = "en"
+src         = "src"
+
+[rust]
+edition = "2024"
+
+[output.html]
+git-repository-url      = "https://github.com/yanivkalfa/gdscript-analyzer"
+git-repository-icon     = "fa-github"
+edit-url-template       = "https://github.com/yanivkalfa/gdscript-analyzer/edit/master/docs/{path}"
+default-theme           = "rust"
+preferred-dark-theme    = "ayu"
+no-section-label        = false
+
+[output.html.fold]
+enable = true
+level  = 1
+
+# mdbook-linkcheck — fails the docs build on broken intra-book and (optionally)
+# external links. Installed in CI via taiki-e/install-action.
+[output.linkcheck]
+follow-web-links     = false   # keep CI hermetic; flip on for a periodic job
+warning-policy       = "error"
+exclude              = []

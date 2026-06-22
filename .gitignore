@@ -1,0 +1,26 @@
+# Rust
+/target
+**/target
+
+# Node / napi
+**/node_modules
+*.node
+**/pkg/
+/dist
+
+# wasm-pack / wasm-bindgen output
+**/pkg/
+
+# mdBook
+/docs/book
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
+
+# Committed (NOT ignored), listed here as a reminder:
+#   Cargo.lock                      (workspace has binaries)
+#   vendor/godot/**                 (the vendored engine API data)
+#   crates/gdscript-api/src/generated.rs  (generated, but reviewed + committed)
+#   .changeset/*.md                 (changeset intents)

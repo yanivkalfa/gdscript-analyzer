@@ -1,0 +1,70 @@
+# git-cliff — changelog generation from Conventional Commits.
+#
+# Consumed by release-plz (see release-plz.toml `[changelog] path`). Produces a
+# Keep a Changelog 1.1.0 (https://keepachangelog.com/en/1.1.0/) document whose
+# section groupings map Conventional-Commit types onto the Keep-a-Changelog
+# headings (Added / Changed / Fixed / Deprecated / Removed / Security /
+# Documentation). Versioning follows SemVer 2.0.0 (Cargo's 0.x reading).
+#
+# See plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md §D.3.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+(under Cargo's 0.x reading: while `0.x`, a breaking change bumps the minor and a
+new feature is a patch).
+"""
+
+# Per-release body. `unreleased` -> "Unreleased"; otherwise the version tag.
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}\n
+"""
+
+trim = true
+footer = ""
+
+[git]
+conventional_commits  = true
+filter_unconventional = false
+split_commits         = false
+protect_breaking_commits = true
+
+# Map Conventional-Commit types onto Keep-a-Changelog 1.1.0 headings.
+# Order matters: the breaking-change rule sits before the type rules so a
+# `feat!:` / "BREAKING CHANGE" body lands under "Changed", not "Added".
+commit_parsers = [
+  { body = ".*BREAKING CHANGE", group = "Changed" },
+  { message = "^feat",     group = "Added" },
+  { message = "^fix",      group = "Fixed" },
+  { message = "^perf",     group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^docs",     group = "Documentation" },
+  { message = "^deprecat", group = "Deprecated" },
+  { message = "^remove",   group = "Removed" },
+  { message = "^security", group = "Security" },
+  # Housekeeping commits never appear in the changelog.
+  { message = "^chore",    skip = true },
+  { message = "^ci",       skip = true },
+  { message = "^build",    skip = true },
+  { message = "^test",     skip = true },
+]
+
+filter_commits = false
+tag_pattern    = "v[0-9]*"
+topo_order     = false
+sort_commits   = "oldest"

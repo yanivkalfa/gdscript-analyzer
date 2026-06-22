@@ -1,0 +1,19 @@
+[package]
+name = "gdscript-cli"
+description = "CLI for gdscript-analyzer — check / lint / format / symbols for CI and pre-commit (no editor, no Godot)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "gdscript"
+path = "src/main.rs"
+
+[dependencies]
+gdscript-ide = { workspace = true }
+
+[lints]
+workspace = true

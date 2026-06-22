@@ -1,0 +1,23 @@
+# Mirror the workspace MSRV so clippy's version-gated lints match the supported floor.
+msrv = "1.88.0"
+
+# Domain proper nouns that `clippy::doc_markdown` would otherwise flag as missing backticks.
+# `..` keeps clippy's built-in list (GitHub, GitLab, …). Our own Rust type names are still expected
+# to be backticked in docs; this list is only for external/proper-noun vocabulary.
+doc-valid-idents = [
+    "GDScript",
+    "GDExtension",
+    "GDNative",
+    "GDQuest",
+    "NodePath",
+    "StringName",
+    "StyleBox",
+    "StyleBoxFlat",
+    "VBoxContainer",
+    "TextMate",
+    "WebAssembly",
+    "TypeScript",
+    "JavaScript",
+    "rust-analyzer",
+    "..",
+]

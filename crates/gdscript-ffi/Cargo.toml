@@ -1,0 +1,18 @@
+[package]
+name = "gdscript-ffi"
+description = "napi-rs binding surface for gdscript-analyzer — one source for the Node .node addon and the wasm32 target."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+gdscript-ide = { workspace = true }
+
+[lints]
+workspace = true

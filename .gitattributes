@@ -1,0 +1,17 @@
+# Normalize all text to LF in the repository (avoids CRLF churn on Windows checkouts).
+* text=auto eol=lf
+
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.js    text eol=lf
+*.ts    text eol=lf
+*.sh    text eol=lf
+
+# The vendored Godot API dump is large, generated data — keep LF, treat as text but
+# don't let editors/linters reformat it.
+vendor/godot/**/extension_api.json text eol=lf linguist-generated=true
+crates/gdscript-api/src/generated.rs text eol=lf linguist-generated=true
