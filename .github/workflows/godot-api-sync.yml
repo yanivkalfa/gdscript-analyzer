@@ -99,7 +99,7 @@ jobs:
 
       - name: Open / update PR # PIPELINE STEP 6 (surface)
         if: steps.diff.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           # Use a PAT (GODOT_SYNC_TOKEN) so the sync PR is created by a real identity
           # and therefore TRIGGERS the required CI checks. The default GITHUB_TOKEN
