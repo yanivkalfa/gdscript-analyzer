@@ -1,7 +1,7 @@
 # Quickstart
 
 > **Status: forthcoming.** The analysis API lands in **Phase 1+** (see
-> [`plans/ROADMAP.md`](../../../plans/ROADMAP.md)). The sketch below shows the
+> [`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md)). The sketch below shows the
 > *intended shape* of the smallest possible "analyze a `.gd` string" program so
 > the surface is fixed early. It does not compile against the Phase-0 stubs yet.
 
@@ -58,7 +58,7 @@ The same `Analysis` snapshot exposes `completions`, `hover`, `goto_definition`,
 `find_references`, `rename`, `signature_help`, `semantic_tokens`,
 `inlay_hints`, and more — one method per IDE feature, each returning POD. See
 [Consuming from Rust](../consume/rust.md) for the full surface, and
-[`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §2 for the
+[`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §2 for the
 authoritative API sketch.
 
 ## What works today (Phase 0)

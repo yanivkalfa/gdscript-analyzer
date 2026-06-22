@@ -1,7 +1,7 @@
 # Architecture
 
 This page is a short orientation. The **authoritative** technical reference is
-[`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md), which fixes the
+[`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md), which fixes the
 crate layering, the public API shape, the FFI/WASM strategy, the
 incremental-computation plan, the engine data model, and the portability rules.
 Read it before making architecturally consequential changes — and record any
@@ -45,7 +45,7 @@ gdscript-analyzer copies rust-analyzer's proven discipline:
 
 - [Crate layout](./crates.md) — the layer table and dependency edges.
 - [Build & test](./build.md) — the exact onboarding commands.
-- [`plans/ROADMAP.md`](../../../plans/ROADMAP.md) — phase sequencing and exit
+- [`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md) — phase sequencing and exit
   criteria.
-- [`plans/00-VISION-AND-SCOPE.md`](../../../plans/00-VISION-AND-SCOPE.md) — what
+- [`plans/00-VISION-AND-SCOPE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/00-VISION-AND-SCOPE.md) — what
   the project is and isn't.

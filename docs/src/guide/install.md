@@ -3,7 +3,7 @@
 > **Status: Phase 0.** The packages described here are not yet published. The
 > commands below show the intended install story for the `0.x` line; they are
 > documented now so the surface is fixed before the first release. See
-> [`plans/ROADMAP.md`](../../../plans/ROADMAP.md).
+> [`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md).
 
 ## Toolchain (contributors)
 

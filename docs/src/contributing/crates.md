@@ -4,7 +4,7 @@ The workspace is a flat `crates/*` virtual workspace (matklad's "Large Rust
 Workspaces"), with thin `bindings/{node,wasm}` packages and an `xtask/` build
 crate. **Each crate depends only downward** — lower crates know nothing about
 the layers above them. The authoritative version is in
-[`plans/01-ARCHITECTURE.md`](../../../plans/01-ARCHITECTURE.md) §1.
+[`plans/01-ARCHITECTURE.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/01-ARCHITECTURE.md) §1.
 
 ## The layer table
 
@@ -40,7 +40,7 @@ Every crate currently exists as a **stub**: a `lib.rs`/`main.rs` that is (at
 most) a doc comment plus a trivial smoke test, with the correct dependency edges
 and metadata declared in `Cargo.toml`. They compile, lint, test, and (for the
 core crates) pass the wasm portability check — but contain **no domain logic**.
-Features arrive phase by phase per [`plans/ROADMAP.md`](../../../plans/ROADMAP.md).
+Features arrive phase by phase per [`plans/ROADMAP.md`](https://github.com/yanivkalfa/gdscript-analyzer/blob/master/plans/ROADMAP.md).
 
 ## Publishing note
 
