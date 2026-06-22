@@ -1,0 +1,2 @@
+# Feature-scenario fixtures (Phase 2+): source + cursor position → expected completion / hover /
+# diagnostics, used as snapshot tests for the `gdscript-ide` query layer.

@@ -1,0 +1,48 @@
+# release-plz — Rust release engine (crates.io side of the dual-registry flow).
+#
+# Single shared version across the whole workspace (crates.io + npm move in
+# lockstep, starting 0.1.0). release-plz computes the bump from Conventional
+# Commits, runs cargo-semver-checks, writes the changelog (formatting delegated
+# to cliff.toml), tags `v<version>`, and publishes on the Release PR merge.
+#
+# See plans/PHASE-0-ECOSYSTEM-AND-TOOLING.md §D and plans/01-ARCHITECTURE.md §9.
+
+[workspace]
+# All crates share one version and release together.
+allow_dirty        = false        # never release from a dirty tree
+changelog_update   = true         # regenerate CHANGELOG.md from commits
+git_release_enable = true         # create the GitHub Release for the tag
+semver_check       = true         # run cargo-semver-checks before bumping
+pr_branch_prefix   = "release-plz/"
+
+# Keep the npm-only / non-published crates out of the crates.io release.
+# (gdscript-ffi, gdscript-lsp, gdscript-cli, and the bindings carry
+# `publish = false` in their own Cargo.toml until Phase 5; release-plz honours
+# that, so no per-package override is needed here in Phase 0.)
+
+# ---------------------------------------------------------------------------
+# 0.x bump policy (the canonical mapping from plans §D.2):
+#   fix                     -> PATCH
+#   feat                    -> PATCH   (do NOT let `feat` force a 0.x minor)
+#   `!` / BREAKING CHANGE    -> MINOR   (the 0.x "major")
+#
+# release-plz derives the bump from cargo-semver-checks + Conventional Commits
+# and follows Cargo's 0.x SemVer reading, under which a breaking change bumps
+# the leading non-zero (0.x -> 0.(x+1)) and additive `feat` is a patch — which
+# is exactly the mapping we want while < 1.0. We therefore do NOT override the
+# default bump rules here; the default 0.x behaviour already yields feat=patch,
+# breaking=minor. If a future release-plz version flips that default, pin it
+# explicitly via a `[[package]]` override or the relevant `version_*` key:
+#
+#   [[package]]
+#   name = "gdscript-ide"
+#   # (set the explicit 0.x bump override here if the default ever changes)
+#
+# This block is intentionally documented rather than enforced so that the
+# behaviour is captured even though the default already matches.
+# ---------------------------------------------------------------------------
+
+[changelog]
+# Delegate all changelog formatting (Keep-a-Changelog groupings, commit
+# parsers, header) to cliff.toml so git-cliff and release-plz agree.
+path = "cliff.toml"

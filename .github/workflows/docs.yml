@@ -1,0 +1,56 @@
+name: docs
+
+# mdBook guide (Phase 0, Workstream F.1). Build + `mdbook test` (validates Rust
+# samples) + linkcheck on every PR; build AND deploy to GitHub Pages on push to
+# master via the official Pages flow (OIDC, no gh-pages branch).
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdbook + mdbook-linkcheck
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook,mdbook-linkcheck
+      - name: mdbook test
+        run: mdbook test docs
+      - name: mdbook build
+        run: mdbook build docs
+      - name: Upload Pages artifact
+        # Only needed for the deploy job (push to master).
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    name: deploy (GitHub Pages)
+    needs: build
+    # Deploy only on push to master; PRs build (above) but do not deploy.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write # OIDC for the Pages deploy
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

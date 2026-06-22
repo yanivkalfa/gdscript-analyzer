@@ -1,0 +1,7 @@
+# Pin one reproducible toolchain across dev + CI. Bump deliberately (this string is
+# part of the CI cache key). The MSRV (1.88.0) is asserted separately by the `msrv` job.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

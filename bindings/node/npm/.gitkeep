@@ -1,0 +1,2 @@
+# Per-platform npm sub-packages (`@gdscript-analyzer/core-<triple>`) are generated here in Phase 1
+# by `napi create-npm-dirs` and published as `optionalDependencies` of `@gdscript-analyzer/core`.

@@ -1,0 +1,46 @@
+name: Design proposal
+description: An architecturally consequential change (routes to an ADR).
+title: "proposal: "
+labels: ["C-architecture", "S-needs-design"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For decisions that affect the crate layout, public API, data model, FFI/
+        WASM strategy, or other architecture. Accepted proposals land as a
+        numbered ADR (see `docs/adr/`).
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: The forces at play — what makes a decision necessary now?
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Proposed decision
+      description: What do you propose, stated as a clear, testable decision?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other options and why they were rejected.
+    validations:
+      required: true
+  - type: textarea
+    id: consequences
+    attributes:
+      label: Consequences
+      description: What becomes easier or harder? Migration, compatibility, MSRV, wasm portability, etc.
+    validations:
+      required: true
+  - type: input
+    id: affected
+    attributes:
+      label: Affected crates / areas
+      placeholder: "gdscript-ide, gdscript-ffi, bindings/wasm"
+    validations:
+      required: false

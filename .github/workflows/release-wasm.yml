@@ -1,0 +1,46 @@
+name: release-wasm
+
+# wasm npm package build (Phase 0, Workstream C.3).
+#
+# PHASE-0 SKELETON. The wasm fallback crate (`gdscript-wasm` at bindings/wasm)
+# is a bare cdylib stub with NO wasm-bindgen wiring yet (Phase 1). So this is
+# `workflow_dispatch`-only and the build step is a plain
+# `cargo build -p gdscript-wasm --release` placeholder.
+#
+# The build route is decided in Phase 5 by measured bundle size:
+#   Route A (default): reuse the napi crate ->
+#       napi build --target wasm32-wasip1-threads
+#   Route B (fallback): wasm-pack build bindings/wasm --target web
+#       --profile wasm-release  (+ --target bundler / --target nodejs variants),
+#       then wasm-pack pack / publish.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (+ wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # PHASE-0 PLACEHOLDER: build the empty fallback crate. Phase 5 selects
+      # Route A (napi wasm) or Route B (wasm-pack) per measured bundle size.
+      - name: Build (placeholder — Route A/B decided in Phase 5)
+        run: cargo build -p gdscript-wasm --release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg
+          path: target/release/*gdscript_wasm*
+          if-no-files-found: ignore

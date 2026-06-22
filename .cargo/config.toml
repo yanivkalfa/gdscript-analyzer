@@ -1,0 +1,5 @@
+# Cargo aliases for repository automation. See xtask/ and plans/PHASE-0 §A.4/§B.
+[alias]
+xtask = "run --package xtask --"
+# Convenience alias mirroring CI's portability guard (plans/01-ARCHITECTURE.md §7.5).
+wasm-check = "check -p gdscript-ide --target wasm32-unknown-unknown"

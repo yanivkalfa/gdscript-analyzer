@@ -1,0 +1,59 @@
+name: Feature or diagnostic request
+description: Propose a new feature, or a new lint / diagnostic the analyzer should emit.
+title: "feat: "
+labels: ["C-enhancement", "S-needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for new analyzer capabilities or new diagnostics (lints). For
+        larger architectural changes, file a Design proposal instead.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of request
+      options:
+        - New feature (completion, hover, navigation, etc.)
+        - New diagnostic / lint
+        - Improvement to an existing feature or diagnostic
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem does this solve? Who hits it and how often?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the feature or the lint, including when it should fire.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: GDScript example
+      description: Code that should trigger the new behavior, and what the analyzer should report.
+      render: gdscript
+    validations:
+      required: false
+  - type: dropdown
+    id: severity
+    attributes:
+      label: For a diagnostic, suggested severity
+      options:
+        - "n/a (not a diagnostic)"
+        - error
+        - warning
+        - hint / info
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
