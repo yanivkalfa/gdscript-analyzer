@@ -1,0 +1,20 @@
+SourceFile@0..26
+  ClassNameDecl@0..14
+    ClassNameKw@0..10 "class_name"
+    Name@10..14
+      Whitespace@10..11 " "
+      Ident@11..14 "Foo"
+  Newline@14..14 ""
+  VarDecl@14..25
+    NewlinePhys@14..15 "\n"
+    VarKw@15..18 "var"
+    Name@18..20
+      Whitespace@18..19 " "
+      Ident@19..20 "x"
+    Whitespace@20..21 " "
+    ColonEq@21..23 ":="
+    Literal@23..25
+      Whitespace@23..24 " "
+      Int@24..25 "1"
+  Newline@25..25 ""
+  NewlinePhys@25..26 "\n"

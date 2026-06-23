@@ -4,6 +4,22 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "bindings/wasm", "xtask"]
+# The two FFI bindings build on their own targets, not the host: `gdscript-ffi` (napi)
+# needs the @napi-rs/cli to provision `libnode.dll` on Windows, and `gdscript-wasm`
+# targets `wasm32-unknown-unknown` via wasm-pack. Excluding them from default-members
+# keeps plain `cargo build`/`test`/`clippy` green; CI builds them in dedicated jobs.
+default-members = [
+    "crates/gdscript-base",
+    "crates/gdscript-syntax",
+    "crates/gdscript-api",
+    "crates/gdscript-db",
+    "crates/gdscript-hir",
+    "crates/gdscript-ide",
+    "crates/gdscript-scene",
+    "crates/gdscript-lsp",
+    "crates/gdscript-cli",
+    "xtask",
+]
 
 # Shared metadata inherited by every crate via `*.workspace = true`.
 [workspace.package]
@@ -31,6 +47,30 @@ gdscript-scene = { path = "crates/gdscript-scene", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+
+# Phase 1 — parser stack. The core (base/syntax/db/hir/ide) stays wasm-clean; see
+# plans/PHASE-1-IMPLEMENTATION-PLAYBOOK.md §1 for the confirmed pins + rationale.
+cstree = { version = "0.14", features = ["derive"] } # lossless CST (Send+Sync, interned)
+logos = "0.16" # DFA lexer; trivia kept as first-class tokens (never `skip`)
+text-size = "1.1" # TextSize/TextRange POD (also a cstree transitive dep)
+rustc-hash = "2.1" # deterministic FxHashMap — keeps `getrandom` out of the graph
+# FFI — Node addon (napi). Native + wasip1-threads only; never in the wasm32-unknown
+# core gate. napi-build is "2" (the README's "1" is stale — see Playbook §1).
+napi = { version = "3", default-features = true }
+napi-derive = "3"
+napi-build = "2"
+# FFI — browser (wasm-bindgen + wasm-pack --target web). The static-page path.
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+# Differential oracle — native-only, opt-in via the `tree-sitter-oracle` feature.
+# MSRV 1.90 > the workspace's 1.88, so it MUST stay optional + off by default (the
+# MSRV/wasm CI lanes use default features and never build it). Compiles a C parser via
+# `cc`, so it can't target wasm32. See Playbook §1 / §WS5.
+tree-sitter = "0.26"
+tree-sitter-gdscript = "6.1"
+# dev/test
+expect-test = "1.5" # rust-analyzer's golden mechanism (UPDATE_EXPECT=1 to bless)
+proptest = "1.11" # local panic-free robustness harness (in-process; gnu-clean)
 
 # Lints applied workspace-wide; each crate opts in with `[lints] workspace = true`.
 [workspace.lints.rust]

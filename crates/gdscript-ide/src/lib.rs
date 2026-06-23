@@ -1,20 +1,217 @@
 //! `gdscript-ide` — the public, engine-/protocol-neutral analysis API.
 //!
-//! This is the crate external Rust consumers depend on. It exposes `AnalysisHost` (the single
-//! mutable owner; `apply_change`) and immutable, `Send` `Analysis` snapshots whose queries take
-//! byte offsets and return plain, `serde`-serializable result structs — never `lsp-types`. Each
-//! client (the LSP server, the guitkx adapter, the CLI, the WASM playground) maps these POD results
-//! to its own protocol. See `plans/01-ARCHITECTURE.md` §2 and ADR-0001.
+//! Modeled on rust-analyzer's `ide::AnalysisHost` / `ide::Analysis`
+//! (`plans/01-ARCHITECTURE.md` §2). [`AnalysisHost`] is the single mutable owner of the
+//! input world; [`Analysis`] is a cheap, cloneable, `Send` snapshot whose queries take
+//! byte offsets and return plain `serde` result structs from `gdscript-base` — never
+//! `lsp-types`. Each client (LSP server, the guitkx adapter, the CLI, the WASM
+//! playground) maps these POD results to its own protocol.
 //!
-//! Phase 0: empty, compiling stub. **This is the crate the wasm portability guard checks**
-//! (`cargo check -p gdscript-ide --target wasm32-unknown-unknown`), so it must always build for
-//! the browser target — no `std::fs`, no clocks, no threads in the hot path.
+//! Phase 1 (Tier 0) implements four features for real — parse diagnostics, document
+//! symbols, folding ranges, and by-name completion — and stubs the rest. There is no
+//! salsa yet: a plain VFS map and whole-file reparse on query. Every derived
+//! computation is a pure `(text) -> value` function so the Phase-3 salsa swap is
+//! localized. The crate is `wasm32`-safe (CI guards this).
 #![cfg_attr(docsrs, feature(doc_cfg))]
+
+use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
+
+use gdscript_base::{
+    Cancellable, CompletionItem, Diagnostic, DocumentSymbol, FileId, FilePosition, FoldRange,
+};
+
+mod features;
+
+/// The single mutable owner of analysis state — one per project/workspace.
+///
+/// The input world is a virtual file system (`FileId` → UTF-8 text); the host never
+/// reads paths. Clients push text via [`AnalysisHost::apply_change`].
+#[derive(Debug, Clone, Default)]
+pub struct AnalysisHost {
+    files: Arc<FxHashMap<FileId, Arc<str>>>,
+}
+
+/// A batch of input changes. `None` text removes the file.
+#[derive(Debug, Default)]
+pub struct Change {
+    /// Files to add/replace (`Some`) or remove (`None`).
+    pub files: Vec<(FileId, Option<Arc<str>>)>,
+}
+
+impl Change {
+    /// An empty change set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a file add/replace.
+    pub fn change_file(&mut self, file: FileId, text: impl Into<Arc<str>>) {
+        self.files.push((file, Some(text.into())));
+    }
+
+    /// Queue a file removal.
+    pub fn remove_file(&mut self, file: FileId) {
+        self.files.push((file, None));
+    }
+}
+
+impl AnalysisHost {
+    /// A new, empty host.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply a batch of input changes. The **only** mutation entry point.
+    pub fn apply_change(&mut self, change: Change) {
+        let files = Arc::make_mut(&mut self.files);
+        for (id, text) in change.files {
+            match text {
+                Some(t) => {
+                    files.insert(id, t);
+                }
+                None => {
+                    files.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// A cheap, cloneable, `Send` snapshot for read queries.
+    #[must_use]
+    pub fn analysis(&self) -> Analysis {
+        Analysis {
+            files: Arc::clone(&self.files),
+        }
+    }
+}
+
+/// An immutable snapshot of the world. Every query is `Cancellable` (Phase 1 never
+/// actually cancels, but the type is on the surface for the Phase-3 salsa swap).
+#[derive(Debug, Clone)]
+pub struct Analysis {
+    files: Arc<FxHashMap<FileId, Arc<str>>>,
+}
+
+impl Analysis {
+    fn text(&self, file: FileId) -> Option<&str> {
+        self.files.get(&file).map(|t| &**t)
+    }
+
+    // ---- Tier-0 features: real data ----
+
+    /// A pretty-printed dump of the syntax tree (debugging / playground).
+    ///
+    /// # Errors
+    /// Currently infallible; returns `Err(Cancelled)` only once Phase 3 wires real
+    /// cancellation.
+    pub fn syntax_tree(&self, file: FileId) -> Cancellable<Option<String>> {
+        Ok(self
+            .text(file)
+            .map(|t| gdscript_syntax::parse(t).debug_tree()))
+    }
+
+    /// Parse-error diagnostics only (no type/lint diagnostics in Tier 0).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn diagnostics(&self, file: FileId) -> Cancellable<Vec<Diagnostic>> {
+        Ok(self
+            .text(file)
+            .map(features::diagnostics)
+            .unwrap_or_default())
+    }
+
+    /// The document outline (classes, funcs, vars, consts, enums, signals, members).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn document_symbols(&self, file: FileId) -> Cancellable<Vec<DocumentSymbol>> {
+        Ok(self
+            .text(file)
+            .map(features::document_symbols)
+            .unwrap_or_default())
+    }
+
+    /// Foldable ranges (blocks, `#region` pairs, multi-line brackets).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn folding_ranges(&self, file: FileId) -> Cancellable<Vec<FoldRange>> {
+        Ok(self
+            .text(file)
+            .map(features::folding_ranges)
+            .unwrap_or_default())
+    }
+
+    /// By-name completions: keywords, annotations (after `@`), and document-local
+    /// symbol names. No member (`.`) completion in Tier 0 (that needs inference).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn completions(&self, pos: FilePosition) -> Cancellable<Vec<CompletionItem>> {
+        Ok(self
+            .text(pos.file)
+            .map(|t| features::completions(t, pos.offset))
+            .unwrap_or_default())
+    }
+
+    // ---- present on the API surface; Phase-1 returns empty/None ----
+
+    /// Hover (Phase 2).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    #[allow(clippy::unused_self)]
+    pub fn hover(&self, _pos: FilePosition) -> Cancellable<Option<String>> {
+        Ok(None)
+    }
+
+    /// Go-to-definition (Phase 2+).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    #[allow(clippy::unused_self)]
+    pub fn goto_definition(
+        &self,
+        _pos: FilePosition,
+    ) -> Cancellable<Vec<gdscript_base::TextRange>> {
+        Ok(Vec::new())
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn host_with(src: &str) -> (AnalysisHost, FileId) {
+        let mut host = AnalysisHost::new();
+        let file = FileId(0);
+        let mut change = Change::new();
+        change.change_file(file, src);
+        host.apply_change(change);
+        (host, file)
+    }
+
     #[test]
-    fn smoke() {
-        // Phase 0: this crate is an empty, compiling stub.
+    fn snapshot_reads_applied_files() {
+        let (host, file) = host_with("func f():\n\tpass\n");
+        let analysis = host.analysis();
+        let symbols = analysis.document_symbols(file).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "f");
+    }
+
+    #[test]
+    fn removing_a_file_clears_it() {
+        let (mut host, file) = host_with("var x = 1\n");
+        let mut change = Change::new();
+        change.remove_file(file);
+        host.apply_change(change);
+        let analysis = host.analysis();
+        assert!(analysis.document_symbols(file).unwrap().is_empty());
     }
 }

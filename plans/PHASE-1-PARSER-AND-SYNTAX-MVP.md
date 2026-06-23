@@ -1,5 +1,17 @@
 # PHASE 1 — Parser & Syntax MVP (Tier 0)
 
+> **⚠️ Read [`PHASE-1-IMPLEMENTATION-PLAYBOOK.md`](PHASE-1-IMPLEMENTATION-PLAYBOOK.md) first.**
+> That companion doc is the **current-API authority** (mid-2026 crate versions, the
+> resolved napi/wasm-bindgen split, the cstree build recipe, the dependency-ordered
+> build sequence). Where this design doc and the Playbook disagree, **the Playbook
+> wins** — its §8 lists the itemized corrections to this file (notably: `#[repr(u32)]`
+> not `u16`; indentation `tab_size = 4` not `8`; `true`/`false`/`null` are literals,
+> not keywords; the Node binding (napi `gdscript-ffi`) and the browser binding
+> (wasm-bindgen `bindings/wasm`) are **separate crates**; `tree-sitter` is an optional
+> native-only dev-dependency; `proptest` is the local robustness harness and
+> `cargo-fuzz` is CI-only). The inline `tab = 8` and `#[repr(u16)]` below are corrected
+> in place; the rest stand as design intent, refined by the Playbook.
+
 > Execution-ready plan for the first feature phase. Delivers the lexer, the
 > indentation pre-pass, the lossless hand-written recursive-descent parser →
 > `cstree` CST + typed AST, error recovery, the `AnalysisHost`/`Analysis`
@@ -154,8 +166,9 @@ emits `INDENT`/`DEDENT`/`NEWLINE`, tracks a line-continuation flag, and
 language's quirk-risk into **one standalone, golden-tested module** that consumes
 the WS1 token stream and produces a token stream the parser can treat as
 block-structured. It is modeled on Godot's tokenizer semantics (so we match the
-engine) and on tree-sitter-gdscript's `scanner.c` (tab = 8 columns, indent
-stack, `within_brackets`).
+engine) — column math uses Godot's flat `tab_size` (default **4**) per tab, **not**
+tree-sitter `scanner.c`'s 8-column tab-stops (scanner.c informs the indent-stack /
+`within_brackets` structure, but its tab width is the wrong oracle — see Playbook §2).
 
 ### Synthetic tokens injected
 
@@ -182,11 +195,12 @@ state:
   at_line_start: bool = true
   out: Vec<Token> = []
 
-fn column_width(ws_text):           # Godot/scanner.c convention
+fn column_width(ws_text):           # Godot gdscript_tokenizer.cpp convention
   col = 0
   for ch in ws_text:
-    if ch == '\t': col += 8 - (col % 8)   # tab stops every 8 (scanner.c uses +8)
-    else: col += 1                        # space = +1
+    if ch == '\t': col += tab_size           # FLAT add of tab_size (default 4), NOT
+                                             # tree-sitter scanner.c's `8 - col%8` tab-stops.
+    else: col += 1                           # space = +1
   return col
   # NOTE: also detect tab-after-space / space-after-tab → emit MIXED_INDENT
   #       diagnostic (Godot 4 forbids mixing) but DO NOT abort — recover.
@@ -333,12 +347,15 @@ hand-written backend. The whole crate "knows nothing about salsa or LSP"
 
 ### `SyntaxKind` (representative subset)
 
-A single `#[repr(u16)]` enum covering **tokens** (from WS1/WS2) and **nodes**
+A single `#[repr(u32)]` enum covering **tokens** (from WS1/WS2) and **nodes**
 (grammar productions). `cstree` keys green nodes by this. Representative slice:
 
 ```rust
+// NOTE: cstree's RawSyntaxKind is u32 (not rowan's u16) — use #[repr(u32)] and
+// #[derive(cstree::Syntax)] (see Playbook §4.1). The hand-written enum below is
+// illustrative of the *kinds*; the real one derives Syntax + uses #[static_text].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u16)]
+#[repr(u32)]
 pub enum SyntaxKind {
     // ---- tokens: trivia ----
     WHITESPACE, COMMENT, DOC_COMMENT, LINE_CONTINUATION,
@@ -391,7 +408,7 @@ pub enum SyntaxKind {
     PRELOAD_EXPR,
     // ---- nodes: error recovery ----
     ERROR_NODE,
-    // (keep last; count drives the u16<->kind cast)
+    // (keep last; count drives the u32<->kind cast)
     TOMBSTONE,
 }
 ```
