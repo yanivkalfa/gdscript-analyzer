@@ -3,6 +3,7 @@
 //! Run via the cargo alias `cargo xtask <command>` (see `.cargo/config.toml`). This is a plain
 //! Rust binary so the automation is cross-platform with no `make`/`bash`/`python` dependency.
 
+mod codegen;
 mod tasks;
 
 fn main() -> anyhow::Result<()> {
