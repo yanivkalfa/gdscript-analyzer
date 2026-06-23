@@ -531,6 +531,35 @@ func _ready() -> void:
     }
 
     #[test]
+    fn inline_if_elif_else_clauses_attach() {
+        // Real-corpus regression (ReactiveUI-Godot reconciler.gd / router matcher.gd):
+        // an inline branch body (`if c: stmt`) followed by `elif`/`else` on the next
+        // line. The inline body ends at a logical newline that must not orphan the
+        // clause as a stray statement.
+        let src = "func f():\n\tif a: x = 1\n\telif b: x = 2\n\telse: x = 3\n";
+        let parse = parse(src);
+        assert_eq!(parse.syntax_node().to_string(), src, "lossless");
+        assert!(parse.errors().is_empty(), "no errors: {:?}", parse.errors());
+        let root = parse.syntax_node();
+        let if_stmt = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::IfStmt)
+            .expect("an IfStmt node");
+        assert!(
+            if_stmt
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::ElifClause),
+            "elif clause attached to the if"
+        );
+        assert!(
+            if_stmt
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::ElseClause),
+            "else clause attached to the if"
+        );
+    }
+
+    #[test]
     fn multiline_lambda_in_call_argument_parses() {
         // The fixed lambda-in-brackets case: a multiline lambda body inside a call.
         let src = "func f():\n\tcb(func(a, b):\n\t\treturn a + b\n\t)\n";

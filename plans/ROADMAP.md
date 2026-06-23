@@ -2,6 +2,8 @@
 
 > Canonical. Fixes the phase order, what ships in each, the Tier 0→3 mapping, and the dependency graph. Phase docs hold the detail; this fixes the *sequence* and *exit criteria*.
 
+> **Current status (2026-06):** Phase 0 ✅ and Phase 1 ✅ are **COMPLETE and shipped to `master`** (CI green; both the Node and browser FFI demos pass). Broad real-corpus hardening of the parser is ongoing. **Active next: Phase 2 (the MVP).**
+
 ## The shape of the build
 
 The owner's directive sets the spine: **ecosystem first, then features, value-earliest within features.**
@@ -34,12 +36,14 @@ Phase 6 ── v1.0 RELEASE (Tier 3 full)
 
 ## Phase-by-phase: deliverable + exit criteria
 
-### Phase 0 — Ecosystem & Tooling *(no features; the foundation)*
+### Phase 0 — Ecosystem & Tooling *(no features; the foundation)* — ✅ **COMPLETE**
+**Status:** shipped to `master`; CI green; docs site live; godot-sync bot live.
 **Ships:** the cargo workspace skeleton (all crate stubs compiling), CI (fmt/clippy/test matrix/MSRV/wasm-check/coverage), the release toolchain (release-plz + changesets), docs scaffold (mdBook + docs.rs), governance files, dual licensing, the `xtask` automation, the **Godot-sync GitHub Action**, and `extension_api.json` vendored + codegen producing a `gdscript-api` data blob. A `CONTRIBUTING`/`README` so an external contributor can clone, build, and run.
 **Exit criteria:** `cargo xtask ci` is green locally and in Actions; a no-op release dry-run succeeds; the Godot-sync workflow runs (dispatch) and opens a PR against a synthetic API change; `cargo check -p gdscript-ide --target wasm32-unknown-unknown` passes.
 **Doc:** [`PHASE-0-ECOSYSTEM-AND-TOOLING.md`](PHASE-0-ECOSYSTEM-AND-TOOLING.md), [`GODOT-SYNC.md`](GODOT-SYNC.md).
 
-### Phase 1 — Parser & Syntax MVP *(Tier 0)*
+### Phase 1 — Parser & Syntax MVP *(Tier 0)* — ✅ **COMPLETE**
+**Status:** shipped to `master` via PR #18; CI green; the Node (`hello.mjs`) and browser (wasm-pack) FFI demos both produce document symbols; tree-sitter differential oracle passing. Broad real-corpus hardening (parsing large idiomatic projects) is ongoing.
 **Ships:** `gdscript-syntax` (logos lexer + indentation pre-pass + hand-written recursive-descent parser → `cstree` CST + AST), error recovery, the `Parser` trait (tree-sitter optional MVP backend + golden-tree differential oracle); `gdscript-base`; the `AnalysisHost`/`Analysis` skeleton in `gdscript-ide`; the `gdscript-ffi` napi+wasm binding returning **parse diagnostics, document symbols, folding ranges, and by-name (no-type) completion**.
 **Exit criteria:** parses the entire Godot demo-projects corpus + a fixtures suite with zero panics and lossless round-trip (CST → source byte-identical); differential test vs tree-sitter passes; a Node script and a browser page both load the binding and get document symbols for a `.gd` file. **No Godot editor anywhere in the loop.**
 **Doc:** [`PHASE-1-PARSER-AND-SYNTAX-MVP.md`](PHASE-1-PARSER-AND-SYNTAX-MVP.md).

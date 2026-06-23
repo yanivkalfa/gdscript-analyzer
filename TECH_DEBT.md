@@ -6,29 +6,14 @@ later.
 
 ---
 
-## Queued next steps (ops / repo)
+## Repo / ops state
 
-- [x] **Auto-delete merged branches** — enabled (`delete_branch_on_merge: true`).
-      `fix/mdbook-build` deleted (confirmed merged). **`feat/phase-0-ecosystem` NOT
-      deleted:** its tip diverges from master (16 files / 346 lines of stale workflow +
-      docs that were superseded by PRs #12–#14 — no unique source code). It was not
-      cleanly merged, so it's left for an explicit go-ahead.
-- [x] **godot-sync bot proven end-to-end** — a `workflow_dispatch` with
-      `godot_tag=4.4-stable` resolved the tag, fetched + vendored the API, ran
-      `codegen-api`, and opened PR #16 (`chore(api): sync to Godot 4.4-stable`). Closed
-      without merging (would downgrade 4.5→4.4); branch deleted.
-- [x] **godot-sync *scheduled* run failure — FIXED** (`fix(ci): … from godot-cpp`).
-      Root cause: it resolved the tag from `godotengine/godot` releases (latest =
-      4.7-stable) but fetches from `godot-cpp`, which lags (newest = 4.5-stable) and
-      doesn't tag every patch → the fetch 404'd. Now resolves the newest
-      `godot-<ver>-stable` **tag** from godot-cpp itself (+ patch→minor fetch fallback);
-      validated against the live API. **Takes effect once this branch reaches `master`**
-      (the schedule runs on the default branch).
-- [x] **GitHub Pages site — LIVE.** It had deployed but never activated serving (Pages
-      `status: null` + 404 despite green deploys); the API couldn't flip it. Resolved by
-      toggling **Settings → Pages → Source = GitHub Actions** in the UI + re-running the
-      `docs` deploy. Now `status: built` and `https://yanivkalfa.github.io/gdscript-analyzer/`
-      serves HTTP 200.
+- **Branch protection:** `dev` and `master` are governed by the **"Protect dev + master"**
+  ruleset (PR-only, required status checks incl. `pr-title`, restrict deletions,
+  non-fast-forward). **`delete_branch_on_merge` is OFF.** GitHub's auto-delete-on-merge
+  *bypasses* the ruleset's deletion rule and had silently deleted `dev` when the
+  `dev → master` PR merged (it deletes the PR's head branch). Disabling it keeps `dev`
+  permanent; merged **feature** branches are cleaned up manually instead.
 
 ---
 
