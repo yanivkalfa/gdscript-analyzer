@@ -24,14 +24,11 @@ later.
       `godot-<ver>-stable` **tag** from godot-cpp itself (+ patch→minor fetch fallback);
       validated against the live API. **Takes effect once this branch reaches `master`**
       (the schedule runs on the default branch).
-- [ ] **GitHub Pages site is not serving.** The `docs` CI is fully green (mdbook build +
-      `upload-pages-artifact@v5` + `configure-pages@v6` + `deploy-pages@v5` all succeed;
-      the `github-pages` deployment state is `success`), yet
-      `https://yanivkalfa.github.io/gdscript-analyzer/` returns 404 and the Pages
-      `status` is `null`. Re-asserting `Source = GitHub Actions` via the API + re-running
-      the deploy did **not** fix it. **Fix:** open **Settings → Pages** and confirm
-      **Source: GitHub Actions** (the first-time UI activation), then re-run the `docs`
-      workflow; it should then serve.
+- [x] **GitHub Pages site — LIVE.** It had deployed but never activated serving (Pages
+      `status: null` + 404 despite green deploys); the API couldn't flip it. Resolved by
+      toggling **Settings → Pages → Source = GitHub Actions** in the UI + re-running the
+      `docs` deploy. Now `status: built` and `https://yanivkalfa.github.io/gdscript-analyzer/`
+      serves HTTP 200.
 
 ---
 
