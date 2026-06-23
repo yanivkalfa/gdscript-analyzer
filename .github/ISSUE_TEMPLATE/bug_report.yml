@@ -1,0 +1,78 @@
+name: Bug Report
+description: Report a bug in the gdscript-analyzer library or its bindings
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the project is affected?
+      options:
+        - Lexer / parser / CST (gdscript-syntax)
+        - Analysis & IDE features (gdscript-ide — diagnostics, symbols, folding, completion)
+        - Engine API model (gdscript-api / godot-sync)
+        - Node binding (napi — @gdscript-analyzer/core)
+        - Browser binding (WASM)
+        - CLI (gdscript-cli)
+        - LSP server (gdscript-lsp)
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "Crate version (Cargo.toml) or npm package version"
+      placeholder: "e.g. gdscript-ide 0.1.0 / @gdscript-analyzer/core 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: godot-version
+    attributes:
+      label: Godot / extension_api.json version
+      description: "Only if the bug relates to engine-API data (hover, member types). The analyzer is engine-independent, but its API model targets a specific Godot version."
+      placeholder: "e.g. 4.5-stable"
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: A minimal GDScript snippet + the call (API / CLI / LSP) that triggers it
+      placeholder: |
+        1. Analyze this `.gd` snippet:
+        ```gdscript
+        extends Node
+        func _ready() -> void:
+            var x := 1
+        ```
+        2. Call `diagnostics(file)` / open it in the LSP / run `gdscript-cli check ...`
+        3. See: <unexpected diagnostic / panic / wrong symbol>
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error Output / Logs
+      description: "Paste any panic backtrace, diagnostic JSON, or LSP trace"
+      render: text
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows
+        - macOS
+        - Linux
