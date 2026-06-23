@@ -560,6 +560,27 @@ func _ready() -> void:
     }
 
     #[test]
+    fn soft_keyword_names_parse() {
+        // Real-corpus regression (ReactiveUI-Godot router): Godot's `is_identifier()` /
+        // `is_node_name()` soft keywords used as identifiers — `match` as a function
+        // name and a member name, `when` as a parameter and an identifier expression.
+        let src = "static func match(when: bool) -> int:\n\tvar r = RUIRouteMatcher.match(when)\n\treturn when\n";
+        let parse = parse(src);
+        assert_eq!(parse.syntax_node().to_string(), src, "lossless");
+        assert!(parse.errors().is_empty(), "no errors: {:?}", parse.errors());
+    }
+
+    #[test]
+    fn multiline_lambda_with_trailing_call_paren() {
+        // Real-corpus regression (ReactiveUI-Godot media.gd): a multiline lambda whose
+        // enclosing call paren closes on the body's last line (`call(func(): … last())`).
+        let src = "func f():\n\tt.connect(func():\n\t\tif ok:\n\t\t\tp.free())\n";
+        let parse = parse(src);
+        assert_eq!(parse.syntax_node().to_string(), src, "lossless");
+        assert!(parse.errors().is_empty(), "no errors: {:?}", parse.errors());
+    }
+
+    #[test]
     fn multiline_lambda_in_call_argument_parses() {
         // The fixed lambda-in-brackets case: a multiline lambda body inside a call.
         let src = "func f():\n\tcb(func(a, b):\n\t\treturn a + b\n\t)\n";

@@ -45,6 +45,10 @@ const TAB_SIZE: u32 = 4;
 struct LambdaCtx {
     saved_indent_stack: Vec<u32>,
     base: u32,
+    /// The `bracket_depth` the lambda body lives at (the depth inside its enclosing
+    /// bracket). When a closing bracket drops below this, the body ends — even mid-line,
+    /// when the closer trails the last body statement (`call(func(): … last())`).
+    open_bracket_depth: u32,
 }
 
 /// An indentation diagnostic produced while injecting block-structure markers.
@@ -160,6 +164,17 @@ impl PrePass<'_> {
                 }
                 self.out.push(*tok);
             } else {
+                // A closing bracket that drops below a lambda body's enclosing depth
+                // ends that body here, even mid-line — emit its `Dedent`s before the
+                // bracket so the parser closes the block at the right place.
+                if matches!(
+                    tok.kind,
+                    SyntaxKind::RParen | SyntaxKind::RBrace | SyntaxKind::RBrack
+                ) && !self.lambda_stack.is_empty()
+                {
+                    let new_depth = self.bracket_depth.saturating_sub(1);
+                    self.close_lambdas_on_bracket(new_depth, tok.range.start());
+                }
                 self.out.push(*tok);
                 self.track_bracket(tok.kind);
                 if !tok.kind.is_trivia() {
@@ -179,6 +194,7 @@ impl PrePass<'_> {
             self.lambda_stack.push(LambdaCtx {
                 saved_indent_stack: saved,
                 base: col,
+                open_bracket_depth: self.bracket_depth,
             });
         }
     }
@@ -188,6 +204,28 @@ impl PrePass<'_> {
     /// surrounding indentation context.
     fn close_lambdas(&mut self, col: u32, at: TextSize) {
         while self.lambda_stack.last().is_some_and(|ctx| col <= ctx.base) {
+            let base = self.lambda_stack.last().expect("checked").base;
+            while *self.indent_stack.last().expect("lambda base present") > base {
+                self.indent_stack.pop();
+                self.push_marker(SyntaxKind::Dedent, at);
+            }
+            let ctx = self.lambda_stack.pop().expect("checked");
+            self.indent_stack = ctx.saved_indent_stack;
+        }
+    }
+
+    /// Close lambda bodies whose enclosing bracket has just closed — a `)`/`]`/`}` that
+    /// drops `bracket_depth` to `new_depth` *mid-line*. Mirrors [`Self::close_lambdas`]
+    /// but is keyed on bracket depth instead of column, for the case where the closer
+    /// trails the last body statement on one line (`call(func(): … last())`). The
+    /// column-based path already handles a closer that sits on its own dedented line; a
+    /// lambda is only ever popped once, so the two paths never double-close.
+    fn close_lambdas_on_bracket(&mut self, new_depth: u32, at: TextSize) {
+        while self
+            .lambda_stack
+            .last()
+            .is_some_and(|ctx| ctx.open_bracket_depth > new_depth)
+        {
             let base = self.lambda_stack.last().expect("checked").base;
             while *self.indent_stack.last().expect("lambda base present") > base {
                 self.indent_stack.pop();

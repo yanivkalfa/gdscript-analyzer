@@ -43,9 +43,21 @@ later.
       need a preceding-sibling walk.
 - [ ] **Property accessor (`get`/`set`) parsing is permissive.** Inline and indented
       forms are accepted loosely; tighten when accessor semantics matter (Phase 2).
-- [ ] **`PI`/`TAU`/`INF`/`NAN` modeled as distinct const token kinds.** Confirm against
-      Godot's tokenizer (the differential oracle excludes them); reclassify to plain
-      identifiers if the engine treats them as such. Low risk.
+- [x] **Soft-keyword identifiers — `match`/`when` supported.** Godot's `is_identifier()`
+      whitelist is `match, when, PI, TAU, INF, NAN`; the parser now accepts `match`/`when`
+      as names (declaration / parameter / identifier expression) and the full
+      `is_node_name()` keyword set after `.` (verified against `gdscript_tokenizer.cpp`).
+      The four math constants stay literal tokens (their near-universal use), so
+      `var PI = …`-style shadowing of a constant isn't modeled — a deliberate choice, not
+      a gap.
+- [ ] **Statement-initial bare `match` is always the `match` statement.** `match(...)` /
+      `match.x` used as an *identifier* at statement start isn't handled (needs lookahead
+      in `stmt`). Rare; not seen in real corpora (member/`func` uses are handled).
+- [ ] **UTF-8 BOM at file start is not skipped.** A leading `U+FEFF` is lexed as an
+      unknown token, so the first declaration errors (`expected a declaration` at 1:1).
+      The fix needs a dedicated BOM trivia token (folding it into `Whitespace` miscounts
+      the indent column by its 3 bytes) plus `column`/`diagnose_indent` handling. Real:
+      some editors save `.gd` with a BOM (one file in the ReactiveUI-Godot corpus).
 
 ### IDE features (Tier 0 → Tier 1)
 - [ ] **Completions are not scope-aware.** By-name completion offers *every* document
@@ -67,3 +79,6 @@ later.
 - [ ] **Differential corpus is small + error-agreement only.** The tree-sitter oracle
       checks whether both parsers consider a file well-formed over ~14 core snippets. Grow
       it (e.g. the Godot demo-projects corpus) and add a structural skeleton comparison.
+      *(The parser is now also exercised by `cargo run -p gdscript-ide --example corpus --
+      <dir>` against real projects — the ReactiveUI-Godot codebase parses **88/89 files
+      clean, 0 panics**; the one remaining diagnostic is the BOM item above.)*
