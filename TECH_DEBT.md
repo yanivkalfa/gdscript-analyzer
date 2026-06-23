@@ -8,14 +8,27 @@ later.
 
 ## Queued next steps (ops / repo)
 
-- [ ] **Auto-delete merged branches.** Enable "Automatically delete head branches" in
-      the repo settings (Settings → General → Pull Requests), and delete the already-
-      merged `feat/phase-0-ecosystem` and `fix/mdbook-build` branches.
-- [ ] **Verify the docs site is live.** Confirm the GitHub Pages URL renders the mdBook
-      guide (Settings → Pages).
-- [ ] **Prove the godot-sync bot end-to-end.** Actions → *Sync Godot extension_api.json*
-      → Run with `godot_tag: 4.4-stable` → confirm it vendors the API and opens a sync
-      PR → **close the PR without merging** (don't actually downgrade).
+- [x] **Auto-delete merged branches** — enabled (`delete_branch_on_merge: true`).
+      `fix/mdbook-build` deleted (confirmed merged). **`feat/phase-0-ecosystem` NOT
+      deleted:** its tip diverges from master (16 files / 346 lines of stale workflow +
+      docs that were superseded by PRs #12–#14 — no unique source code). It was not
+      cleanly merged, so it's left for an explicit go-ahead.
+- [x] **godot-sync bot proven end-to-end** — a `workflow_dispatch` with
+      `godot_tag=4.4-stable` resolved the tag, fetched + vendored the API, ran
+      `codegen-api`, and opened PR #16 (`chore(api): sync to Godot 4.4-stable`). Closed
+      without merging (would downgrade 4.5→4.4); branch deleted.
+- [ ] **godot-sync *scheduled* run is failing.** The daily 06:17 UTC schedule run
+      failed (the dispatched run succeeds). Investigate the schedule-vs-dispatch
+      difference (token/permissions on `schedule`, or the "Allow Actions to create and
+      approve PRs" repo setting).
+- [ ] **GitHub Pages site is not serving.** The `docs` CI is fully green (mdbook build +
+      `upload-pages-artifact@v5` + `configure-pages@v6` + `deploy-pages@v5` all succeed;
+      the `github-pages` deployment state is `success`), yet
+      `https://yanivkalfa.github.io/gdscript-analyzer/` returns 404 and the Pages
+      `status` is `null`. Re-asserting `Source = GitHub Actions` via the API + re-running
+      the deploy did **not** fix it. **Fix:** open **Settings → Pages** and confirm
+      **Source: GitHub Actions** (the first-time UI activation), then re-run the `docs`
+      workflow; it should then serve.
 
 ---
 
