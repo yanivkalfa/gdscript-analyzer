@@ -8,7 +8,7 @@
 use cstree::util::NodeOrToken;
 use gdscript_base::TextRange;
 use gdscript_syntax::ast;
-use gdscript_syntax::{GdNode, SyntaxKind};
+use gdscript_syntax::{GdNode, GdToken, SyntaxKind};
 
 /// A reparse-stable pointer to a syntax node — its [`SyntaxKind`] plus byte [`TextRange`]
 /// (rust-analyzer's `SyntaxNodePtr`). Because it is plain `Copy` data keyed on text
@@ -106,4 +106,32 @@ pub fn first_child(node: &GdNode, pred: impl Fn(SyntaxKind) -> bool) -> Option<G
 #[must_use]
 pub fn first_child_expr(node: &GdNode) -> Option<GdNode> {
     first_child(node, is_expr_kind)
+}
+
+/// All direct child nodes that are expressions, in source order.
+#[must_use]
+pub fn child_exprs(node: &GdNode) -> Vec<GdNode> {
+    node.children().filter(|c| is_expr_kind(c.kind())).cloned().collect()
+}
+
+/// All direct child nodes of the given `kind`, in source order.
+#[must_use]
+pub fn children_of(node: &GdNode, kind: SyntaxKind) -> Vec<GdNode> {
+    node.children().filter(|c| c.kind() == kind).cloned().collect()
+}
+
+/// The first meaningful (non-trivia, non-layout) token of `node`.
+#[must_use]
+pub fn first_token(node: &GdNode) -> Option<GdToken> {
+    node.children_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .find(|t| !t.kind().is_trivia() && !t.kind().is_synthetic_layout())
+        .cloned()
+}
+
+/// The [`TextRange`] of a token.
+#[must_use]
+pub fn token_range(token: &GdToken) -> TextRange {
+    let r = token.text_range();
+    TextRange::new(u32::from(r.start()), u32::from(r.end()))
 }

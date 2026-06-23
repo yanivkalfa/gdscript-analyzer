@@ -10,6 +10,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod cst;
+pub mod body;
 pub mod item_tree;
 pub mod resolve;
 pub mod ty;
