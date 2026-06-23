@@ -11,6 +11,7 @@
 
 mod cst;
 pub mod item_tree;
+pub mod resolve;
 pub mod ty;
 
 pub use cst::AstPtr;
