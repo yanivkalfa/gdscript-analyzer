@@ -16,8 +16,8 @@
   "types": "index.d.ts",
   "engines": { "node": ">=20" },
   "scripts": {
-    "build": "napi build --release --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
-    "build:debug": "napi build --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
+    "build": "napi build --platform --release --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
+    "build:debug": "napi build --platform --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
     "demo": "node hello.mjs"
   },
   "devDependencies": { "@napi-rs/cli": "^3.0.0" },
