@@ -9,4 +9,8 @@
 //! resolution, and inference. Must build for `wasm32`.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod cst;
+pub mod item_tree;
 pub mod ty;
+
+pub use cst::AstPtr;
