@@ -458,7 +458,7 @@ impl Parser<'_> {
         self.expr();
         self.expect(Colon);
         self.block();
-        while self.at(ElifKw) {
+        while self.at_clause(ElifKw) {
             let e = self.open();
             self.advance();
             self.expr();
@@ -466,7 +466,7 @@ impl Parser<'_> {
             self.block();
             self.close(e, ElifClause);
         }
-        if self.at(ElseKw) {
+        if self.at_clause(ElseKw) {
             let e = self.open();
             self.advance();
             self.expect(Colon);
@@ -474,6 +474,23 @@ impl Parser<'_> {
             self.close(e, ElseClause);
         }
         self.close(m, IfStmt);
+    }
+
+    /// Whether the next `if`-continuation clause keyword (`elif`/`else`) is current.
+    ///
+    /// An *inline* branch body (`if c: stmt`) ends at a logical `Newline` that sits
+    /// before the clause on the next line — consume that terminator so the clause
+    /// attaches to this `if`. A *block* body instead ends at a `Dedent` (already eaten
+    /// by [`Self::block`]), leaving the clause keyword current.
+    fn at_clause(&mut self, kw: SyntaxKind) -> bool {
+        if self.at(kw) {
+            return true;
+        }
+        if self.at(Newline) && self.nth(1) == kw {
+            self.advance(); // the inline body's terminating newline
+            return true;
+        }
+        false
     }
 
     fn for_stmt(&mut self) {
