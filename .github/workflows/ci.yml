@@ -139,7 +139,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24 # current LTS; the npm `engines` floor stays at >=20 for consumers
       # Node path: build the napi addon and run the hello demo.
       - name: build node addon + run hello.mjs
         working-directory: bindings/node

@@ -4,7 +4,10 @@
 //
 //   cd bindings/node && npm install && npm run build && npm run demo
 
-import { AnalysisHandle } from "./index.js";
+// napi-rs emits a CommonJS `index.js`; load it from this ES module via createRequire.
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { AnalysisHandle } = require("./index.js");
 
 const SRC = `class_name Player extends CharacterBody2D
 
