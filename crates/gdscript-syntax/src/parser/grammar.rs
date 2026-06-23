@@ -220,7 +220,9 @@ impl Parser<'_> {
         self.expect(LBrace);
         while !self.at(RBrace) && !self.eof() {
             let v = self.open();
-            self.eat(Ident);
+            if self.at_name() {
+                self.advance();
+            }
             if self.eat(Eq) {
                 self.expr();
             }
@@ -265,11 +267,70 @@ impl Parser<'_> {
 
     /// A declaration name: a single identifier wrapped in a `Name` node.
     fn opt_name(&mut self) {
-        if self.at(Ident) {
+        if self.at_name() {
             let m = self.open();
             self.advance();
             self.close(m, Name);
         }
+    }
+
+    /// Whether the current token may be used as a *name* (a declaration name, a
+    /// parameter, an identifier expression). Godot's `is_identifier()` whitelist
+    /// (`gdscript_tokenizer.cpp`) is `match`, `when`, and the math constants `PI`/`TAU`/
+    /// `INF`/`NAN`; we model the math constants as literals (their near-universal use),
+    /// so the soft names accepted here are `match` and `when` — the keywords real code
+    /// actually uses as identifiers (e.g. `func match()`, a `when` parameter).
+    fn at_name(&self) -> bool {
+        matches!(self.nth(0), Ident | MatchKw | WhenKw)
+    }
+
+    /// Whether the current token may follow `.` as a member name. Godot's
+    /// `is_node_name()` (`gdscript_tokenizer.cpp`) promotes nearly every keyword to an
+    /// identifier in attribute position, so `obj.match()`, `node.signal`, `x.class`,
+    /// etc. are all valid member accesses (only the `true`/`false`/`null` *literals*
+    /// are excluded — they are not keyword tokens).
+    fn at_member_name(&self) -> bool {
+        self.at_name()
+            || matches!(
+                self.nth(0),
+                IfKw | ElifKw
+                    | ElseKw
+                    | ForKw
+                    | WhileKw
+                    | BreakKw
+                    | ContinueKw
+                    | PassKw
+                    | ReturnKw
+                    | VarKw
+                    | ConstKw
+                    | EnumKw
+                    | FuncKw
+                    | StaticKw
+                    | SignalKw
+                    | ClassKw
+                    | ClassNameKw
+                    | ExtendsKw
+                    | IsKw
+                    | InKw
+                    | AsKw
+                    | SelfKw
+                    | SuperKw
+                    | VoidKw
+                    | AwaitKw
+                    | PreloadKw
+                    | AssertKw
+                    | BreakpointKw
+                    | NotKw
+                    | AndKw
+                    | OrKw
+                    | YieldKw
+                    | NamespaceKw
+                    | TraitKw
+                    | ConstPi
+                    | ConstTau
+                    | ConstInf
+                    | ConstNan
+            )
     }
 
     /// `'(' (param (',' param)*)? ')'` where a param is `name (: type)? (= expr)?` or
@@ -283,7 +344,7 @@ impl Parser<'_> {
                 self.advance();
                 self.opt_name();
                 self.close(p, VarargParam);
-            } else if self.at(Ident) {
+            } else if self.at_name() {
                 let p = self.open();
                 self.opt_name();
                 if self.eat(Colon) && !self.at_any(&[Eq, Comma, RParen]) {
@@ -742,7 +803,7 @@ impl Parser<'_> {
                 Dot => {
                     let m = self.open_before(lhs);
                     self.advance();
-                    if self.at(Ident) {
+                    if self.at_member_name() {
                         let n = self.open();
                         self.advance();
                         self.close(n, NameRef);
@@ -767,7 +828,7 @@ impl Parser<'_> {
                 self.advance();
                 Some(self.close(m, Literal))
             }
-            Ident | SelfKw | SuperKw => {
+            Ident | SelfKw | SuperKw | MatchKw | WhenKw => {
                 let m = self.open();
                 self.advance();
                 Some(self.close(m, NameRef))
