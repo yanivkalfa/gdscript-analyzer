@@ -12,10 +12,11 @@ fn main() -> anyhow::Result<()> {
         "ci" => tasks::ci(),
         "codegen-api" => tasks::codegen_api(),
         "fixtures" => tasks::fixtures(),
+        "differential" => tasks::differential(),
         "dist" => tasks::dist(),
         "release" => tasks::release(&args[1..]),
         "" => {
-            eprintln!("usage: cargo xtask <ci|codegen-api|fixtures|dist|release>");
+            eprintln!("usage: cargo xtask <ci|codegen-api|fixtures|differential|dist|release>");
             std::process::exit(2);
         }
         other => anyhow::bail!("unknown xtask command: {other:?}"),

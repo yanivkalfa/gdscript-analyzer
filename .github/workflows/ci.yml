@@ -59,7 +59,9 @@ jobs:
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      # No `--workspace`: uses `default-members`, which excludes the FFI bindings
+      # (they build on their own targets — napi via @napi-rs/cli, wasm via wasm-pack).
+      - run: cargo test
 
   msrv:
     name: msrv (1.88.0)
@@ -78,7 +80,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack
-      - run: cargo hack check --rust-version --workspace
+      # Exclude the FFI bindings: `gdscript-ffi` (napi) floors at 1.88 but needs
+      # libnode to build, and `gdscript-wasm` builds only on wasm32.
+      - run: cargo hack check --rust-version --workspace --exclude gdscript-ffi --exclude gdscript-wasm
 
   wasm:
     name: wasm portability guard
@@ -91,9 +95,65 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      # The single most important Phase-0 invariant after "it compiles": the
-      # public surface must build on the browser target.
-      - run: cargo check -p gdscript-ide --target wasm32-unknown-unknown
+      # The single most important invariant after "it compiles": the public surface
+      # must build on the browser target — both the core and the browser binding.
+      - name: core builds for wasm32
+        run: cargo check -p gdscript-ide --target wasm32-unknown-unknown
+      - name: browser binding builds for wasm32
+        run: cargo build -p gdscript-wasm --target wasm32-unknown-unknown
+      # `getrandom` is a wasm footgun (its JS backend needs an explicit feature). Assert
+      # it never enters the browser runtime graph. `cargo tree -i` exits non-zero when
+      # the package is absent — which is exactly what we want, so invert it.
+      - name: getrandom stays out of the wasm runtime graph
+        run: |
+          if cargo tree -p gdscript-wasm -i getrandom --target wasm32-unknown-unknown --edges normal 2>/dev/null; then
+            echo "::error::getrandom entered the wasm runtime graph"; exit 1
+          else
+            echo "ok: getrandom is absent from the wasm runtime graph"
+          fi
+
+  differential:
+    name: differential (vs tree-sitter)
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Compiles tree-sitter-gdscript's C parser (cc) — native-only, feature-gated.
+      - run: cargo test -p gdscript-syntax --features tree-sitter-oracle --test differential
+
+  bindings:
+    name: bindings demo (node + browser)
+    runs-on: ubuntu-latest
+    needs: fmt
+    # The two Phase-1 exit demos. Non-blocking while the cross-platform publish matrix
+    # is wired in Phase 5 (local Windows-gnu can't build the napi .node — no libnode).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # current LTS; the npm `engines` floor stays at >=20 for consumers
+      # Node path: build the napi addon and run the hello demo.
+      - name: build node addon + run hello.mjs
+        working-directory: bindings/node
+        run: |
+          npm install
+          npm run build
+          node hello.mjs
+      # Browser path: package the wasm-bindgen binding with wasm-pack.
+      - name: install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - name: build browser package
+        run: wasm-pack build --target web --out-dir playground/pkg --out-name gdscript bindings/wasm
 
   coverage:
     name: coverage

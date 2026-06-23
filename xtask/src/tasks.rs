@@ -21,13 +21,23 @@ pub fn ci() -> Result<()> {
     ]))?;
 
     section("test");
-    run(cargo().args(["test", "--workspace"]))?;
+    // No `--workspace`: `default-members` excludes the FFI bindings, which build on
+    // their own targets (napi via @napi-rs/cli, wasm via wasm-pack).
+    run(cargo().args(["test"]))?;
 
     section("wasm-check");
+    // The core public surface and the browser binding must both build on wasm32.
     run(cargo().args([
         "check",
         "-p",
         "gdscript-ide",
+        "--target",
+        "wasm32-unknown-unknown",
+    ]))?;
+    run(cargo().args([
+        "build",
+        "-p",
+        "gdscript-wasm",
         "--target",
         "wasm32-unknown-unknown",
     ]))?;
@@ -103,11 +113,30 @@ pub fn codegen_api() -> Result<()> {
     Ok(())
 }
 
-/// `cargo xtask fixtures` — (Phase 1) regenerate golden parser fixtures. Phase 0: no-op.
-// Returns `Result` for dispatch uniformity with the sibling task fns; becomes fallible in Phase 1.
-#[allow(clippy::unnecessary_wraps)]
+/// `cargo xtask fixtures` — re-bless the golden fixtures (the `expect-test` `.cst`
+/// snapshots) by running the tests with `UPDATE_EXPECT=1`. Review the diff before
+/// committing.
 pub fn fixtures() -> Result<()> {
-    println!("fixtures: no parser fixtures yet (Phase 1). Nothing to do.");
+    section("fixtures (bless)");
+    run(cargo().env("UPDATE_EXPECT", "1").args(["test"]))?;
+    println!("fixtures: regenerated golden files. Review the diff before committing.");
+    Ok(())
+}
+
+/// `cargo xtask differential` — cross-validate the parser against tree-sitter-gdscript
+/// (native-only; compiles tree-sitter's C parser). Divergences are triaged into
+/// `crates/gdscript-syntax/tests/KNOWN_DIVERGENCES.md`.
+pub fn differential() -> Result<()> {
+    section("differential (vs tree-sitter)");
+    run(cargo().args([
+        "test",
+        "-p",
+        "gdscript-syntax",
+        "--features",
+        "tree-sitter-oracle",
+        "--test",
+        "differential",
+    ]))?;
     Ok(())
 }
 

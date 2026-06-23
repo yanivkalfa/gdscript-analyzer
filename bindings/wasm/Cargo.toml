@@ -13,6 +13,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 gdscript-ide = { workspace = true }
+gdscript-base = { workspace = true }
+wasm-bindgen = { workspace = true }
+console_error_panic_hook = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "gdscript-ffi"
-description = "napi-rs binding surface for gdscript-analyzer — one source for the Node .node addon and the wasm32 target."
+description = "napi-rs binding surface for gdscript-analyzer — the Node .node addon over gdscript-ide."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,13 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 gdscript-ide = { workspace = true }
+gdscript-base = { workspace = true }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+napi-build = { workspace = true }
 
 [lints]
 workspace = true
