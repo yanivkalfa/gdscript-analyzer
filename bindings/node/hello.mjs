@@ -6,8 +6,19 @@
 
 // napi-rs emits a CommonJS `index.js`; load it from this ES module via createRequire.
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 const require = createRequire(import.meta.url);
-const { AnalysisHandle } = require("./index.js");
+
+// --- diagnostic (temporary): reveal napi's generated export shape on CI ---
+console.log("--- index.js (first 45 lines) ---");
+console.log(readFileSync(new URL("./index.js", import.meta.url), "utf8").split("\n").slice(0, 45).join("\n"));
+const mod = require("./index.js");
+console.log("--- index.js exports:", Object.keys(mod), "| default:", mod.default && Object.keys(mod.default));
+// --- end diagnostic ---
+
+// Resolve the class across the plausible napi export shapes (named / default / module).
+const AnalysisHandle =
+  mod.AnalysisHandle ?? mod.default?.AnalysisHandle ?? (typeof mod === "function" ? mod : undefined);
 
 const SRC = `class_name Player extends CharacterBody2D
 
