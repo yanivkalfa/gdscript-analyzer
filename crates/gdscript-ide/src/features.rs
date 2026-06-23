@@ -3,8 +3,8 @@
 //! so the Phase-3 salsa swap is a localized change.
 
 use gdscript_base::{
-    CompletionItem, CompletionKind, Diagnostic, DocumentSymbol, FoldKind, FoldRange, LineIndex,
-    Severity, SymbolKind, TextRange,
+    CompletionItem, CompletionKind, Diagnostic, DiagnosticSource, DocumentSymbol, FoldKind,
+    FoldRange, LineIndex, Severity, SymbolKind, TextRange,
 };
 use gdscript_syntax::ast::{self, AstNode, Decl};
 use gdscript_syntax::{GdNode, SyntaxKind, parse, tokenize};
@@ -34,6 +34,8 @@ pub fn diagnostics(text: &str) -> Vec<Diagnostic> {
             severity: Severity::Error,
             code: "GDSCRIPT_SYNTAX".to_owned(),
             message: e.message.clone(),
+            source: DiagnosticSource::Syntax,
+            fixes: Vec::new(),
         })
         .collect()
 }
@@ -185,6 +187,7 @@ pub fn completions(text: &str, offset: u32) -> Vec<CompletionItem> {
                 label: (*a).to_owned(),
                 kind: CompletionKind::Annotation,
                 insert_text: None,
+                detail: None,
             })
             .collect();
     }
@@ -195,6 +198,7 @@ pub fn completions(text: &str, offset: u32) -> Vec<CompletionItem> {
             label: (*k).to_owned(),
             kind: CompletionKind::Keyword,
             insert_text: None,
+            detail: None,
         })
         .collect();
     items.extend(local_symbols(text));
@@ -236,6 +240,7 @@ fn local_symbols(text: &str) -> Vec<CompletionItem> {
                 label: name,
                 kind,
                 insert_text: None,
+                detail: None,
             });
         }
     }

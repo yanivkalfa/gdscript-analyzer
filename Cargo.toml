@@ -54,6 +54,15 @@ cstree = { version = "0.14", features = ["derive"] } # lossless CST (Send+Sync, 
 logos = "0.16" # DFA lexer; trivia kept as first-class tokens (never `skip`)
 text-size = "1.1" # TextSize/TextRange POD (also a cstree transitive dep)
 rustc-hash = "2.1" # deterministic FxHashMap — keeps `getrandom` out of the graph
+# Phase 2 — engine-API model (plans/PHASE-2-IMPLEMENTATION-PLAYBOOK.md §4). `gdscript-api`
+# normalizes `extension_api.json` into an `EngineApi`, serializes it to a binary blob at
+# codegen time (`xtask codegen-api`), and loads it via `from_bytes` — `rkyv` is that
+# zero-copy format (validated on load via its default `bytecheck`). `smol_str` interns the
+# ~16k identifier strings in the model (≤23-byte inline = cheap `Clone`, no alloc for the
+# typical method/class name); both are wasm-clean (no `std::fs`/clocks/threads). Declared
+# here only — crates opt in with `.workspace = true` in Step 1, so this is inert until then.
+rkyv = "0.8"
+smol_str = "0.3"
 # FFI — Node addon (napi). Native + wasip1-threads only; never in the wasm32-unknown
 # core gate. napi-build is "2" (the README's "1" is stale — see Playbook §1).
 napi = { version = "3", default-features = true }
