@@ -17,10 +17,13 @@ later.
       `godot_tag=4.4-stable` resolved the tag, fetched + vendored the API, ran
       `codegen-api`, and opened PR #16 (`chore(api): sync to Godot 4.4-stable`). Closed
       without merging (would downgrade 4.5→4.4); branch deleted.
-- [ ] **godot-sync *scheduled* run is failing.** The daily 06:17 UTC schedule run
-      failed (the dispatched run succeeds). Investigate the schedule-vs-dispatch
-      difference (token/permissions on `schedule`, or the "Allow Actions to create and
-      approve PRs" repo setting).
+- [x] **godot-sync *scheduled* run failure — FIXED** (`fix(ci): … from godot-cpp`).
+      Root cause: it resolved the tag from `godotengine/godot` releases (latest =
+      4.7-stable) but fetches from `godot-cpp`, which lags (newest = 4.5-stable) and
+      doesn't tag every patch → the fetch 404'd. Now resolves the newest
+      `godot-<ver>-stable` **tag** from godot-cpp itself (+ patch→minor fetch fallback);
+      validated against the live API. **Takes effect once this branch reaches `master`**
+      (the schedule runs on the default branch).
 - [ ] **GitHub Pages site is not serving.** The `docs` CI is fully green (mdbook build +
       `upload-pages-artifact@v5` + `configure-pages@v6` + `deploy-pages@v5` all succeed;
       the `github-pages` deployment state is `success`), yet
