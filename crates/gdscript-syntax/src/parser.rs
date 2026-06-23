@@ -531,6 +531,46 @@ func _ready() -> void:
     }
 
     #[test]
+    fn multiline_lambda_in_call_argument_parses() {
+        // The fixed lambda-in-brackets case: a multiline lambda body inside a call.
+        let src = "func f():\n\tcb(func(a, b):\n\t\treturn a + b\n\t)\n";
+        let parse = parse(src);
+        assert_eq!(parse.syntax_node().to_string(), src, "lossless");
+        assert!(parse.errors().is_empty(), "no errors: {:?}", parse.errors());
+        let root = parse.syntax_node();
+        let lambda = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::LambdaExpr)
+            .expect("a LambdaExpr node");
+        let block = lambda
+            .children()
+            .find(|n| n.kind() == SyntaxKind::Block)
+            .expect("the lambda body Block");
+        assert!(
+            block
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::ReturnStmt),
+            "the lambda body contains the return statement"
+        );
+    }
+
+    #[test]
+    fn single_line_lambda_in_call_argument_parses() {
+        // The body stops at the call's `)` (parser inline-block fix).
+        let src = "var m = arr.map(func(x): x * 2)\n";
+        let parse = parse(src);
+        assert_eq!(parse.syntax_node().to_string(), src, "lossless");
+        assert!(parse.errors().is_empty(), "no errors: {:?}", parse.errors());
+        assert!(
+            parse
+                .syntax_node()
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::LambdaExpr),
+            "a LambdaExpr node"
+        );
+    }
+
+    #[test]
     fn broken_code_recovers_and_round_trips() {
         // A malformed parameter list: a tree is still produced, errors are reported,
         // siblings still parse, and the source round-trips.

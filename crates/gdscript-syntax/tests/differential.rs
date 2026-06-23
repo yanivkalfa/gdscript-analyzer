@@ -41,6 +41,10 @@ const VALID: &[&str] = &[
     "func e(a, b, c):\n\tvar r = 2 ** 3 + 1 * -4\n\tvar t = a if b else c\n\treturn r + t\n",
     "class Inner:\n\tvar y = 1\n\tfunc inner_fn():\n\t\treturn y\n",
     "func l():\n\tvar cb = func(x): return x + 1\n\treturn cb.call(1)\n",
+    // Lambdas inside call arguments (single-line and multiline) — the stack-of-stacks
+    // indentation case.
+    "func s(arr):\n\treturn arr.map(func(x): return x * 2)\n",
+    "func s(arr):\n\tarr.sort_custom(func(a, b):\n\t\treturn a < b\n\t)\n",
 ];
 
 #[test]

@@ -35,12 +35,6 @@ later.
       `bindings` CI job builds it.
 
 ### Parser / syntax
-- [ ] **Lambda body inside an open bracket.** The indentation pre-pass suppresses
-      indentation inside `()[]{}`, so a multiline lambda body living inside an open
-      bracket (e.g. `arr.sort_custom(func(a, b):\n\treturn a < b\n)`) gets no
-      `Indent`/`Dedent` markers. Godot re-enables indentation there via a stack-of-stacks
-      (`saved_stacks: Vec<Vec<u32>>`); wire it. Top-level / ordinary nested lambdas are
-      fine. (Documented in `crates/gdscript-syntax/src/prepass.rs`.)
 - [ ] **Trivia attachment is the simple model.** The tree sink flushes leading trivia
       into the *following* node; it does not implement rust-analyzer's full
       `n_attached_trivia` leading-vs-trailing heuristic (blank-line breaks, doc-comment

@@ -392,11 +392,12 @@ impl Parser<'_> {
             }
             // else: an empty body (no indentation followed).
         } else {
-            // Inline body. A `Dedent` (emitted at EOF / when a surrounding block closes,
-            // e.g. on truncated input with an open bracket) also terminates it — without
-            // this the loop could spin on a `Dedent` that `stmt` can't consume.
+            // Inline body, e.g. `func f(): return 1` or a single-line lambda inside a
+            // call `map(func(x): x * 2)`. Terminates at a logical newline, a `Dedent`
+            // (EOF / surrounding block close), or — for an in-bracket lambda — the
+            // enclosing bracket's closer or argument comma.
             let m = self.open();
-            while !self.at_any(&[Newline, Dedent]) && !self.eof() {
+            while !self.at_any(&[Newline, Dedent, RParen, RBrack, RBrace, Comma]) && !self.eof() {
                 if self.eat(Semicolon) {
                     continue;
                 }
