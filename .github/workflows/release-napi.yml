@@ -68,7 +68,7 @@ jobs:
             target: wasm32-wasip1-threads
             build: napi-wasm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain (+ target)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -82,7 +82,7 @@ jobs:
       - name: Build (placeholder — Phase 1 swaps in `napi build`)
         run: cargo build -p gdscript-ffi --release
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.target }}
           path: target/release/*gdscript_ffi*
@@ -100,8 +100,8 @@ jobs:
       contents: read
       id-token: write # OIDC for npm provenance
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
       - name: "Publish (Phase 1+: napi artifacts && npm publish --provenance)"
         run: echo "Phase 0 stub — no napi crate yet; nothing to publish."

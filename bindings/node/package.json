@@ -15,6 +15,12 @@
   "main": "index.js",
   "types": "index.d.ts",
   "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "napi build --platform --release --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
+    "build:debug": "napi build --platform --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
+    "demo": "node hello.mjs"
+  },
+  "devDependencies": { "@napi-rs/cli": "^3.0.0" },
   "private": false,
   "publishConfig": { "access": "public", "provenance": true },
   "files": ["index.js", "index.d.ts"],

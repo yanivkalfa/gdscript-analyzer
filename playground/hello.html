@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<!--
+  Phase-1 exit demo (browser path): load the wasm build of the analyzer and show the
+  document symbols of a `.gd` file — no Godot, no server-side anything.
+
+  Build the wasm package first (from the repo root):
+
+    wasm-pack build --target web --out-dir ../../playground/pkg --out-name gdscript bindings/wasm
+
+  Then serve this folder over any static HTTP server (the ES-module import + the
+  `_bg.wasm` fetch are blocked on `file://` by browser CORS — this is a browser rule,
+  not a server requirement):
+
+    python -m http.server      # then open http://localhost:8000/hello.html
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>gdscript-analyzer — browser demo</title>
+    <style>
+      body { font: 14px ui-monospace, monospace; margin: 2rem; max-width: 60rem; }
+      h1 { font-size: 1.1rem; }
+      textarea { width: 100%; height: 18rem; font: inherit; }
+      .sym { margin-left: calc(var(--d) * 1.5rem); }
+      .kind { color: #06c; display: inline-block; width: 6rem; }
+      pre { background: #f4f4f4; padding: 0.75rem; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>gdscript-analyzer — document symbols (wasm, no engine)</h1>
+    <textarea id="src">
+class_name Player extends CharacterBody2D
+
+const SPEED := 300.0
+@export var health: int = 100
+signal died(reason: String)
+enum State { IDLE, RUNNING }
+
+func _ready() -> void:
+	var node := $Sprite2D
+	print(node, health)
+
+class Inner:
+	var x = 1
+	func helper() -> int:
+		return x
+</textarea>
+    <h2 style="font-size: 1rem">Symbols</h2>
+    <div id="symbols"></div>
+    <h2 style="font-size: 1rem">Diagnostics</h2>
+    <pre id="diagnostics"></pre>
+
+    <script type="module">
+      import init, { WasmAnalysis } from "./pkg/gdscript.js";
+
+      await init();
+      const analysis = new WasmAnalysis();
+      const FILE = 0;
+
+      function render() {
+        const src = document.getElementById("src").value;
+        analysis.applyChange(FILE, src);
+
+        const symbols = JSON.parse(analysis.documentSymbols(FILE));
+        const out = document.getElementById("symbols");
+        out.innerHTML = "";
+        const walk = (sym, depth) => {
+          const div = document.createElement("div");
+          div.className = "sym";
+          div.style.setProperty("--d", depth);
+          div.innerHTML = `<span class="kind">${sym.kind}</span> ${sym.name}`;
+          out.appendChild(div);
+          sym.children.forEach((c) => walk(c, depth + 1));
+        };
+        symbols.forEach((s) => walk(s, 0));
+
+        const diags = JSON.parse(analysis.diagnostics(FILE));
+        document.getElementById("diagnostics").textContent =
+          diags.length === 0 ? "(no parse errors)" : JSON.stringify(diags, null, 2);
+      }
+
+      document.getElementById("src").addEventListener("input", render);
+      render();
+    </script>
+  </body>
+</html>

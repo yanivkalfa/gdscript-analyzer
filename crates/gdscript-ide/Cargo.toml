@@ -17,6 +17,8 @@ gdscript-syntax = { workspace = true }
 gdscript-api = { workspace = true }
 gdscript-db = { workspace = true }
 gdscript-hir = { workspace = true }
+rustc-hash = { workspace = true }
+text-size = { workspace = true }
 
 [lints]
 workspace = true

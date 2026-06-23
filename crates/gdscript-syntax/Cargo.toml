@@ -13,6 +13,22 @@ keywords.workspace = true
 
 [dependencies]
 gdscript-base = { workspace = true }
+cstree = { workspace = true }
+logos = { workspace = true }
+text-size = { workspace = true }
+# The differential oracle (native-only, off by default; see `[features]`). Optional so
+# the default/wasm/MSRV builds never pull tree-sitter's C parser (MSRV 1.90 > 1.88).
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-gdscript = { workspace = true, optional = true }
+
+[features]
+# Cross-validate our hand-written parser against tree-sitter-gdscript. Enable for the
+# `differential` test: `cargo test -p gdscript-syntax --features tree-sitter-oracle`.
+tree-sitter-oracle = ["dep:tree-sitter", "dep:tree-sitter-gdscript"]
+
+[dev-dependencies]
+expect-test = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

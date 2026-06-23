@@ -43,21 +43,27 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Resolve latest stable Godot tag # PIPELINE STEP 1 (detect)
+      - name: Resolve latest godot-cpp stable API tag # PIPELINE STEP 1 (detect)
         id: godot
         run: |
           set -euo pipefail
           if [ -n "${{ inputs.godot_tag }}" ]; then
             TAG="${{ inputs.godot_tag }}"
           else
-            TAG="$(gh release list -R godotengine/godot --exclude-pre-releases --exclude-drafts \
-                     --limit 1 --json tagName --jq '.[0].tagName')"
+            # `godot-cpp` is the API source and LAGS `godotengine/godot` releases (e.g.
+            # Godot may be at 4.7-stable while godot-cpp's newest release is 4.6-stable).
+            # Resolve from godot-cpp's own `godot-<ver>-stable` release TAGS (its
+            # branches are `4.x`/`4.0`-style, not the stable refs we fetch) so the fetch
+            # below never 404s on a tag godot-cpp hasn't caught up to.
+            TAG="$(gh api repos/godotengine/godot-cpp/tags --paginate --jq '.[].name' \
+                     | grep -E '^godot-[0-9]+\.[0-9]+(\.[0-9]+)?-stable$' \
+                     | sed 's/^godot-//' | sort -V | tail -1)"
           fi
           echo "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?-stable$' \
             || { echo "::error::bad tag $TAG"; exit 1; }
@@ -71,13 +77,18 @@ jobs:
         run: |
           set -euo pipefail
           VER="${{ steps.godot.outputs.ver }}"
-          # NOTE: godot-cpp tags are PREFIXED with `godot-`.
-          curl -fsSL \
-            "https://raw.githubusercontent.com/godotengine/godot-cpp/godot-${VER}-stable/gdextension/extension_api.json" \
-            -o new_extension_api.json
+          MINOR="${{ steps.godot.outputs.minor }}"
+          base="https://raw.githubusercontent.com/godotengine/godot-cpp"
+          # godot-cpp branches are PREFIXED with `godot-`. Try the exact version, then
+          # fall back to the minor branch (godot-cpp doesn't tag every patch release —
+          # e.g. `godot-4.5.1-stable` may 404 while `godot-4.5-stable` exists).
+          if ! curl -fsSL "$base/godot-${VER}-stable/gdextension/extension_api.json" -o new_extension_api.json; then
+            echo "::notice::godot-cpp has no godot-${VER}-stable branch; falling back to godot-${MINOR}-stable"
+            curl -fsSL "$base/godot-${MINOR}-stable/gdextension/extension_api.json" -o new_extension_api.json
+          fi
           # Fallback (B): download the matching Godot editor release binary and run
           #   ./Godot --headless --dump-extension-api --dump-extension-api-with-docs
-          # (use when godot-cpp lags the tag or for doc XML the JSON omits).
+          # (use for doc XML the JSON omits, or if godot-cpp lags the minor too).
 
       - name: Diff, vendor, regenerate # PIPELINE STEPS 3-4 (diff + regenerate)
         id: diff
@@ -99,7 +110,7 @@ jobs:
 
       - name: Open / update PR # PIPELINE STEP 6 (surface)
         if: steps.diff.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           # Use a PAT (GODOT_SYNC_TOKEN) so the sync PR is created by a real identity
           # and therefore TRIGGERS the required CI checks. The default GITHUB_TOKEN
