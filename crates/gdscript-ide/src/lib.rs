@@ -471,6 +471,42 @@ mod tests {
     }
 
     #[test]
+    fn node_path_completion_does_not_hijack_inside_a_string_literal() {
+        // A `$child/` that appears INSIDE a string literal must NOT trigger node-path completion
+        // (the byte scan has no lexer awareness; a `String` token at the cursor suppresses it).
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Panel\" type=\"Panel\" parent=\".\"]\n\
+             [node name=\"Ok\" type=\"Button\" parent=\"Panel\"]\n",
+        );
+        change.set_file_path(FileId(0), "res://main.tscn");
+        let gd = "extends Control\nfunc _ready():\n\tvar s := \"$Panel/\"\n";
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        // cursor right after the `/`, INSIDE the string literal.
+        let offset = u32::try_from(gd.find("$Panel/").unwrap() + "$Panel/".len()).unwrap();
+        let items = analysis
+            .completions(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap();
+        assert!(
+            !items.iter().any(|i| i.label == "Ok"),
+            "node names must not leak into a string literal: {items:?}",
+        );
+    }
+
+    #[test]
     fn goto_definition_on_a_node_path_jumps_into_the_tscn() {
         // Cursor on `$Btn` → a NavTarget pointing at the `[node name="Btn" …]` line in the owning
         // `.tscn` (the inverse of M1 typing; navigation the engine LSP cannot provide).

@@ -1430,4 +1430,42 @@ mod tests {
             "$Enemy.hp() should recurse into the instanced sub-scene root's script Enemy",
         );
     }
+
+    // ---- Phase-4 hunt fixes: `%`-segment paths (no false INVALID_NODE_PATH) ----------------
+
+    #[test]
+    fn unique_name_subpath_resolves_to_the_child_without_warning() {
+        // `%Box/Btn`: resolve the unique `%Box`, then walk `/Btn` to its Button child — idiomatic
+        // Godot. Must type as Button and NOT raise INVALID_NODE_PATH (the bare-map lookup of the
+        // whole joined "Box/Btn" used to miss → false warning).
+        let db = scene_db(
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Box\" type=\"VBoxContainer\" parent=\".\"]\n\
+             unique_name_in_owner = true\n\
+             [node name=\"Btn\" type=\"Button\" parent=\"Box\"]\n",
+            "extends Control\nfunc _ready():\n\tvar b := %Box/Btn\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "%Box/Btn → Button (and no false INVALID_NODE_PATH)",
+        );
+    }
+
+    #[test]
+    fn percent_prefixed_string_paths_resolve_as_unique_without_warning() {
+        // `get_node("%Btn")` and `$"%Btn"` are unique-name lookups (the `%` prefix lives inside the
+        // string), NOT a child literally named "%Btn". Must type as Button with no INVALID_NODE_PATH.
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar a := get_node(\"%Btn\")\n\tvar b := $\"%Btn\"\n",
+        );
+        let labels = binding_labels(&db);
+        assert!(
+            labels.iter().filter(|l| *l == "Button").count() >= 2,
+            "both %Btn string forms should resolve to Button: {labels:?}",
+        );
+    }
 }

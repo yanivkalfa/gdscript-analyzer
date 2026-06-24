@@ -166,6 +166,17 @@ pub fn node_path_completions(
     offset: u32,
 ) -> Option<Vec<CompletionItem>> {
     let prefix = dollar_path_prefix(file.text(db), offset)?;
+    // The backward byte scan has no lexer awareness, so a `$name/` *inside a string literal or
+    // comment* (e.g. `var s = "$x/y"`) would otherwise hijack completion. Bail when the cursor sits
+    // in a `String`/`Comment` token. (The real `$Panel/` form is `Dollar`/`Ident`/`Slash` tokens,
+    // never `String`; the quoted `$"…"` form isn't byte-scannable anyway, so nothing is lost.)
+    let root = parse(db, file).syntax_node();
+    if let Some(tok) = ast::token_at(&root, offset.saturating_sub(1).into()) {
+        // A `String` literal or any comment trivia at the cursor → not a real node-path context.
+        if tok.kind() == SyntaxKind::String || tok.kind().is_trivia() {
+            return None;
+        }
+    }
     let ctx = queries::scene_context(db, file)?;
     let parent = if prefix.is_empty() {
         ctx.attach

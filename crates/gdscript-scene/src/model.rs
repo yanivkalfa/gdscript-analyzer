@@ -210,7 +210,10 @@ impl SceneModel {
     }
 
     /// Walk a name-path from an arbitrary `base` node (the node a script attaches to — `$X` is
-    /// relative to *that* node, which is usually but not always the root).
+    /// relative to *that* node, which is usually but not always the root). A `%Name` segment is a
+    /// **unique-name** lookup (scene-wide, owner-relative), so the idiomatic `Foo/%Bar` and the
+    /// string forms `$"%Bar"` / `get_node("%Bar")` resolve like the engine; a plain segment is a
+    /// child lookup.
     #[must_use]
     pub fn resolve_path_from(&self, base: NodeIdx, path: &str) -> Option<NodeIdx> {
         let p = path.trim();
@@ -228,16 +231,37 @@ impl SceneModel {
             if seg == ".." {
                 return None; // parent escape — needs the runtime tree
             }
-            cur = *self.child_index.get(&(cur, SmolStr::new(seg)))?;
+            cur = self.step_segment(cur, seg)?;
         }
         Some(cur)
     }
 
-    /// The `%Name` lookup — a node marked `unique_name_in_owner` (the leading `%` is stripped by the
-    /// caller). Scene-wide in the slice.
+    /// Resolve one path segment from `cur`: a `%Name` segment is a scene-wide unique-name lookup
+    /// (the `cur` base is irrelevant for it); a plain `Name` segment is a child of `cur`.
+    fn step_segment(&self, cur: NodeIdx, seg: &str) -> Option<NodeIdx> {
+        if let Some(unique) = seg.strip_prefix('%') {
+            self.unique_nodes.get(unique).copied()
+        } else {
+            self.child_index.get(&(cur, SmolStr::new(seg))).copied()
+        }
+    }
+
+    /// Resolve a `%`-sigil path (`%Name` / `%Name/Child/…`). The leading segment is a unique name
+    /// even though the `%` sigil was a separate token (so it isn't in `path`); subsequent segments
+    /// walk as normal children. Delegates to the `%`-aware [`resolve_path_from`](Self::resolve_path_from).
     #[must_use]
-    pub fn resolve_unique(&self, name: &str) -> Option<NodeIdx> {
-        self.unique_nodes.get(name).copied()
+    pub fn resolve_unique(&self, path: &str) -> Option<NodeIdx> {
+        self.resolve_path_from(self.root?, &Self::with_unique_head(path))
+    }
+
+    /// Mark the first segment of a `%`-sigil path as a unique name (`"Box/Btn"` → `"%Box/Btn"`),
+    /// leaving an already-`%`-prefixed path untouched.
+    fn with_unique_head(path: &str) -> String {
+        if path.starts_with('%') {
+            path.to_owned()
+        } else {
+            format!("%{path}")
+        }
     }
 
     /// The node whose body `script = ExtResource(id)` resolves (via `ext_resources[id].path`) to
@@ -282,10 +306,12 @@ impl SceneModel {
             if seg == ".." {
                 return NodePathResolution::Escaped;
             }
-            match self.child_index.get(&(cur, SmolStr::new(seg))) {
-                Some(&next) => cur = next,
+            match self.step_segment(cur, seg) {
+                Some(next) => cur = next,
                 None => {
-                    return if self.descends_from_instance(Some(cur)) {
+                    // A `%Name` segment is scene-wide with no instance boundary, so a miss is a
+                    // genuine `Missing`; a plain child miss below an instance is `IntoInstance`.
+                    return if !seg.starts_with('%') && self.descends_from_instance(Some(cur)) {
                         NodePathResolution::IntoInstance
                     } else {
                         NodePathResolution::Missing
@@ -296,15 +322,16 @@ impl SceneModel {
         NodePathResolution::Resolved(cur)
     }
 
-    /// Resolve a `%Unique` name. A missing unique name is genuinely [`Missing`] (no instance
-    /// ambiguity — `%` is scene-wide).
+    /// Resolve a `%`-sigil path (`%Name` / `%Name/Child`). The leading segment is a unique name
+    /// (the `%` sigil was a separate token, so it isn't in `path`); subsequent segments walk as
+    /// children. A missing leading unique name is genuinely [`Missing`](NodePathResolution::Missing)
+    /// (no instance ambiguity — `%` is scene-wide).
     #[must_use]
-    pub fn classify_unique(&self, name: &str) -> NodePathResolution {
-        self.unique_nodes
-            .get(name)
-            .map_or(NodePathResolution::Missing, |&idx| {
-                NodePathResolution::Resolved(idx)
-            })
+    pub fn classify_unique(&self, path: &str) -> NodePathResolution {
+        match self.root {
+            Some(root) => self.classify_path_from(root, &Self::with_unique_head(path)),
+            None => NodePathResolution::Missing,
+        }
     }
 
     /// Whether `start` or any ancestor (up to the root) is an instance boundary (`instance=` /

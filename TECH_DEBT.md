@@ -95,6 +95,25 @@ nested instance all flow through (`$Enemy` → `enemy.tscn`'s root class, e.g. `
 the cross-file method). `infer::instance_root_ty` follows the ext-resource path through
 `res_path_registry` → `scene_model`, depth-bounded (≤16) against an instancing cycle.
 
+### M1–M3 adversarial bug hunt (5-finder → 3-vote, 3 lenses) — fixed
+The post-M3 hunt confirmed **3 distinct false-positive bugs** (all `INVALID_NODE_PATH` / completion
+violations; `rejected: []`), each verified end-to-end and now fixed + regression-tested:
+- [x] **`%Name/Child` subpath false-warned.** `classify_unique`/`resolve_unique` did a single
+      bare-map lookup of the whole joined path (`"Box/Btn"`), missing → false `INVALID_NODE_PATH`,
+      though `%Box/Btn` (resolve the unique node, then walk `/Btn`) is idiomatic Godot.
+- [x] **`$"%Name"` / `get_node("%Name")` string forms false-warned.** The `%` lived *inside* the
+      string (`unique:false`), so it was looked up as a child literally named `"%Name"` → miss →
+      false warning.
+- [x] **Node-path completion hijacked inside string literals/comments.** `dollar_path_prefix` is a
+      pure byte scan; a `$x/` inside `"…"` or `#…` would offer scene node names.
+
+The fix unifies the first two: the path walk (`resolve_path_from` / `classify_path_from`) is now
+**`%`-segment-aware** — a `%X` segment resolves scene-wide via `unique_nodes` (the `step_segment`
+helper), so leading **and** mid-path `%` work everywhere; `resolve_unique`/`classify_unique` mark the
+sigil form's head segment and delegate. The completion fix guards on the `ast::token_at` kind
+(`String`/trivia → bail). The bare `$Panel/` completion still works (`Dollar`/`Ident`/`Slash`
+tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is lost.
+
 **M2/M3 deferrals (→ later):**
 - [ ] **Paths *into* an instance stay `Node`.** `$Enemy` is now typed (the instance root), but
       `$Enemy/Sprite` (a node *inside* the sub-scene) still degrades to `Node` (`IntoInstance` — no
