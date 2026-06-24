@@ -209,32 +209,50 @@ pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
     let tree = item_tree(root);
     let mut units = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
+
+    // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
+    // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
     {
         let class = ClassScope::new(api, &tree);
         for m in &tree.members {
-            let unit = match m {
-                Member::Func(f) => f.ptr.to_node(root).map(|node| {
-                    let body = body::body_of_func(&node);
-                    let return_ty =
-                        cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
-                            .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
-                    let result = infer(api, root, &class, &body, return_ty);
-                    Unit {
-                        range: f.range,
-                        body,
-                        result,
-                    }
-                }),
-                Member::Var(v) if v.has_init => unit_from_decl(api, root, &class, v.ptr, v.range),
-                Member::Const(c) => unit_from_decl(api, root, &class, c.ptr, c.range),
-                _ => None,
+            let (ptr, range) = match m {
+                Member::Var(v) => (v.ptr, v.range),
+                Member::Const(c) => (c.ptr, c.range),
+                _ => continue,
             };
-            if let Some(u) = unit {
-                diagnostics.extend(u.result.diagnostics.iter().cloned());
-                units.push(u);
+            if let Some(unit) = unit_from_decl(api, root, &class, ptr, range) {
+                if let (Some(name), Some(b)) = (m.name(), unit.result.bindings.first()) {
+                    member_types.insert(SmolStr::new(name), b.ty.clone());
+                }
+                diagnostics.extend(unit.result.diagnostics.iter().cloned());
+                units.push(unit);
             }
         }
     }
+
+    // Pass 2 — functions, against a scope carrying the seeded field types.
+    {
+        let mut class = ClassScope::new(api, &tree);
+        class.member_types = member_types;
+        for m in &tree.members {
+            let Member::Func(f) = m else { continue };
+            let Some(node) = f.ptr.to_node(root) else {
+                continue;
+            };
+            let body = body::body_of_func(&node);
+            let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
+                .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
+            let result = infer(api, root, &class, &body, return_ty);
+            diagnostics.extend(result.diagnostics.iter().cloned());
+            units.push(Unit {
+                range: f.range,
+                body,
+                result,
+            });
+        }
+    }
+
     FileInference {
         tree,
         units,
@@ -542,7 +560,14 @@ impl Cx<'_> {
                 self.infer_expr(cond, &Expectation::None);
                 let a = self.infer_expr(then_branch, expected);
                 let b = self.infer_expr(else_branch, expected);
-                self.join(&a, &b)
+                // A `null` branch does not poison the other: `x if c else null` is nullable-`x`.
+                if self.is_null(else_branch) {
+                    a
+                } else if self.is_null(then_branch) {
+                    b
+                } else {
+                    self.join(&a, &b)
+                }
             }
             Expr::Call { callee, args } => self.infer_call(callee, &args),
             Expr::Field {
@@ -572,23 +597,43 @@ impl Cx<'_> {
             }
             Expr::Await(operand) => {
                 self.infer_expr(operand, &Expectation::None);
-                Ty::Variant
+                // The awaited result (a signal's args / a coroutine's return) is not tracked in
+                // Phase 2 — use the seam, not `Variant`, so `var x := await f()` never warns.
+                Ty::Unknown
             }
             Expr::Array(elems) => {
+                // Checking mode: an expected `Array[T]` is pushed down onto the literal (so
+                // `var a: Array[String] = []` / `[...]` is accepted). Otherwise the engine does
+                // not infer a literal's element type past `Variant`.
+                let pushed = match expected {
+                    Expectation::Has(Ty::Array(e)) => Some((**e).clone()),
+                    _ => None,
+                };
+                let elem_exp = pushed.clone().map_or(Expectation::None, Expectation::Has);
                 for e in elems {
-                    self.infer_expr(e, &Expectation::None);
+                    self.infer_expr(e, &elem_exp);
                 }
-                // Match the engine: a literal does not infer its element type past `Variant`.
-                Ty::array_of_variant()
+                pushed.map_or_else(Ty::array_of_variant, |e| Ty::Array(Box::new(e)))
             }
             Expr::Dict(entries) => {
+                let pushed = match expected {
+                    Expectation::Has(Ty::Dict(k, v)) => Some(((**k).clone(), (**v).clone())),
+                    _ => None,
+                };
+                let (kx, vx) = pushed
+                    .clone()
+                    .map_or((Expectation::None, Expectation::None), |(k, v)| {
+                        (Expectation::Has(k), Expectation::Has(v))
+                    });
                 for (k, v) in entries {
-                    self.infer_expr(k, &Expectation::None);
+                    self.infer_expr(k, &kx);
                     if let Some(v) = v {
-                        self.infer_expr(v, &Expectation::None);
+                        self.infer_expr(v, &vx);
                     }
                 }
-                Ty::dict_of_variant()
+                pushed.map_or_else(Ty::dict_of_variant, |(k, v)| {
+                    Ty::Dict(Box::new(k), Box::new(v))
+                })
             }
             Expr::Lambda { params, body } => {
                 self.infer_lambda(&params, &body);
@@ -604,6 +649,11 @@ impl Cx<'_> {
             // `$Node`/`%Unique`/`get_node()` are always `Object(Node)` (Playbook §2).
             Expr::GetNode => self.node_ty(),
         }
+    }
+
+    /// Whether `id` is the `null` literal.
+    fn is_null(&self, id: ExprId) -> bool {
+        matches!(self.body.expr(id), Expr::Literal(Literal::Null))
     }
 
     fn literal_ty(&self, lit: Literal) -> Ty {
@@ -690,6 +740,11 @@ impl Cx<'_> {
                 self.int_ty()
             };
         }
+        // A seam operand keeps the result on the seam (`a + unknown` is `Unknown`, not the
+        // gradual `Variant`, so `var x := a + unknown` never warns).
+        if lt.is_unknown() || rt.is_unknown() || lt.is_error() || rt.is_error() {
+            return Ty::Unknown;
+        }
         Ty::Variant
     }
 
@@ -716,9 +771,12 @@ impl Cx<'_> {
                 self.expr_ty.insert(callee, Ty::Callable);
                 ret
             }
+            // Calling an arbitrary expression (a `Callable` value, an IIFE, or a parser artifact
+            // where a `(` line was absorbed onto a multi-line lambda): the return type isn't
+            // tracked → the seam, not `Variant`, so `var x := f()()` never warns.
             _ => {
                 self.infer_expr(callee, &Expectation::None);
-                Ty::Variant
+                Ty::Unknown
             }
         }
     }
@@ -742,11 +800,15 @@ impl Cx<'_> {
         if let Some(f) = self.api.gdscript_builtin(name) {
             return resolve::layer_to_ty(self.api, f.ret);
         }
-        // A builtin / class name used as a constructor: `Vector2(...)` / `Color(...)`.
+        // A builtin / class name used as a constructor: `Vector2(...)` / `Array(...)`.
+        // Normalize via `resolve_tyref` so `Array`/`Dictionary`/`Callable`/`Signal` land on
+        // their dedicated `Ty` variants rather than `Builtin(...)`.
         if let Some(b) = self.api.builtin_by_name(name) {
-            return Ty::Builtin(b);
+            return ty::resolve_tyref(self.api, &TyRef::Builtin(b));
         }
-        Ty::Variant
+        // Otherwise unresolved — most likely a cross-file global / autoload / a method on a
+        // `class_name` base we can't see. Treat as the seam so `var x := foo()` never warns.
+        Ty::Unknown
     }
 
     fn func_return_ty(&self, annotation: Option<&str>) -> Ty {
@@ -772,21 +834,31 @@ impl Cx<'_> {
         }
 
         match &recv_ty {
-            // Uninformative receivers are unchecked (no diagnostic, no false positive).
-            t if t.is_uninformative() => Ty::Variant,
+            // Uninformative receivers are unchecked and **propagate the seam**: a member of an
+            // `Unknown` (cross-file) value is itself `Unknown` (never warns), a member of a
+            // `Variant` is `Variant`, of an `Error` is `Error`. Collapsing `Unknown` to
+            // `Variant` here would wrongly fire `INFERENCE_ON_VARIANT` on `var x := other.field`.
+            t if t.is_uninformative() => recv_ty.clone(),
             Ty::Object(class) => {
-                if let Some(m) = self.api.lookup_member(*class, name) {
+                if name == "new" {
+                    // `Class.new(...)` always constructs an instance of the class (some classes,
+                    // e.g. GDScript, also carry a modeled `new` member — the constructor wins).
+                    recv_ty.clone()
+                } else if let Some(m) = self.api.lookup_member(*class, name) {
                     self.member_ref_ty(&m, as_method)
+                } else if let Some(t) = self.class_enum_value(*class, name) {
+                    // A statically-accessed enum value (`Control.PRESET_FULL_RECT`).
+                    t
                 } else {
                     // Self with an Object base already checked own members above.
                     self.emit_unsafe(name, &recv_ty, name_range, as_method);
                     Ty::Variant
                 }
             }
-            Ty::Builtin(_) | Ty::Array(_) | Ty::Dict(..) => {
+            Ty::Builtin(_) | Ty::Array(_) | Ty::Dict(..) | Ty::Callable | Ty::Signal(_) => {
                 self.builtin_member_ty(&recv_ty, name, name_range, as_method)
             }
-            // Enum value access (`MyEnum.VALUE`) is an `int`; signals/callables/etc. unchecked.
+            // Enum value access (`MyEnum.VALUE`) is an `int`.
             Ty::Enum(_) => self.int_ty(),
             _ => Ty::Variant,
         }
@@ -857,11 +929,41 @@ impl Cx<'_> {
         if let Some(member) = self.api.builtin_member(bid, name) {
             return ty::resolve_tyref(self.api, &member.ty);
         }
+        // Static constants (`Vector2.ZERO`, `Color.WHITE`) and enum values (`Variant.Type.*`).
+        let data = self.api.builtin(bid);
+        if let Some(c) = data.constants.iter().find(|c| c.name == name) {
+            return ty::resolve_tyref(self.api, &c.ty);
+        }
+        if data
+            .enums
+            .iter()
+            .any(|e| e.values.iter().any(|v| v.name == name))
+        {
+            return self.int_ty();
+        }
         if self.api.builtin_method(bid, name).is_some() {
             return Ty::Callable;
         }
         self.emit_unsafe(name, recv, range, false);
         Ty::Variant
+    }
+
+    /// The type of a class enum **value** accessed statically (`Control.PRESET_FULL_RECT`):
+    /// the engine exposes enum values as class members, so search every (inherited) enum's
+    /// values. Returns `int` when found.
+    fn class_enum_value(&self, class: gdscript_api::ClassId, name: &str) -> Option<Ty> {
+        let mut cur = Some(class);
+        while let Some(cid) = cur {
+            let c = self.api.class(cid);
+            if c.enums
+                .iter()
+                .any(|e| e.values.iter().any(|v| v.name == name))
+            {
+                return Some(self.int_ty());
+            }
+            cur = c.base;
+        }
+        None
     }
 
     /// The builtin id backing a builtin / `Array` / `Dictionary` receiver.
@@ -870,6 +972,8 @@ impl Cx<'_> {
             Ty::Builtin(b) => Some(*b),
             Ty::Array(_) => self.api.builtin_by_name("Array"),
             Ty::Dict(..) => self.api.builtin_by_name("Dictionary"),
+            Ty::Callable => self.api.builtin_by_name("Callable"),
+            Ty::Signal(_) => self.api.builtin_by_name("Signal"),
             _ => None,
         }
     }
@@ -884,6 +988,9 @@ impl Cx<'_> {
                 .indexing_return
                 .as_ref()
                 .map_or(Ty::Variant, |r| ty::resolve_tyref(self.api, r)),
+            // Indexing through the seam stays on the seam (never warns).
+            Ty::Unknown => Ty::Unknown,
+            Ty::Error => Ty::Error,
             _ => Ty::Variant,
         }
     }
@@ -892,23 +999,46 @@ impl Cx<'_> {
     fn loop_var_ty(&self, iter: &Ty) -> Ty {
         match iter {
             Ty::Array(elem) => (**elem).clone(),
-            // `for i in 5` / `for i in range(...)` → int.
-            Ty::Builtin(b) if self.api.builtin(*b).name == "int" => self.int_ty(),
-            // `for c in "abc"` → String.
-            Ty::Builtin(b) if self.api.builtin(*b).name == "String" => self.builtin("String"),
+            Ty::Builtin(b) => {
+                let data = self.api.builtin(*b);
+                if data.name == "int" {
+                    // `for i in 5` / `for i in range(...)` → int.
+                    self.int_ty()
+                } else if let Some(r) = &data.indexing_return {
+                    // `for c in "abc"` → String; `for s in packed_string_array` → String; …
+                    ty::resolve_tyref(self.api, r)
+                } else {
+                    Ty::Variant
+                }
+            }
+            // Iterating a seam value keeps the loop var on the seam (never warns).
+            Ty::Unknown => Ty::Unknown,
+            Ty::Error => Ty::Error,
             _ => Ty::Variant,
         }
     }
 
     fn infer_lambda(&mut self, params: &[ParamBinding], body: &[body::StmtId]) {
-        // Lambda params shadow within the body; restore the outer locals afterward.
-        let saved = self.locals.clone();
+        // Lambda params shadow within the body; restore the outer locals afterward. A `return`
+        // inside the lambda is the *lambda's* return, not the enclosing function's — so disable
+        // return checking (set the expected return to `Variant`) while walking the body.
+        let saved_locals = self.locals.clone();
+        let saved_ret = std::mem::replace(&mut self.return_ty, Ty::Variant);
         for p in params {
             let ty = self.param_ty(p);
+            self.bindings.push(Binding {
+                name_range: p.name_range,
+                ty: ty.clone(),
+                init: None,
+                annotated: p.type_ref.is_some(),
+                inferred_colon_eq: false,
+                kind: BindingKind::Param,
+            });
             self.locals.insert(p.name.clone(), ty);
         }
         self.infer_block(body);
-        self.locals = saved;
+        self.return_ty = saved_ret;
+        self.locals = saved_locals;
     }
 
     fn param_ty(&mut self, p: &ParamBinding) -> Ty {
@@ -951,8 +1081,8 @@ impl Cx<'_> {
         match item {
             ClassItem::EnumVariant => self.int_ty(),
             ClassItem::Member(_) => match self.class.member(item) {
-                Some(Member::Var(v)) => self.resolve_decl_annotation(v.ptr),
-                Some(Member::Const(c)) => self.resolve_decl_annotation(c.ptr),
+                Some(Member::Var(v)) => self.field_ty(&v.name, v.ptr),
+                Some(Member::Const(c)) => self.field_ty(&c.name, c.ptr),
                 Some(Member::Func(f)) => {
                     if as_method {
                         self.func_return_ty(f.return_type.as_deref())
@@ -965,6 +1095,15 @@ impl Cx<'_> {
                 Some(Member::Enum(_)) | None => Ty::Variant,
             },
         }
+    }
+
+    /// The type of an own field (`var`/`const`): the type seeded by the field pre-pass (which
+    /// captures the inferred type of `var n := 0`), falling back to the written annotation.
+    fn field_ty(&self, name: &str, ptr: AstPtr) -> Ty {
+        if let Some(t) = self.class.member_types.get(name) {
+            return t.clone();
+        }
+        self.resolve_decl_annotation(ptr)
     }
 
     /// Resolve a declaration's annotation (recovering its `TypeRef` node), else `Variant`.
@@ -1211,6 +1350,51 @@ mod tests {
         // `:=` from an untyped (Variant) param.
         let h = infer_first_func("func f(x):\n\tvar y := x\n");
         assert!(codes(&h).contains(&INFERENCE_ON_VARIANT));
+    }
+
+    #[test]
+    fn lambda_var_is_callable_not_variant() {
+        let h = infer_first_func("func f():\n\tvar cb := func():\n\t\tpass\n");
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_a_lambda_value_is_seam_not_variant() {
+        // A `(` line absorbed onto a multi-line lambda (a parser artifact) makes the var init a
+        // call whose callee is the lambda; the result is the seam (Unknown), so no false warning.
+        let src = "func f(state, i, loop):\n\tvar cb := func():\n\t\tif i >= state.size():\n\t\t\treturn\n\t(loop as SceneTree).process_frame.connect(cb, CONNECT_ONE_SHOT)\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_var_over_packed_string_array_is_string() {
+        // `for s in "a,b".split(",")` iterates a PackedStringArray → String, so `s.to_int()`
+        // resolves and `var x := s` does not warn.
+        let h = infer_first_func("func f():\n\tfor s in \"a,b\".split(\",\"):\n\t\tvar x := s\n");
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn class_new_is_object_not_variant() {
+        let h = infer_first_func("func f():\n\tvar s := GDScript.new()\n");
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            h.result.diagnostics
+        );
     }
 
     #[test]

@@ -81,6 +81,9 @@ fn resolve_named(api: &EngineApi, names: &[String], args: &[GdNode]) -> Ty {
         match head.as_str() {
             "void" => return Ty::Void,
             "Variant" => return Ty::Variant,
+            // Dedicated variants (see `resolve_tyref`) so annotations match lambda/signal values.
+            "Callable" => return Ty::Callable,
+            "Signal" => return Ty::Signal(None),
             "Array" => return Ty::Array(Box::new(elem_arg(api, args, 0))),
             "Dictionary" => {
                 return Ty::Dict(
@@ -189,6 +192,10 @@ pub struct ClassScope<'a> {
     pub tree: &'a ItemTree,
     /// The resolved base type (`Object(id)` for an engine base, else `Unknown`).
     pub base: Ty,
+    /// Resolved types of this class's own fields (`var`/`const`), seeded by a first inference
+    /// pass over the field initializers so member references see the *inferred* type (e.g.
+    /// `var n := 0` → `int`), not just the annotation. Empty until populated.
+    pub member_types: FxHashMap<SmolStr, Ty>,
     members: FxHashMap<SmolStr, ClassItem>,
 }
 
@@ -217,6 +224,7 @@ impl<'a> ClassScope<'a> {
         Self {
             tree,
             base: resolve_base(api, tree),
+            member_types: FxHashMap::default(),
             members,
         }
     }

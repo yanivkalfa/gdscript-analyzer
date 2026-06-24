@@ -200,8 +200,11 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
                 let from_name = api.builtin(*from_id).name.as_str();
                 let to_name = api.builtin(*to_id).name.as_str();
                 match (from_name, to_name) {
-                    ("int", "float") => Assign::Ok,        // widening, silent
                     ("float", "int") => Assign::Narrowing, // NARROWING_CONVERSION
+                    // `int`→`float` widening (silent) + Godot's string-ish auto-conversions.
+                    ("int", "float")
+                    | ("String", "StringName" | "NodePath")
+                    | ("StringName" | "NodePath", "String") => Assign::Ok,
                     _ => Assign::No,
                 }
             }
@@ -217,17 +220,34 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
         },
         Ty::Object(to_class) => match from {
             Ty::Object(from_class) if api.is_subclass(*from_class, *to_class) => Assign::Ok,
+            // Downcast (a base value into a derived slot): permitted with a runtime check —
+            // unsafe, but not a hard error. Real code relies on `var c: Control = get_child(0)`.
+            Ty::Object(from_class) if api.is_subclass(*to_class, *from_class) => Assign::OkUnsafe,
             // A script reference is opaque — treat like the seam, never a mismatch.
             Ty::ScriptRef(_) => Assign::Ok,
             _ => Assign::No,
         },
-        // Arrays are invariant: element types must be exactly equal (engine reality, §3.5.4).
+        // Typed arrays are invariant — but only between two *informative* element types
+        // (`Array[Button]` ↛ `Array[Node]`). A bare `Array`/`Array[Variant]`, or an
+        // `Array[Unknown]` (cross-file element), assigns freely: the engine permits
+        // untyped→typed with a runtime check, and the seam must never hard-error.
         Ty::Array(to_elem) => match from {
-            Ty::Array(from_elem) if from_elem == to_elem => Assign::Ok,
+            Ty::Array(from_elem)
+                if from_elem == to_elem
+                    || from_elem.is_uninformative()
+                    || to_elem.is_uninformative() =>
+            {
+                Assign::Ok
+            }
             _ => Assign::No,
         },
         Ty::Dict(to_k, to_v) => match from {
-            Ty::Dict(from_k, from_v) if from_k == to_k && from_v == to_v => Assign::Ok,
+            Ty::Dict(from_k, from_v)
+                if (from_k == to_k || from_k.is_uninformative() || to_k.is_uninformative())
+                    && (from_v == to_v || from_v.is_uninformative() || to_v.is_uninformative()) =>
+            {
+                Assign::Ok
+            }
             _ => Assign::No,
         },
         Ty::Signal(_) => {
@@ -263,7 +283,16 @@ pub fn resolve_tyref(api: &EngineApi, tyref: &TyRef) -> Ty {
     match tyref {
         TyRef::Void => Ty::Void,
         TyRef::Variant => Ty::Variant,
-        TyRef::Builtin(id) => Ty::Builtin(*id),
+        // `Array`/`Dictionary`/`Callable`/`Signal` are engine builtins, but we keep dedicated
+        // `Ty` variants for them (a lambda is `Ty::Callable`, `[]` is `Ty::Array`); normalize
+        // the bare builtin form so annotations, constructors, and values all agree.
+        TyRef::Builtin(id) => match api.builtin(*id).name.as_str() {
+            "Callable" => Ty::Callable,
+            "Signal" => Ty::Signal(None),
+            "Array" => Ty::array_of_variant(),
+            "Dictionary" => Ty::dict_of_variant(),
+            _ => Ty::Builtin(*id),
+        },
         TyRef::Class(id) => Ty::Object(*id),
         TyRef::TypedArray(elem) => Ty::Array(Box::new(resolve_elemref(api, elem))),
         TyRef::TypedDict(k, v) => Ty::Dict(
@@ -343,9 +372,13 @@ mod tests {
         let api = gdscript_api::bundled();
         let node = Ty::Object(api.class_by_name("Node").unwrap());
         let node2d = Ty::Object(api.class_by_name("Node2D").unwrap());
-        // Node2D is a Node; a Node is not a Node2D.
+        // Node2D is a Node (upcast → Ok); a Node into a Node2D slot is a downcast — permitted
+        // with a runtime check (unsafe), not a hard mismatch.
         assert_eq!(is_assignable(api, &node2d, &node), Assign::Ok);
-        assert_eq!(is_assignable(api, &node, &node2d), Assign::No);
+        assert_eq!(is_assignable(api, &node, &node2d), Assign::OkUnsafe);
+        // An unrelated builtin is a real mismatch.
+        let s = ty_of(api, "String");
+        assert_eq!(is_assignable(api, &s, &node), Assign::No);
     }
 
     #[test]
