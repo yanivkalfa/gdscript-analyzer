@@ -459,6 +459,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn leading_utf8_bom_is_trivia_not_an_error() {
+        // A `.gd` saved with a UTF-8 BOM is valid GDScript (Godot strips it). The BOM must
+        // be lexed as trivia, round-trip byte-for-byte, and NOT produce a parse error at 1:1.
+        let src = "\u{feff}class_name Foo\nextends Node\n";
+        let parse = parse(src);
+        assert_eq!(
+            parse.syntax_node().to_string(),
+            src,
+            "BOM file must round-trip byte-for-byte"
+        );
+        assert!(
+            parse.errors().is_empty(),
+            "BOM-prefixed file should parse clean: {:?}",
+            parse.errors()
+        );
+        // The BOM does not shift the first declaration's indentation: `class_name` is at col 0.
+        assert!(
+            structure(src).starts_with("(SourceFile (ClassNameDecl"),
+            "{}",
+            structure(src)
+        );
+    }
+
+    #[test]
+    fn multiline_lambda_does_not_absorb_following_paren_line() {
+        // A block-body lambda assigned to a var, followed by a statement that begins with
+        // `(`. The dedent ends the lambda; the `(...)` line is its OWN statement — it must
+        // NOT be parsed as a postfix call on the lambda. (Regression: the parser used to
+        // absorb the `(` as `CallExpr(LambdaExpr, …)`.)
+        let src = "func f():\n\tvar cb := func():\n\t\treturn 1\n\t(self).process()\n";
+        let st = structure(src);
+        assert!(
+            st.contains("(VarDecl (Name) (LambdaExpr"),
+            "lambda should be the var initializer, standalone: {st}"
+        );
+        assert!(
+            !st.contains("CallExpr (LambdaExpr"),
+            "the following `(` line must not be absorbed as a call on the lambda: {st}"
+        );
+        // The `(self).process()` line is a separate ExprStmt with its own call chain.
+        assert!(
+            st.contains("(ExprStmt (CallExpr (FieldExpr (ParenExpr"),
+            "the `(self).process()` line should be its own statement: {st}"
+        );
+        round_trips(src);
+    }
+
+    #[test]
+    fn inline_lambda_still_chains_postfix() {
+        // An *inline* (single-line) lambda has no dedent, so a postfix `.call()` on the same
+        // logical line must still chain — the fix only suppresses postfix after a block body.
+        let src = "var x = (func(): return 1).call()\n";
+        let st = structure(src);
+        assert!(
+            st.contains("CallExpr (FieldExpr (ParenExpr (LambdaExpr"),
+            "inline lambda should still accept a postfix chain: {st}"
+        );
+        round_trips(src);
+    }
+
     /// A broad, realistic GDScript file exercising most of the grammar. The key
     /// invariant is that it round-trips byte-for-byte and parses without panicking.
     const CORPUS: &str = r#"@tool

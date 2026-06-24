@@ -56,6 +56,18 @@ pub enum Severity {
     Hint,
 }
 
+/// What analysis layer produced a diagnostic — lets clients group/filter parse vs. type
+/// diagnostics without parsing the `code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticSource {
+    /// A lexer / parser / indentation diagnostic (Phase 1).
+    #[default]
+    Syntax,
+    /// A type / semantic diagnostic from inference (Phase 2).
+    Type,
+}
+
 /// A diagnostic with a byte range, a stable machine code, a severity, and a message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
@@ -63,10 +75,17 @@ pub struct Diagnostic {
     pub range: TextRange,
     /// Severity.
     pub severity: Severity,
-    /// A stable code, e.g. `GDSCRIPT_SYNTAX`.
+    /// A stable code, e.g. `GDSCRIPT_SYNTAX` or `INTEGER_DIVISION`.
     pub code: String,
     /// Human-readable message.
     pub message: String,
+    /// Which analysis layer produced it. Defaults to [`DiagnosticSource::Syntax`] so older
+    /// serialized diagnostics and Phase-1 call sites round-trip unchanged.
+    #[serde(default)]
+    pub source: DiagnosticSource,
+    /// Quick-fixes offered for this diagnostic (e.g. "add type annotation"). Empty when none.
+    #[serde(default)]
+    pub fixes: Vec<CodeAction>,
 }
 
 /// The kind of a document symbol (a subset of LSP `SymbolKind`, named for GDScript).
@@ -160,6 +179,133 @@ pub struct CompletionItem {
     pub kind: CompletionKind,
     /// Optional text to insert (defaults to `label`).
     pub insert_text: Option<String>,
+    /// Optional secondary text shown after the label — a type or signature, e.g. `: int`
+    /// or `(node: Node) -> void`. Phase 2 fills this for typed members; `None` keeps the
+    /// Phase-1 by-name items unchanged.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 PODs — hover, signature help, inlay hints, code actions, navigation.
+// Each is an engine-/protocol-neutral result struct (byte offsets, serde). A feature
+// returning one of these maps it to its own protocol at the client edge. See
+// `plans/PHASE-2-IMPLEMENTATION-PLAYBOOK.md` §1.1.
+// ---------------------------------------------------------------------------
+
+/// Documentation rendered as Markdown (engine `BBCode` already converted at codegen time).
+pub type Markdown = String;
+
+/// The result of a hover query: an inferred type / signature label plus engine docs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoverResult {
+    /// The inferred type / signature rendered for display, e.g. `Node` or
+    /// `add_child(node: Node) -> void`. `None` when the type is `Unknown` (elided — the
+    /// Phase-3 cross-file seam) so we never show a placeholder type.
+    pub ty_label: Option<String>,
+    /// Engine documentation as Markdown. Empty when no doc XML is available.
+    pub doc: Markdown,
+    /// The source range the hover applies to (the hovered token / expression).
+    pub range: TextRange,
+}
+
+/// One parameter within a [`SignatureInfo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParamInfo {
+    /// The parameter label, e.g. `node: Node` or `force_readable_name: bool = false`.
+    pub label: String,
+    /// Optional documentation (Markdown).
+    pub doc: Markdown,
+}
+
+/// One signature shown in signature help (GDScript has no overloads, so usually one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureInfo {
+    /// The full signature label, e.g.
+    /// `add_child(node: Node, force_readable_name: bool = false) -> void`.
+    pub label: String,
+    /// Optional documentation (Markdown).
+    pub doc: Markdown,
+    /// The parameters, in order.
+    pub params: Vec<ParamInfo>,
+}
+
+/// The result of a signature-help query at a call site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureHelp {
+    /// The candidate signatures.
+    pub signatures: Vec<SignatureInfo>,
+    /// Index into `signatures` of the active one.
+    pub active_signature: u32,
+    /// Index of the active parameter within the active signature. A vararg call keeps the
+    /// last parameter active once the fixed parameters are exhausted.
+    pub active_parameter: u32,
+}
+
+/// What an [`InlayHint`] represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InlayHintKind {
+    /// An inferred type, e.g. `: int` after a `:=` declaration or an unannotated parameter.
+    Type,
+    /// An inferred parameter name shown at a call site.
+    Parameter,
+}
+
+/// An inline hint rendered at a byte offset (e.g. the `: int` the engine LSP omits).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlayHint {
+    /// The byte offset at which to render the hint.
+    pub offset: u32,
+    /// The hint text, e.g. `: int`.
+    pub label: String,
+    /// What kind of hint it is.
+    pub kind: InlayHintKind,
+}
+
+/// A single text edit: replace `range` with `new_text`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextEdit {
+    /// The byte range to replace.
+    pub range: TextRange,
+    /// The replacement text.
+    pub new_text: String,
+}
+
+/// A set of edits to apply. Phase 2 is single-file, so every edit targets `file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceChange {
+    /// The file the edits apply to.
+    pub file: FileId,
+    /// The edits (non-overlapping; the client sorts and applies them).
+    pub edits: Vec<TextEdit>,
+}
+
+/// A code action / quick-fix: a titled, optionally-kinded [`SourceChange`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeAction {
+    /// Human-readable title, e.g. `Add type annotation`.
+    pub title: String,
+    /// An LSP-style kind such as `quickfix` or `refactor.rewrite`; `None` if unspecified.
+    pub kind: Option<String>,
+    /// The edit this action performs.
+    pub edit: SourceChange,
+}
+
+/// A navigation target (goto-definition / -declaration). Phase 2 only ever points within
+/// the same file; cross-file targets arrive in Phase 3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavTarget {
+    /// The file the target lives in.
+    pub file: FileId,
+    /// The full range of the target's declaration.
+    pub full_range: TextRange,
+    /// The name / selection range to focus within `full_range`.
+    pub focus_range: TextRange,
+    /// The target symbol's name.
+    pub name: String,
+    /// The target symbol's kind.
+    pub kind: SymbolKind,
 }
 
 /// A read query was cancelled by a concurrent change. (Phase 1 never actually cancels,

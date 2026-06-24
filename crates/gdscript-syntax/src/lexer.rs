@@ -29,6 +29,11 @@ pub struct RawToken {
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq)]
 enum LexKind {
     // ---- trivia ----
+    // A UTF-8 BOM (`U+FEFF`). High priority so it wins over any other rule; lexed
+    // wherever it appears (a leading BOM is the real case — Godot strips it), kept as
+    // trivia for losslessness.
+    #[token("\u{feff}", priority = 10)]
+    Bom,
     #[regex(r"[ \t]+")]
     Whitespace,
     #[regex(r"\r\n|\n|\r")]
@@ -246,6 +251,7 @@ fn map_kind(kind: LexKind, text: &str) -> SyntaxKind {
     use LexKind as L;
     use SyntaxKind as S;
     match kind {
+        L::Bom => S::Bom,
         L::Whitespace => S::Whitespace,
         L::NewlinePhys => S::NewlinePhys,
         L::LineContinuation => S::LineContinuation,
