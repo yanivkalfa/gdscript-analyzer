@@ -1,6 +1,9 @@
-//! Ad-hoc corpus runner (Phase-1 parser hardening): parse every `.gd` file under a
-//! directory and report parse diagnostics. Phase 1 emits *only* parse diagnostics, so
-//! any diagnostic (or panic) on engine-valid GDScript is a parser gap worth fixing.
+//! Ad-hoc corpus runner: load every `.gd` file under a directory through the public
+//! [`AnalysisHost`] / [`gdscript_ide::Analysis`] API and report its diagnostics (parse +
+//! the Phase-2 §5 type diagnostics). It exercises the full salsa pipeline end to end
+//! (`apply_change` → tracked `parse`/`analyze_file` → features), so it doubles as the
+//! zero-behaviour-change regression check across the Phase-3 migrations: 0 panics and a
+//! stable diagnostic count on a real project.
 //!
 //! Usage: `cargo run -p gdscript-ide --example corpus -- <dir> [--show]`
 
