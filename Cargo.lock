@@ -558,6 +558,7 @@ dependencies = [
  "gdscript-hir",
  "gdscript-syntax",
  "rustc-hash",
+ "salsa",
  "text-size",
 ]
 

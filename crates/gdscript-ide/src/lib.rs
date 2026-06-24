@@ -7,32 +7,42 @@
 //! `lsp-types`. Each client (LSP server, the guitkx adapter, the CLI, the WASM
 //! playground) maps these POD results to its own protocol.
 //!
-//! Phase 1 (Tier 0) implements four features for real — parse diagnostics, document
-//! symbols, folding ranges, and by-name completion — and stubs the rest. There is no
-//! salsa yet: a plain VFS map and whole-file reparse on query. Every derived
-//! computation is a pure `(text) -> value` function so the Phase-3 salsa swap is
-//! localized. The crate is `wasm32`-safe (CI guards this).
+//! Phase 3 (M0) swaps the engine behind these types from a plain VFS map to a **salsa**
+//! query graph in [`gdscript_db`]: the input world is now `FileText` salsa inputs, mutated
+//! through `apply_change`; [`Analysis`] is a cloned database handle (salsa handles are
+//! `Clone + Send`, replacing the old `Arc<map>` snapshot). Cancellation is now *real* —
+//! a concurrent `apply_change` cancels in-flight reads on outstanding handles, which unwind
+//! into `Err(Cancelled)` at the query boundary (see [`catch`]). The public API shape is
+//! unchanged. The crate stays `wasm32`-safe (CI guards this).
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::sync::Arc;
-
-use rustc_hash::FxHashMap;
 
 use gdscript_base::{
     Cancellable, CodeAction, CompletionItem, Diagnostic, DocumentSymbol, FileId, FilePosition,
     FoldRange, HoverResult, InlayHint, SignatureHelp,
 };
+use gdscript_db::{Db, RootDatabase};
+use salsa::Durability;
 
 mod features;
 mod semantic;
 
+/// Run a read query, turning a salsa cancellation (a concurrent `apply_change` invalidated the
+/// snapshot) into `Err(Cancelled)`. The closure is `AssertUnwindSafe` because the database
+/// handle it borrows is shared, immutable for the duration of the read, and salsa's unwind is
+/// panic-safe by design.
+fn catch<T>(f: impl FnOnce() -> T) -> Cancellable<T> {
+    salsa::Cancelled::catch(std::panic::AssertUnwindSafe(f)).map_err(|_| gdscript_base::Cancelled)
+}
+
 /// The single mutable owner of analysis state — one per project/workspace.
 ///
-/// The input world is a virtual file system (`FileId` → UTF-8 text); the host never
-/// reads paths. Clients push text via [`AnalysisHost::apply_change`].
+/// The input world is a virtual file system (`FileId` → UTF-8 text) held as salsa inputs; the
+/// host never reads paths. Clients push text via [`AnalysisHost::apply_change`].
 #[derive(Debug, Clone, Default)]
 pub struct AnalysisHost {
-    files: Arc<FxHashMap<FileId, Arc<str>>>,
+    db: RootDatabase,
 }
 
 /// A batch of input changes. `None` text removes the file.
@@ -67,40 +77,39 @@ impl AnalysisHost {
         Self::default()
     }
 
-    /// Apply a batch of input changes. The **only** mutation entry point.
+    /// Apply a batch of input changes. The **only** mutation entry point — each `set`/`remove`
+    /// bumps the salsa revision (and cancels any in-flight reads on outstanding [`Analysis`]
+    /// handles). Edited files are `LOW` durability (they change every keystroke).
     pub fn apply_change(&mut self, change: Change) {
-        let files = Arc::make_mut(&mut self.files);
         for (id, text) in change.files {
             match text {
-                Some(t) => {
-                    files.insert(id, t);
-                }
-                None => {
-                    files.remove(&id);
-                }
+                Some(t) => self.db.set_file_text(id, &t, Durability::LOW),
+                None => self.db.remove_file(id),
             }
         }
     }
 
-    /// A cheap, cloneable, `Send` snapshot for read queries.
+    /// A cheap, cloneable, `Send` snapshot for read queries (a cloned salsa database handle).
     #[must_use]
     pub fn analysis(&self) -> Analysis {
         Analysis {
-            files: Arc::clone(&self.files),
+            db: self.db.clone(),
         }
     }
 }
 
-/// An immutable snapshot of the world. Every query is `Cancellable` (Phase 1 never
-/// actually cancels, but the type is on the surface for the Phase-3 salsa swap).
+/// An immutable snapshot of the world — a cloned salsa handle. Every query is [`Cancellable`]:
+/// a concurrent `apply_change` cancels in-flight reads, which the client re-issues against the
+/// fresh snapshot.
 #[derive(Debug, Clone)]
 pub struct Analysis {
-    files: Arc<FxHashMap<FileId, Arc<str>>>,
+    db: RootDatabase,
 }
 
 impl Analysis {
-    fn text(&self, file: FileId) -> Option<&str> {
-        self.files.get(&file).map(|t| &**t)
+    /// The text for `file`, if present in the input world.
+    fn text(&self, file: FileId) -> Option<Arc<str>> {
+        self.db.file_text(file).map(|ft| ft.text(&self.db).clone())
     }
 
     // ---- Tier-0 features: real data ----
@@ -108,12 +117,12 @@ impl Analysis {
     /// A pretty-printed dump of the syntax tree (debugging / playground).
     ///
     /// # Errors
-    /// Currently infallible; returns `Err(Cancelled)` only once Phase 3 wires real
-    /// cancellation.
+    /// `Err(Cancelled)` if a concurrent `apply_change` invalidated this snapshot.
     pub fn syntax_tree(&self, file: FileId) -> Cancellable<Option<String>> {
-        Ok(self
-            .text(file)
-            .map(|t| gdscript_syntax::parse(t).debug_tree()))
+        catch(|| {
+            self.text(file)
+                .map(|t| gdscript_syntax::parse(&t).debug_tree())
+        })
     }
 
     /// Parse-error diagnostics ∪ the Phase-2 §5 type diagnostics.
@@ -121,14 +130,15 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn diagnostics(&self, file: FileId) -> Cancellable<Vec<Diagnostic>> {
-        Ok(self
-            .text(file)
-            .map(|t| {
-                let mut diags = features::diagnostics(t);
-                diags.extend(semantic::type_diagnostics(t));
-                diags
-            })
-            .unwrap_or_default())
+        catch(|| {
+            self.text(file)
+                .map(|t| {
+                    let mut diags = features::diagnostics(&t);
+                    diags.extend(semantic::type_diagnostics(&t));
+                    diags
+                })
+                .unwrap_or_default()
+        })
     }
 
     /// The document outline (classes, funcs, vars, consts, enums, signals, members).
@@ -136,10 +146,11 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn document_symbols(&self, file: FileId) -> Cancellable<Vec<DocumentSymbol>> {
-        Ok(self
-            .text(file)
-            .map(features::document_symbols)
-            .unwrap_or_default())
+        catch(|| {
+            self.text(file)
+                .map(|t| features::document_symbols(&t))
+                .unwrap_or_default()
+        })
     }
 
     /// Foldable ranges (blocks, `#region` pairs, multi-line brackets).
@@ -147,10 +158,11 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn folding_ranges(&self, file: FileId) -> Cancellable<Vec<FoldRange>> {
-        Ok(self
-            .text(file)
-            .map(features::folding_ranges)
-            .unwrap_or_default())
+        catch(|| {
+            self.text(file)
+                .map(|t| features::folding_ranges(&t))
+                .unwrap_or_default()
+        })
     }
 
     /// Completions. After `receiver.` it offers the inferred member set; otherwise (or when
@@ -160,13 +172,14 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn completions(&self, pos: FilePosition) -> Cancellable<Vec<CompletionItem>> {
-        Ok(self
-            .text(pos.file)
-            .map(|t| {
-                semantic::member_completions(t, pos.offset)
-                    .unwrap_or_else(|| features::completions(t, pos.offset))
-            })
-            .unwrap_or_default())
+        catch(|| {
+            self.text(pos.file)
+                .map(|t| {
+                    semantic::member_completions(&t, pos.offset)
+                        .unwrap_or_else(|| features::completions(&t, pos.offset))
+                })
+                .unwrap_or_default()
+        })
     }
 
     /// Hover: the inferred type of the expression / binding under the cursor (`Unknown`
@@ -175,9 +188,10 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn hover(&self, pos: FilePosition) -> Cancellable<Option<HoverResult>> {
-        Ok(self
-            .text(pos.file)
-            .and_then(|t| semantic::hover(t, pos.offset)))
+        catch(|| {
+            self.text(pos.file)
+                .and_then(|t| semantic::hover(&t, pos.offset))
+        })
     }
 
     /// Inlay `: T` hints on `:=` declarations + unannotated params / `for`-vars (suppressed
@@ -186,10 +200,11 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn inlay_hints(&self, file: FileId) -> Cancellable<Vec<InlayHint>> {
-        Ok(self
-            .text(file)
-            .map(semantic::inlay_hints)
-            .unwrap_or_default())
+        catch(|| {
+            self.text(file)
+                .map(|t| semantic::inlay_hints(&t))
+                .unwrap_or_default()
+        })
     }
 
     /// Signature help at a call site (active parameter by top-level comma count).
@@ -197,9 +212,10 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn signature_help(&self, pos: FilePosition) -> Cancellable<Option<SignatureHelp>> {
-        Ok(self
-            .text(pos.file)
-            .and_then(|t| semantic::signature_help(t, pos.offset)))
+        catch(|| {
+            self.text(pos.file)
+                .and_then(|t| semantic::signature_help(&t, pos.offset))
+        })
     }
 
     /// Code actions at a position (currently "add type annotation").
@@ -207,10 +223,11 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn code_actions(&self, pos: FilePosition) -> Cancellable<Vec<CodeAction>> {
-        Ok(self
-            .text(pos.file)
-            .map(|t| semantic::code_actions(t, pos.offset, pos.file))
-            .unwrap_or_default())
+        catch(|| {
+            self.text(pos.file)
+                .map(|t| semantic::code_actions(&t, pos.offset, pos.file))
+                .unwrap_or_default()
+        })
     }
 
     /// Go-to-definition (Phase 2+).
@@ -222,7 +239,7 @@ impl Analysis {
         &self,
         _pos: FilePosition,
     ) -> Cancellable<Vec<gdscript_base::TextRange>> {
-        Ok(Vec::new())
+        catch(Vec::new)
     }
 }
 
