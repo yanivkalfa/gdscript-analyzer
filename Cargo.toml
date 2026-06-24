@@ -80,6 +80,7 @@ tree-sitter-gdscript = "6.1"
 # dev/test
 expect-test = "1.5" # rust-analyzer's golden mechanism (UPDATE_EXPECT=1 to bless)
 proptest = "1.11" # local panic-free robustness harness (in-process; gnu-clean)
+criterion = "0.5" # Phase-2 perf benches (cold <50ms / warm <5ms single-file); native-only, no getrandom
 
 # Lints applied workspace-wide; each crate opts in with `[lints] workspace = true`.
 [workspace.lints.rust]

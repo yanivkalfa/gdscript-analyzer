@@ -7,7 +7,6 @@
 
 use cstree::util::NodeOrToken;
 use gdscript_base::TextRange;
-use gdscript_syntax::ast;
 use gdscript_syntax::{GdNode, GdToken, SyntaxKind};
 
 /// A reparse-stable pointer to a syntax node — its [`SyntaxKind`] plus byte [`TextRange`]
@@ -36,12 +35,31 @@ impl AstPtr {
     /// Recover the node this pointer refers to, searching from `root`. `None` if the tree
     /// no longer contains a node of the matching kind + range (e.g. recovered from a stale
     /// pointer against edited text).
+    ///
+    /// Prunes by range — only descends into the one child subtree that contains the target — so
+    /// recovery is ~O(tree depth), not O(nodes). This is on the hot path (called per function /
+    /// field / `TypeRef` during inference), so the pruning is what keeps single-file analysis
+    /// within the warm budget.
     #[must_use]
     pub fn to_node(self, root: &GdNode) -> Option<GdNode> {
-        ast::descendants(root)
-            .into_iter()
-            .find(|n| n.kind() == self.kind && text_range_of(n) == self.range)
+        find_node(root, self)
     }
+}
+
+fn find_node(node: &GdNode, ptr: AstPtr) -> Option<GdNode> {
+    let range = text_range_of(node);
+    if node.kind() == ptr.kind && range == ptr.range {
+        return Some(node.clone());
+    }
+    // Only descend into the subtree that fully contains the target's range.
+    if range.start <= ptr.range.start && range.end >= ptr.range.end {
+        for child in node.children() {
+            if let Some(found) = find_node(child, ptr) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// The [`gdscript_base::TextRange`] of `node` (converted from the `text_size` range the CST

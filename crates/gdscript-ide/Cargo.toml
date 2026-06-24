@@ -21,6 +21,13 @@ cstree = { workspace = true }
 rustc-hash = { workspace = true }
 text-size = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "analysis"
+harness = false
+
 [lints]
 workspace = true
 
