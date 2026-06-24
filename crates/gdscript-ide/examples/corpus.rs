@@ -53,6 +53,10 @@ fn run_project(dir: &str, files: &[PathBuf], show: bool) {
             loaded.push((id, path.clone(), src));
         }
     }
+    // Supply `project.godot` (if present at the root) so `[autoload]` singletons resolve (M4).
+    if let Ok(cfg) = std::fs::read_to_string(root.join("project.godot")) {
+        change.set_project_config(cfg.as_str());
+    }
     host.apply_change(change);
     let analysis = host.analysis();
 

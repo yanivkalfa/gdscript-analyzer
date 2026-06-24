@@ -933,6 +933,57 @@ impl Cx<'_> {
         }
     }
 
+    /// Whether a value of type `sub` is statically a subtype of `sup` — composing user `ScriptRef`
+    /// `extends` chains with the engine class table (M4, for `is`/`as` widen-only narrowing). A
+    /// `ScriptRef` IS-A its native base (so `script_value is Node` holds), but Godot's asymmetry is
+    /// honored: a native/script value is **not** a subtype of an *unrelated* user script.
+    fn is_subtype(&self, sub: &Ty, sup: &Ty) -> bool {
+        match (sub, sup) {
+            (Ty::Object(a), Ty::Object(b)) => self.api.is_subclass(*a, *b),
+            (Ty::ScriptRef(a), Ty::ScriptRef(b)) => self.script_is_subtype(*a, *b, 0),
+            (Ty::ScriptRef(a), Ty::Object(b)) => self.script_extends_engine(*a, *b, 0),
+            _ => false,
+        }
+    }
+
+    /// Whether script `sub` is `sup` or transitively extends it — walk the `extends` base chain by
+    /// script identity (depth-bounded, like [`script_member_walk`](Self::script_member_walk)).
+    fn script_is_subtype(&self, sub: ScriptRefId, sup: ScriptRefId, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        if sub == sup {
+            return true;
+        }
+        let Some(file) = self.db.file_text(FileId(sub.0)) else {
+            return false;
+        };
+        match crate::queries::script_class(self.db, file).base() {
+            Ty::ScriptRef(base) => self.script_is_subtype(*base, sup, depth + 1),
+            _ => false,
+        }
+    }
+
+    /// Whether script `sub`'s `extends` chain reaches engine class `sup_native` at its native base.
+    fn script_extends_engine(
+        &self,
+        sub: ScriptRefId,
+        sup_native: gdscript_api::ClassId,
+        depth: u32,
+    ) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let Some(file) = self.db.file_text(FileId(sub.0)) else {
+            return false;
+        };
+        match crate::queries::script_class(self.db, file).base() {
+            Ty::ScriptRef(base) => self.script_extends_engine(*base, sup_native, depth + 1),
+            Ty::Object(native) => self.api.is_subclass(*native, sup_native),
+            _ => false,
+        }
+    }
+
     fn emit_unsafe(&mut self, name: &str, recv: &Ty, range: TextRange, as_method: bool) {
         let recv_label = recv.label(self.api).unwrap_or_else(|| "?".to_owned());
         let (code, message) = if as_method {
@@ -1155,11 +1206,16 @@ impl Cx<'_> {
         }
         // A project-global `class_name` used as a value — the class itself, for static access
         // (`V.fc()`) or as a constructor (`Player.new()`). Resolves to a `ScriptRef` via the
-        // registry, or falls back to the seam for a global we don't model.
-        resolve::resolve_external(
+        // registry. Precedence (Godot `reduce_identifier`): `class_name` global ≫ autoload
+        // singleton. So try `class_name` first, then a `*`-autoload, then the seam.
+        let by_class = resolve::resolve_external(
             self.db,
             &resolve::ExternalRef::ClassName(SmolStr::new(name)),
-        )
+        );
+        if !by_class.is_unknown() {
+            return by_class;
+        }
+        resolve::resolve_external(self.db, &resolve::ExternalRef::Autoload(SmolStr::new(name)))
     }
 
     fn own_member_ty(&self, item: ClassItem, as_method: bool) -> Ty {
@@ -1205,20 +1261,32 @@ impl Cx<'_> {
     // ---- narrowing ----
 
     /// Apply the narrowing implied by an `if`/`elif` condition to the current (cloned) branch.
+    ///
+    /// `is`-narrowing is a deliberate divergence from upstream Godot (whose `is` does **not**
+    /// flow-narrow); we add it as a UX improvement but keep it **widen-only** so it never produces
+    /// a type Godot's checker would reject: narrow only when the tested type is a strict downcast
+    /// of the operand's current type, or the operand is uninformative. If the operand is already a
+    /// subtype of the test (`d: Derived; if d is Base`), keep it — do not un-narrow. The
+    /// `is_uninformative` guard also stays: never narrow to a type we couldn't resolve.
     fn apply_narrowing(&mut self, cond: ExprId) {
-        if let Expr::Is {
+        let Expr::Is {
             operand,
-            ty,
-            negated,
+            ty: Some(ptr),
+            negated: false,
         } = self.body.expr(cond).clone()
-            && !negated
-            && let Some(key) = self.narrow_key(operand)
-            && let Some(ptr) = ty
-        {
-            let narrowed = self.resolve_ptr_ty(ptr);
-            if !narrowed.is_uninformative() {
-                self.narrowing.insert(key, narrowed);
-            }
+        else {
+            return;
+        };
+        let Some(key) = self.narrow_key(operand) else {
+            return;
+        };
+        let narrowed = self.resolve_ptr_ty(ptr);
+        if narrowed.is_uninformative() {
+            return;
+        }
+        let cur = self.expr_ty.get(&operand).cloned().unwrap_or(Ty::Variant);
+        if cur.is_uninformative() || self.is_subtype(&narrowed, &cur) {
+            self.narrowing.insert(key, narrowed);
         }
     }
 

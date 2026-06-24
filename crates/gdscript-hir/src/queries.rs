@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use gdscript_db::{Db, FileText, SourceRoot, parse};
+use gdscript_db::{Db, FileText, ProjectConfig, SourceRoot, parse};
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
@@ -109,6 +109,48 @@ pub fn res_path_registry(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolStr
         }
     }
     Arc::new(map)
+}
+
+/// The project's autoload **singletons** (`*`-flagged `[autoload]` entries) — the bare names that
+/// resolve as globals in code. Maps each singleton name → its resource path (M4). Non-singleton
+/// autoloads are deliberately excluded (loaded-but-not-global). Keyed on [`ProjectConfig`] alone
+/// (it iterates only the config text), so it backdates across every `.gd` keystroke.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AutoloadRegistry {
+    singletons: FxHashMap<SmolStr, SmolStr>,
+}
+
+impl AutoloadRegistry {
+    /// The resource path of the singleton autoload named `name`, if any.
+    #[must_use]
+    pub fn resolve_path(&self, name: &str) -> Option<&SmolStr> {
+        self.singletons.get(name)
+    }
+
+    /// The number of registered singleton autoloads.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.singletons.len()
+    }
+
+    /// Whether no singleton autoload is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.singletons.is_empty()
+    }
+}
+
+/// The project-wide autoload-singleton registry, parsed from `project.godot` (M4). Only
+/// `*`-flagged entries become globals; a duplicate name keeps the first (deterministic).
+#[salsa::tracked]
+pub fn autoload_registry(db: &dyn Db, config: ProjectConfig) -> Arc<AutoloadRegistry> {
+    let mut singletons = FxHashMap::default();
+    for e in crate::project::parse_autoloads(config.project_godot_text(db)) {
+        if e.is_singleton {
+            singletons.entry(e.name).or_insert(e.path);
+        }
+    }
+    Arc::new(AutoloadRegistry { singletons })
 }
 
 /// One member of a script class, as a cross-file reference sees it (a resolved type, never a
@@ -700,6 +742,66 @@ mod tests {
     }
 
     #[test]
+    fn is_narrows_to_a_user_class_cross_file() {
+        // `if x is Widget:` narrows `x` to the user `ScriptRef`, so `x.make()` resolves to its
+        // cross-file return type — the is/as-over-user-types path (already works once ScriptRef
+        // is informative; M4 just gates it). `int` here PROVES narrowing: without it `x` stays
+        // Variant and `x.make()` would be Variant.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name Widget\nfunc make() -> int:\n\treturn 5\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(1),
+            "func use_it(x):\n\tif x is Widget:\n\t\tvar n := x.make()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        // (bindings include the param `x`; assert *some* binding — the `n` one — is int.)
+        assert!(
+            fi.units
+                .iter()
+                .flat_map(|u| &u.result.bindings)
+                .any(|b| b.ty.label(api).as_deref() == Some("int")),
+            "`x.make()` after `is Widget` should narrow + resolve to int",
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn as_casts_to_a_user_class_cross_file() {
+        // `(x as Widget).make()` types the cast as the user `ScriptRef`, so `.make()` → int.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name Widget\nfunc make() -> int:\n\treturn 5\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(1),
+            "func use_it(x):\n\tvar n := (x as Widget).make()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            fi.units
+                .iter()
+                .flat_map(|u| &u.result.bindings)
+                .any(|b| b.ty.label(api).as_deref() == Some("int")),
+            "`(x as Widget).make()` should resolve to int",
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
     fn renaming_a_files_path_reindexes_the_registry() {
         // A path change (rename) DOES update the registry (it is not a body edit).
         let mut db = RootDatabase::default();
@@ -716,5 +818,160 @@ mod tests {
         let reg = res_path_registry(&db, root);
         assert_eq!(reg.get("res://new.gd"), Some(&FileId(0)));
         assert!(reg.get("res://old.gd").is_none());
+    }
+
+    // ---- M4: autoloads (project.godot [autoload]) + is/as widen-only narrowing --------------
+
+    #[test]
+    fn star_autoload_gdscript_resolves_as_global_and_members() {
+        let mut db = RootDatabase::default();
+        // `game.gd` has NO class_name — the autoload resolves it by PATH (not the class registry).
+        db.set_file_text(
+            FileId(0),
+            "func score() -> int:\n\treturn 0\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://game.gd");
+        db.set_file_text(
+            FileId(1),
+            "func f():\n\tvar s := Game.score()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_project_config("[autoload]\nGame=\"*res://game.gd\"\n");
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("f unit");
+        // `Game` (a *-singleton) resolves to its ScriptRef; `Game.score()` → int.
+        assert_eq!(
+            unit.result.bindings[0].ty.label(api).as_deref(),
+            Some("int")
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn non_star_autoload_is_not_a_global() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "func score() -> int:\n\treturn 0\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://game.gd");
+        db.set_file_text(
+            FileId(1),
+            "func f():\n\tvar s := Game.score()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        // No leading `*` → loaded-but-not-global; the bare name `Game` must NOT resolve.
+        db.set_project_config("[autoload]\nGame=\"res://game.gd\"\n");
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("f unit");
+        // `Game` → seam (Unknown), so `s` is uninformative (no `int`); and NO diagnostic.
+        assert_eq!(unit.result.bindings[0].ty.label(api), None);
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn tscn_autoload_is_the_seam_never_false_warns() {
+        let mut db = RootDatabase::default();
+        // A scene (`.tscn`) autoload: typing it `Node` would false-warn on the root script's own
+        // members, so it stays the seam (scene-root typing is Phase 4).
+        db.set_file_text(FileId(0), "func f():\n\tHud.play_song()\n", Durability::LOW);
+        db.set_file_path(FileId(0), "res://main.gd");
+        db.set_project_config("[autoload]\nHud=\"*res://hud.tscn\"\n");
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        // `Hud.play_song()` on a seam receiver → no diagnostic (no false UNSAFE_METHOD_ACCESS).
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    // The autoload firewall: a `.gd` body edit must not rebuild the autoload registry, which is
+    // keyed only on the `ProjectConfig` input (not on file text).
+
+    static AUTOLOAD_OBSERVED: AtomicU32 = AtomicU32::new(0);
+
+    #[salsa::tracked]
+    fn observe_autoload_registry(db: &dyn gdscript_db::Db, config: ProjectConfig) -> usize {
+        AUTOLOAD_OBSERVED.fetch_add(1, Ordering::SeqCst);
+        autoload_registry(db, config).len()
+    }
+
+    #[test]
+    fn autoload_registry_firewalled_against_body_edits() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "func f():\n\tvar a := 1\n", Durability::LOW);
+        db.set_file_path(FileId(0), "res://game.gd");
+        db.set_project_config("[autoload]\nGame=\"*res://game.gd\"\n");
+        db.sync_source_root();
+        let config = db.project_config().unwrap();
+
+        assert_eq!(observe_autoload_registry(&db, config), 1);
+        let runs = AUTOLOAD_OBSERVED.load(Ordering::SeqCst);
+
+        // Length-changing `.gd` body edit, NO set_project_config: the autoload registry must not
+        // recompute (its sole input — ProjectConfig — is untouched).
+        db.set_file_text(FileId(0), "func f():\n\tvar a := 999999\n", Durability::LOW);
+
+        assert_eq!(observe_autoload_registry(&db, config), 1);
+        assert_eq!(
+            AUTOLOAD_OBSERVED.load(Ordering::SeqCst),
+            runs,
+            "REGRESSION: a body edit re-ran an autoload_registry consumer — the config firewall broke",
+        );
+    }
+
+    #[test]
+    fn is_userbase_narrows_to_derived_but_not_un_narrowed_to_base() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name Base\nfunc base_m() -> int:\n\treturn 1\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(1),
+            "class_name Derived\nextends Base\nfunc own_m() -> String:\n\treturn \"x\"\n",
+            Durability::LOW,
+        );
+        // (a) untyped `x` + `is Derived` → narrow to Derived → `x.own_m()` resolves (String).
+        // (b) `d: Derived` + `is Base` → widen-only: d STAYS Derived → `d.own_m()` resolves (String).
+        db.set_file_text(
+            FileId(2),
+            "func use_it(x):\n\tif x is Derived:\n\t\tvar a := x.own_m()\n\tvar d: Derived\n\tif d is Base:\n\t\tvar b := d.own_m()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let strings = fi
+            .units
+            .iter()
+            .flat_map(|u| &u.result.bindings)
+            .filter(|b| b.ty.label(api).as_deref() == Some("String"))
+            .count();
+        // Both `own_m()` calls resolve to String: proves narrow-to-Derived AND no un-narrow-to-Base.
+        assert!(
+            strings >= 2,
+            "expected both own_m() calls to type as String (narrow-down + widen-only), got {strings}",
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
     }
 }

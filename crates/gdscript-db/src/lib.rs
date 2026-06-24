@@ -42,6 +42,9 @@ pub trait Db: salsa::Database {
     /// The project's file set, or `None` before any file has been applied. Project-wide queries
     /// (the global `class_name` registry) take this as their salsa-tracked input.
     fn source_root(&self) -> Option<SourceRoot>;
+    /// The project's `project.godot` config, or `None` in single-file mode. The autoload registry
+    /// (M4) takes this as its salsa-tracked input.
+    fn project_config(&self) -> Option<ProjectConfig>;
 }
 
 /// The VFS leaf: one file's UTF-8 text, as a salsa input, plus its [`FileId`] (so a query
@@ -74,6 +77,17 @@ pub struct SourceRoot {
     /// Every file currently in the project, ordered by `FileId` for determinism.
     #[returns(ref)]
     pub files: Vec<FileText>,
+}
+
+/// The project's `project.godot`, injected as raw text — the wasm-clean core never reads the
+/// filesystem, so the loader pushes the bytes exactly like a `.gd` file. The autoload index is a
+/// tracked query that parses this text (M4). Held at `MEDIUM` durability (project structure,
+/// stable across `.gd` keystrokes), so a body edit (LOW) never invalidates the autoload registry.
+#[salsa::input]
+pub struct ProjectConfig {
+    /// The full `project.godot` text.
+    #[returns(ref)]
+    pub project_godot_text: Arc<str>,
 }
 
 /// The `FileId → FileText` side table. `Arc`-backed so a cheap clone shares the same map —
@@ -156,6 +170,9 @@ pub struct RootDatabase {
     /// The project file-set input (lazily created on the first file change). Held outside salsa
     /// as a handle so `apply_change` can update it.
     root: Option<SourceRoot>,
+    /// The `project.godot` config input (lazily created on the first config push). Held outside
+    /// salsa as a handle so `apply_change` can update it (M4 autoloads).
+    config: Option<ProjectConfig>,
 }
 
 // `salsa::Storage` is not `Debug`, but the public `AnalysisHost`/`Analysis` that will own a
@@ -185,6 +202,27 @@ impl RootDatabase {
     /// Remove `file`'s entry from the side table.
     pub fn remove_file(&mut self, file: FileId) {
         self.files.remove(file);
+    }
+
+    /// Set the project's `project.godot` text (the loader supplies it on project open / when it
+    /// changes — M4 autoloads). No-op if unchanged: salsa bumps an input field's revision on
+    /// every set even for an identical value, so a redundant push would needlessly invalidate the
+    /// autoload registry. Held at `MEDIUM` durability, so a `.gd` keystroke never touches it.
+    pub fn set_project_config(&mut self, text: &str) {
+        if let Some(cfg) = self.config {
+            if cfg.project_godot_text(self).as_ref() == text {
+                return;
+            }
+            cfg.set_project_godot_text(self)
+                .with_durability(Durability::MEDIUM)
+                .to(Arc::from(text));
+        } else {
+            self.config = Some(
+                ProjectConfig::builder(Arc::from(text))
+                    .durability(Durability::MEDIUM)
+                    .new(self),
+            );
+        }
     }
 
     /// Rebuild the project file-set input from the current side table. Call this from
@@ -230,6 +268,10 @@ impl Db for RootDatabase {
 
     fn source_root(&self) -> Option<SourceRoot> {
         self.root
+    }
+
+    fn project_config(&self) -> Option<ProjectConfig> {
+        self.config
     }
 }
 

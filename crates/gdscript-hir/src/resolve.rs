@@ -54,10 +54,45 @@ pub fn resolve_external(db: &dyn Db, r: &ExternalRef) -> Ty {
         // (`extends "sibling.gd"`, `extends A.B`) stays the seam — relative-path anchoring is a
         // documented follow-up (needs the importing file's dir; 0 occurrences in the corpus).
         ExternalRef::ExtendsPath(path) if is_resource_path(path) => resolve_res_path(db, path),
-        // `load(...)` is never routed here (it stays an opaque runtime call). Dotted `extends` and
-        // autoloads (M4) remain the seam.
-        ExternalRef::ExtendsPath(_) | ExternalRef::Autoload(_) => Ty::Unknown,
+        // M4: a `*`-flagged autoload singleton's bare name → its script `ScriptRef` (`.gd`) or
+        // `Object(Node)` (`.tscn`, scene-root sharpening deferred to Phase 4).
+        ExternalRef::Autoload(name) => resolve_autoload(db, name),
+        // `load(...)` is never routed here (it stays an opaque runtime call). Dotted `extends`
+        // remains the seam.
+        ExternalRef::ExtendsPath(_) => Ty::Unknown,
     }
+}
+
+/// Resolve a `*`-singleton autoload's bare name (M4). A `.gd` autoload resolves by **path** to its
+/// declaring file's [`Ty::ScriptRef`] (so `.member`/`.new()` walk via the script member table,
+/// even when the script has no `class_name`). A scene (`.tscn`/`.scn`) or any other resource
+/// autoload stays the **seam** ([`Ty::Unknown`]): typing it as bare `Node` would *false-warn* on
+/// the scene root script's own members (e.g. `Music.play()`), which we cannot see until Phase 4
+/// scene parsing recovers the root's real type — the conservative seam keeps zero false positives.
+/// No project config, a non-singleton name, or a dangling path is likewise the seam.
+fn resolve_autoload(db: &dyn Db, name: &str) -> Ty {
+    let Some(config) = db.project_config() else {
+        return Ty::Unknown;
+    };
+    let Some(path) = crate::queries::autoload_registry(db, config)
+        .resolve_path(name)
+        .cloned()
+    else {
+        return Ty::Unknown;
+    };
+    if is_gdscript_path(&path) {
+        resolve_res_path(db, &path)
+    } else {
+        Ty::Unknown
+    }
+}
+
+/// Whether a resource path is a GDScript file (the `.cs` C# case is out of scope → seam). Compare
+/// the final extension rather than `ends_with` so a `.GD` (case quirk) still matches.
+fn is_gdscript_path(p: &str) -> bool {
+    p.rsplit('.')
+        .next()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gd"))
 }
 
 /// Whether a path is an engine resource URI we resolve project-root-absolutely (no anchor

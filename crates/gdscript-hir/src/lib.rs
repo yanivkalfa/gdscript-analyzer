@@ -13,6 +13,7 @@ pub mod body;
 mod cst;
 pub mod infer;
 pub mod item_tree;
+pub mod project;
 pub mod queries;
 pub mod resolve;
 pub mod ty;

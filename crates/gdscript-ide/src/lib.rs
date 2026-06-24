@@ -55,6 +55,9 @@ pub struct Change {
     /// omit it (salsa bumps an input field's revision on *every* set, even an identical value, so
     /// re-sending a path each edit would needlessly invalidate the `res_path_registry`).
     pub paths: Vec<(FileId, String)>,
+    /// The project's `project.godot` text (loader-supplied; M4 `[autoload]` resolution). Set once
+    /// on project open / when it changes; omit on `.gd` keystrokes.
+    pub project_config: Option<Arc<str>>,
 }
 
 impl Change {
@@ -78,6 +81,12 @@ impl Change {
     /// it once, when the file is first added; omit it on subsequent edits.
     pub fn set_file_path(&mut self, file: FileId, path: impl Into<String>) {
         self.paths.push((file, path.into()));
+    }
+
+    /// Record the project's `project.godot` text (M4 `[autoload]` resolution). Set on project open
+    /// / when it changes; omit on `.gd` keystrokes.
+    pub fn set_project_config(&mut self, text: impl Into<Arc<str>>) {
+        self.project_config = Some(text.into());
     }
 }
 
@@ -108,6 +117,11 @@ impl AnalysisHost {
         // FileText must already exist, so it runs after the text loop above.
         for (id, path) in change.paths {
             self.db.set_file_path(id, &path);
+        }
+        // The `project.godot` config (M4 autoloads) — its own MEDIUM input, guarded against no-op
+        // re-sets, so re-opening a project doesn't invalidate the autoload registry.
+        if let Some(text) = change.project_config {
+            self.db.set_project_config(&text);
         }
         // Rebuild the project file-set input ONLY on add/remove — never on a body edit — so the
         // MEDIUM-durability registry stays firewalled against keystrokes.
@@ -323,6 +337,29 @@ mod tests {
         assert!(
             hints.iter().any(|h| h.label.contains("int")),
             "expected an `: int` inlay on the preload-resolved binding, got {hints:?}",
+        );
+    }
+
+    #[test]
+    fn autoload_resolves_cross_file_through_the_public_api() {
+        // End-to-end through `apply_change` + `set_project_config`: a `*`-singleton autoload
+        // script (no class_name — resolved by path) used by its bare name.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(FileId(0), "func volume() -> int:\n\treturn 50\n");
+        change.set_file_path(FileId(0), "res://audio.gd");
+        change.change_file(FileId(1), "func go():\n\tvar v := Audio.volume()\n");
+        change.set_file_path(FileId(1), "res://main.gd");
+        change.set_project_config("[autoload]\nAudio=\"*res://audio.gd\"\n");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        assert!(analysis.diagnostics(FileId(1)).unwrap().is_empty());
+        // `Audio.volume()` resolved cross-file via the autoload singleton → `v : int` inlay.
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("int")),
+            "expected an `: int` inlay on the autoload-resolved binding, got {hints:?}",
         );
     }
 
