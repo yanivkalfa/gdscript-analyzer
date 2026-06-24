@@ -107,11 +107,6 @@ pub struct Analysis {
 }
 
 impl Analysis {
-    /// The text for `file`, if present in the input world.
-    fn text(&self, file: FileId) -> Option<Arc<str>> {
-        self.db.file_text(file).map(|ft| ft.text(&self.db).clone())
-    }
-
     // ---- Tier-0 features: real data ----
 
     /// A pretty-printed dump of the syntax tree (debugging / playground).
@@ -120,8 +115,9 @@ impl Analysis {
     /// `Err(Cancelled)` if a concurrent `apply_change` invalidated this snapshot.
     pub fn syntax_tree(&self, file: FileId) -> Cancellable<Option<String>> {
         catch(|| {
-            self.text(file)
-                .map(|t| gdscript_syntax::parse(&t).debug_tree())
+            self.db
+                .file_text(file)
+                .map(|ft| gdscript_db::parse(&self.db, ft).debug_tree())
         })
     }
 
@@ -131,10 +127,11 @@ impl Analysis {
     /// See [`Analysis::syntax_tree`].
     pub fn diagnostics(&self, file: FileId) -> Cancellable<Vec<Diagnostic>> {
         catch(|| {
-            self.text(file)
-                .map(|t| {
-                    let mut diags = features::diagnostics(&t);
-                    diags.extend(semantic::type_diagnostics(&t));
+            self.db
+                .file_text(file)
+                .map(|ft| {
+                    let mut diags = features::diagnostics(&self.db, ft);
+                    diags.extend(semantic::type_diagnostics(&self.db, ft));
                     diags
                 })
                 .unwrap_or_default()
@@ -147,8 +144,9 @@ impl Analysis {
     /// See [`Analysis::syntax_tree`].
     pub fn document_symbols(&self, file: FileId) -> Cancellable<Vec<DocumentSymbol>> {
         catch(|| {
-            self.text(file)
-                .map(|t| features::document_symbols(&t))
+            self.db
+                .file_text(file)
+                .map(|ft| features::document_symbols(&self.db, ft))
                 .unwrap_or_default()
         })
     }
@@ -159,8 +157,9 @@ impl Analysis {
     /// See [`Analysis::syntax_tree`].
     pub fn folding_ranges(&self, file: FileId) -> Cancellable<Vec<FoldRange>> {
         catch(|| {
-            self.text(file)
-                .map(|t| features::folding_ranges(&t))
+            self.db
+                .file_text(file)
+                .map(|ft| features::folding_ranges(&self.db, ft))
                 .unwrap_or_default()
         })
     }
@@ -173,10 +172,11 @@ impl Analysis {
     /// See [`Analysis::syntax_tree`].
     pub fn completions(&self, pos: FilePosition) -> Cancellable<Vec<CompletionItem>> {
         catch(|| {
-            self.text(pos.file)
-                .map(|t| {
-                    semantic::member_completions(&t, pos.offset)
-                        .unwrap_or_else(|| features::completions(&t, pos.offset))
+            self.db
+                .file_text(pos.file)
+                .map(|ft| {
+                    semantic::member_completions(&self.db, ft, pos.offset)
+                        .unwrap_or_else(|| features::completions(&self.db, ft, pos.offset))
                 })
                 .unwrap_or_default()
         })
@@ -189,8 +189,9 @@ impl Analysis {
     /// See [`Analysis::syntax_tree`].
     pub fn hover(&self, pos: FilePosition) -> Cancellable<Option<HoverResult>> {
         catch(|| {
-            self.text(pos.file)
-                .and_then(|t| semantic::hover(&t, pos.offset))
+            self.db
+                .file_text(pos.file)
+                .and_then(|ft| semantic::hover(&self.db, ft, pos.offset))
         })
     }
 
@@ -201,8 +202,9 @@ impl Analysis {
     /// See [`Analysis::syntax_tree`].
     pub fn inlay_hints(&self, file: FileId) -> Cancellable<Vec<InlayHint>> {
         catch(|| {
-            self.text(file)
-                .map(|t| semantic::inlay_hints(&t))
+            self.db
+                .file_text(file)
+                .map(|ft| semantic::inlay_hints(&self.db, ft))
                 .unwrap_or_default()
         })
     }
@@ -213,8 +215,9 @@ impl Analysis {
     /// See [`Analysis::syntax_tree`].
     pub fn signature_help(&self, pos: FilePosition) -> Cancellable<Option<SignatureHelp>> {
         catch(|| {
-            self.text(pos.file)
-                .and_then(|t| semantic::signature_help(&t, pos.offset))
+            self.db
+                .file_text(pos.file)
+                .and_then(|ft| semantic::signature_help(&self.db, ft, pos.offset))
         })
     }
 
@@ -224,8 +227,9 @@ impl Analysis {
     /// See [`Analysis::syntax_tree`].
     pub fn code_actions(&self, pos: FilePosition) -> Cancellable<Vec<CodeAction>> {
         catch(|| {
-            self.text(pos.file)
-                .map(|t| semantic::code_actions(&t, pos.offset, pos.file))
+            self.db
+                .file_text(pos.file)
+                .map(|ft| semantic::code_actions(&self.db, ft, pos.offset))
                 .unwrap_or_default()
         })
     }
