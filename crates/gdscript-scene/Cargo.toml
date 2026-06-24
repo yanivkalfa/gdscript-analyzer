@@ -13,6 +13,8 @@ keywords.workspace = true
 
 [dependencies]
 gdscript-base = { workspace = true }
+smol_str = { workspace = true }
+rustc-hash = { workspace = true }
 
 [lints]
 workspace = true

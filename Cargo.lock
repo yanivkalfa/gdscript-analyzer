@@ -575,6 +575,8 @@ name = "gdscript-scene"
 version = "0.1.0"
 dependencies = [
  "gdscript-base",
+ "rustc-hash",
+ "smol_str",
 ]
 
 [[package]]
