@@ -361,6 +361,60 @@ fn override_children_under_an_inherited_root_are_not_dangling() {
 }
 
 #[test]
+fn escape_parent_paths_degrade_silently_not_dangling() {
+    // `..` / absolute / leading-`/` parent paths are out of the slice — silently unresolved, NOT a
+    // dangling parent (Playbook §5/§7; M1 degrades them to `Node`). Found by the M0 bug hunt.
+    for parent in ["../Sibling", "/root/R", "/R", "A/../B"] {
+        let src = format!(
+            "[gd_scene format=3]\n\
+             [node name=\"R\" type=\"Node\"]\n\
+             [node name=\"A\" type=\"Node\" parent=\".\"]\n\
+             [node name=\"B\" type=\"Node\" parent=\"{parent}\"]\n"
+        );
+        let m = parse_scene(&src);
+        assert!(
+            m.problems
+                .iter()
+                .all(|p| !matches!(p, SceneProblem::DanglingParent { .. })),
+            "parent={parent:?} must not dangle: {:?}",
+            m.problems
+        );
+    }
+    // A genuine in-scene typo still flags (regression guard).
+    let typo = parse_scene(
+        "[gd_scene format=3]\n[node name=\"R\" type=\"Node\"]\n[node name=\"B\" type=\"Node\" parent=\"Nope\"]\n",
+    );
+    assert!(
+        typo.problems
+            .iter()
+            .any(|p| matches!(p, SceneProblem::DanglingParent { .. }))
+    );
+}
+
+#[test]
+fn duplicate_sibling_first_wins_for_path_resolution() {
+    // by_path / resolve_path return the FIRST same-named sibling (matching unique_nodes' first-wins);
+    // children_of still lists both. Found by the M0 bug hunt.
+    let m = parse_scene(
+        "[gd_scene format=3]\n\
+         [node name=\"R\" type=\"Node\"]\n\
+         [node name=\"Dup\" type=\"Label\" parent=\".\"]\n\
+         [node name=\"Dup\" type=\"Button\" parent=\".\"]\n",
+    );
+    let dup = m.resolve_path("Dup").unwrap();
+    assert_eq!(
+        m.node(dup).unwrap().decl_type.as_deref(),
+        Some("Label"),
+        "first sibling wins"
+    );
+    assert_eq!(
+        m.children_of(m.root).count(),
+        2,
+        "children_of lists both siblings"
+    );
+}
+
+#[test]
 fn never_panics_on_garbage() {
     for g in [
         "",

@@ -562,9 +562,10 @@ impl<'a> Parser<'a> {
             let parent_path = self.model.nodes[i].parent_path.clone();
             let name = self.model.nodes[i].name.clone();
 
-            // Inherited-scene root: a parent-less node carrying `instance=` (`set_base_scene`). Set
-            // BEFORE resolving any child paths so the into-instance check below can see it.
-            if parent_path.is_none() && self.model.nodes[i].instance.is_some() {
+            // Inherited-scene root: the chosen root carrying `instance=` (`set_base_scene`). Set
+            // BEFORE resolving any child paths so the into-instance check below can see it. Gated on
+            // being THE root (a spurious extra parent-less node in a MultipleRoots scene is not one).
+            if Some(idx) == root && self.model.nodes[i].instance.is_some() {
                 self.model.nodes[i].instance_is_inherited_root = true;
             }
 
@@ -572,14 +573,16 @@ impl<'a> Parser<'a> {
                 None => None,
                 Some(".") => root,
                 Some(p) => match walk_path(root, p, &child_index) {
-                    Ok(found) => Some(found),
-                    Err(deepest) => {
-                        // Unresolved. If the deepest node we reached — OR ANY of its ancestors up
+                    Walk::Resolved(found) => Some(found),
+                    // An absolute/`..` escape is out of the slice → silently unresolved, never a
+                    // dangling parent (Playbook §5/§7 — M1 degrades it to `Node`).
+                    Walk::Escaped => None,
+                    Walk::Missed(deepest) => {
+                        // A genuine in-scene miss. If the deepest node reached — or any ancestor up
                         // to the root — is an instance boundary, the missing tail lives in an
-                        // instanced/inherited sub-scene we don't recurse into (an override line),
-                        // which is expected, NOT a dangling parent (Playbook C12/C13/C20). The root
-                        // being an *inherited* scene makes every override child's missing segment a
-                        // base-scene node.
+                        // instanced/inherited sub-scene we don't recurse into (an override line) —
+                        // expected, NOT dangling (Playbook C12/C13/C20). The root being an inherited
+                        // scene makes every override child's missing segment a base-scene node.
                         if !self.descends_from_instance(deepest) {
                             self.model.problems.push(SceneProblem::DanglingParent {
                                 node: idx,
@@ -593,7 +596,9 @@ impl<'a> Parser<'a> {
             self.model.nodes[i].parent_idx = parent_idx;
 
             if let Some(p) = parent_idx {
-                child_index.insert((p, name.clone()), idx);
+                // First sibling of a given name keeps the navigable slot (matches `unique_nodes`'
+                // first-wins; Godot auto-uniquifies sibling names anyway).
+                child_index.entry((p, name.clone())).or_insert(idx);
                 children.entry(p).or_default().push(idx);
                 let pfp = &full_paths[p.0 as usize];
                 let fp = if pfp.is_empty() {
@@ -602,7 +607,7 @@ impl<'a> Parser<'a> {
                     SmolStr::new(format!("{pfp}/{name}"))
                 };
                 full_paths[i] = fp.clone();
-                self.model.by_path.insert(fp, idx);
+                self.model.by_path.entry(fp).or_insert(idx);
             }
         }
 
@@ -636,29 +641,44 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// The outcome of resolving a `parent=`/node path against the in-scene tree.
+enum Walk {
+    /// Fully resolved to a node.
+    Resolved(NodeIdx),
+    /// The path escapes the scene (an absolute `/root/…` or a `..` segment). Out of the M0 slice —
+    /// resolves to nothing **silently** (not a dangling parent; M1 degrades it to `Node`).
+    Escaped,
+    /// A genuine in-scene child miss. `deepest` is the last node reached (so the caller can tell an
+    /// override-into-an-instance from a real dangling parent).
+    Missed(Option<NodeIdx>),
+}
+
 /// Walk a relative name-path from `root`, segment by segment, via the incrementally-built child
-/// index. `Ok(idx)` on full resolution; `Err(deepest)` when a segment is missing or the path
-/// escapes the scene (`..`/absolute) — `deepest` is the last node reached (so the caller can tell
-/// "the unresolved tail descends into an instanced sub-scene" from "a genuinely dangling parent").
+/// index.
 fn walk_path(
     root: Option<NodeIdx>,
     path: &str,
     child_index: &FxHashMap<(NodeIdx, SmolStr), NodeIdx>,
-) -> Result<NodeIdx, Option<NodeIdx>> {
-    let mut cur = root.ok_or(None)?;
+) -> Walk {
+    if path.starts_with('/') {
+        return Walk::Escaped; // absolute `/root/…` — detect before splitting (leading "" segment)
+    }
+    let Some(mut cur) = root else {
+        return Walk::Missed(None);
+    };
     for seg in path.split('/') {
         if seg.is_empty() || seg == "." {
             continue;
         }
-        if seg == ".." || seg.starts_with('/') {
-            return Err(Some(cur));
+        if seg == ".." {
+            return Walk::Escaped; // parent escape — needs the runtime tree
         }
         match child_index.get(&(cur, SmolStr::new(seg))) {
             Some(&next) => cur = next,
-            None => return Err(Some(cur)),
+            None => return Walk::Missed(Some(cur)),
         }
     }
-    Ok(cur)
+    Walk::Resolved(cur)
 }
 
 /// Resolve the C-style escapes a `.tscn` quoted string may carry. Unknown escapes pass through
