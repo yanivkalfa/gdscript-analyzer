@@ -155,6 +155,76 @@ pub fn member_completions(db: &dyn Db, file: FileText, offset: u32) -> Option<Ve
     Some(items)
 }
 
+/// Node-path completion (M2): when the cursor is inside a `$` get-node path (`$`, `$Panel/`,
+/// `$Panel/Bt…`), offer the **child node names** of the resolved prefix from the owning scene, each
+/// detailed with its `type=`. `$` is unambiguous (always `get_node`), so this never hijacks ordinary
+/// completion; in a file with no owning scene it returns `None` and the normal path runs. `%Unique`
+/// completion is deferred (the `%`/modulo ambiguity needs token context — see `TECH_DEBT.md`).
+pub fn node_path_completions(
+    db: &dyn Db,
+    file: FileText,
+    offset: u32,
+) -> Option<Vec<CompletionItem>> {
+    let prefix = dollar_path_prefix(file.text(db), offset)?;
+    let ctx = queries::scene_context(db, file)?;
+    let parent = if prefix.is_empty() {
+        ctx.attach
+    } else {
+        ctx.model.resolve_path_from(ctx.attach, &prefix)?
+    };
+    let items = ctx
+        .model
+        .children_of(Some(parent))
+        .map(|(_, n)| CompletionItem {
+            label: n.name.to_string(),
+            kind: CompletionKind::Variable,
+            insert_text: None,
+            detail: Some(n.decl_type.as_deref().unwrap_or("Node").to_owned()),
+        })
+        .collect();
+    Some(items)
+}
+
+/// If `offset` sits inside a `$`-path, the already-typed **parent** path — everything before the
+/// segment under the cursor (`$Panel/Box/Bt|` → `"Panel/Box"`, `$Panel/|` → `"Panel"`, `$|` → `""`).
+/// `None` if the cursor is not inside a `$`-path. A pure backward byte scan, robust to the partial
+/// (unparseable) text a node path has mid-edit.
+fn dollar_path_prefix(text: &str, offset: u32) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = (offset as usize).min(bytes.len());
+    // skip the current (partial) segment under the cursor.
+    while i > 0 && is_path_ident_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    let mut segs_rev: Vec<&str> = Vec::new();
+    loop {
+        if i == 0 {
+            return None;
+        }
+        match bytes[i - 1] {
+            b'$' => {
+                let mut segs = segs_rev;
+                segs.reverse();
+                return Some(segs.join("/"));
+            }
+            b'/' => {
+                let seg_end = i - 1;
+                let mut s = seg_end;
+                while s > 0 && is_path_ident_byte(bytes[s - 1]) {
+                    s -= 1;
+                }
+                segs_rev.push(&text[s..seg_end]);
+                i = s;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn is_path_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// Completion items for the members reachable through a script [`Ty::ScriptRef`]: optionally its
 /// own members, then everything up its `extends` chain (user bases recursively, then the engine
 /// base's members). Depth-bounded against a cyclic `extends`.

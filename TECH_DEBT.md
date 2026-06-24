@@ -72,18 +72,33 @@ the resolved type automatically. Validated: `xtask ci` green + 7 new typing test
 end-to-end inlay test.
 
 **M1 deferrals (→ M2+):**
-- [ ] **Instanced sub-scene recursion → M2+ (hard tail).** A node with `instance=` (no `type=`) stays
-      `Node`; following `instance=ExtResource("sub.tscn")` to the sub-scene root's type needs the
-      cross-file recursion. Records `instance` for it.
-- [ ] **`self.get_node("…")` (explicit-self / `obj.get_node`) is not intercepted** — only the bare
-      `get_node("…")` (implicit self) and `$`/`%`. Explicit/foreign forms stay a normal call → `Node`.
-- [ ] **No `INVALID_NODE_PATH` diagnostic, node-path completion, or `.tscn` go-to-def yet → M2.**
-      M1 only *types* the path; a bad `$DoesNotExist` silently degrades to `Node` (no warn) rather
-      than diagnosing.
-- [ ] **1-script-many-scenes = first scene wins.** `script_scene_index` keeps the first attaching
-      scene; the common-base union policy (Playbook §6.3) is a later refinement.
+- [ ] **1-script-many-scenes = first scene wins** for *typing*. `script_scene_index` keeps the first
+      attaching scene (now also flagging the attachment `ambiguous`, which M2 uses to suppress false
+      `INVALID_NODE_PATH`); the common-base union *typing* policy (Playbook §6.3) is later.
 - [ ] **`.tscn`-autoload sharpening still seam.** A `*`-autoload pointing at a `.tscn` could now read
-      the scene root's type (M1 has the machinery); wired in M2+.
+      the scene root's type (the machinery exists); wired later.
+
+### M2 — scene-aware diagnostics & navigation — **DONE**
+Built on M1's resolution: **go-to-definition** on a node-path jumps into the owning `.tscn`'s
+`[node …]` line (`def::node_path_target` → a `NavTarget` at the node's `name=` span); the
+**`INVALID_NODE_PATH`** warning fires on a genuinely-absent in-scene node; **node-path completion**
+offers a `$`-path prefix's child node names (typed by their `type=`). The `INVALID_NODE_PATH`
+**no-false-positive contract** (4 locked tests): warns only when the path genuinely misses *and* the
+script attaches to exactly one scene — silent on `..`/absolute escapes, misses that descend into an
+instanced sub-scene, and ambiguous multi-scene attachments (`SceneModel::classify_path_from` returns
+the 3-state `NodePathResolution`; `SceneAttach::ambiguous` guards the multi-scene case).
+
+**M2 deferrals (→ M3 / later):**
+- [ ] **Instanced sub-scene recursion → M3 (hard tail).** A node with `instance=` (no `type=`) stays
+      `Node`; following `instance=ExtResource("sub.tscn")` to the sub-scene root's type (so `$Enemy`
+      → the enemy scene's root class) needs cross-file scene recursion. `instance` is recorded.
+- [ ] **`self.get_node("…")` (explicit-self / `obj.get_node`) not intercepted** — only bare
+      `get_node("…")` (implicit self) and `$`/`%`. Explicit/foreign forms stay a normal call → `Node`.
+- [ ] **`%Unique` completion deferred.** `$`-path completion is done; `%`-name completion is held
+      because disambiguating `%Name` (unique node) from `a %b` (modulo) needs token context, not the
+      backward byte scan. Typing/goto/diagnostic for `%` all work — only its *completion* is pending.
+- [ ] **Scene-aware rename → Phase 6.** Renaming a node in a `.tscn` and updating `$Path`s (or vice
+      versa) is deferred per the plan; M2 ships the read-side features (type/goto/complete/diagnose).
 
 ---
 

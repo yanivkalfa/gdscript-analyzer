@@ -272,6 +272,9 @@ pub struct SceneAttach {
     pub scene: FileId,
     /// The node the script attaches to (the `$`-path base).
     pub node: NodeIdx,
+    /// Whether the script attaches to **more than one** scene (the first kept here). When `true`,
+    /// a `$Path` valid in another scene must not be flagged `INVALID_NODE_PATH` (no false positive).
+    pub ambiguous: bool,
 }
 
 /// The project-wide **script → owning scene** index (M1): each `.gd`'s `res://` path → the (first)
@@ -300,25 +303,56 @@ pub fn script_scene_index(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolSt
             else {
                 continue;
             };
-            map.entry(path).or_insert(SceneAttach {
-                scene,
-                node: NodeIdx(u32::try_from(i).unwrap_or(u32::MAX)),
-            });
+            let node = NodeIdx(u32::try_from(i).unwrap_or(u32::MAX));
+            match map.get_mut(&path) {
+                // already attached by an earlier scene → ambiguous (keep the first).
+                Some(existing) => existing.ambiguous = true,
+                None => {
+                    map.insert(
+                        path,
+                        SceneAttach {
+                            scene,
+                            node,
+                            ambiguous: false,
+                        },
+                    );
+                }
+            }
         }
     }
     Arc::new(map)
 }
 
-/// The owning-scene context for the script in `file` (M1): the parsed scene + the attach node, so
-/// `$Path`/`%Unique`/`get_node("…")` can resolve. `None` when the project has no scene attaching
-/// this script (the overwhelmingly common single-file / dynamic-UI case → node paths stay `Node`).
+/// The owning-scene context for the script in `file` (M1): the scene's [`FileId`], the parsed
+/// scene, and the attach node, so `$Path`/`%Unique`/`get_node("…")` can resolve (and go-to-def can
+/// jump into the `.tscn`). `None` when the project has no scene attaching this script (the
+/// overwhelmingly common single-file / dynamic-UI case → node paths stay `Node`).
 #[must_use]
-pub fn scene_context(db: &dyn Db, file: FileText) -> Option<(Arc<SceneModel>, NodeIdx)> {
+pub fn scene_context(db: &dyn Db, file: FileText) -> Option<SceneContext> {
     let res_path = file.res_path(db)?;
     let root = db.source_root()?;
     let attach = *script_scene_index(db, root).get(res_path.as_str())?;
     let scene_file = db.file_text(attach.scene)?;
-    Some((scene_model(db, scene_file), attach.node))
+    Some(SceneContext {
+        scene: attach.scene,
+        model: scene_model(db, scene_file),
+        attach: attach.node,
+        ambiguous: attach.ambiguous,
+    })
+}
+
+/// The resolved owning-scene context for a script — the scene file, its model, the attach node, and
+/// whether the attachment is ambiguous (multi-scene). Returned by [`scene_context`].
+#[derive(Debug, Clone)]
+pub struct SceneContext {
+    /// The owning scene's file.
+    pub scene: FileId,
+    /// The parsed scene model.
+    pub model: Arc<SceneModel>,
+    /// The node the script attaches to (the `$`-path base).
+    pub attach: NodeIdx,
+    /// Whether the script attaches to multiple scenes (suppresses `INVALID_NODE_PATH`).
+    pub ambiguous: bool,
 }
 
 #[cfg(test)]
@@ -1261,6 +1295,91 @@ mod tests {
             fi.diagnostics.is_empty(),
             "no false node-path warnings: {:?}",
             fi.diagnostics
+        );
+    }
+
+    // ---- M2: INVALID_NODE_PATH (the no-false-positive contract) ----------------------------
+
+    fn has_invalid_node_path(db: &RootDatabase) -> bool {
+        let fi = analyze_file(db, db.file_text(FileId(1)).unwrap());
+        fi.diagnostics
+            .iter()
+            .any(|d| d.code == crate::infer::INVALID_NODE_PATH)
+    }
+
+    #[test]
+    fn invalid_node_path_warns_when_genuinely_absent_in_a_single_owning_scene() {
+        let db = scene_db(SCENE, "extends Control\nfunc _ready():\n\tvar b := $Nope\n");
+        assert!(
+            has_invalid_node_path(&db),
+            "$Nope is absent in the one owning scene → warn"
+        );
+    }
+
+    #[test]
+    fn escape_and_absolute_paths_never_warn() {
+        // `..` and absolute `/root/…` escape the scene slice — silent, never INVALID_NODE_PATH.
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar a := $\"../Sibling\"\n\tvar c := $\"/root/Global\"\n",
+        );
+        assert!(!has_invalid_node_path(&db), "escape paths must not warn");
+    }
+
+    #[test]
+    fn path_descending_into_an_instanced_subscene_never_warns() {
+        // Root > Player(instance=…). `$Player/Gun` misses below an instance we don't recurse into —
+        // silent (the node may well exist inside the sub-scene).
+        let db = scene_db(
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://player.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Player\" parent=\".\" instance=ExtResource(\"2\")]\n",
+            "extends Control\nfunc _ready():\n\tvar g := $Player/Gun\n",
+        );
+        assert!(
+            !has_invalid_node_path(&db),
+            "into-instance miss must not warn"
+        );
+    }
+
+    #[test]
+    fn ambiguous_multi_scene_attachment_suppresses_the_invalid_warning() {
+        // main.gd attaches to BOTH a.tscn (child Alpha) and b.tscn (child Beta). `$Beta` is absent in
+        // a.tscn (kept first) but present in b.tscn → ambiguous → no false INVALID_NODE_PATH.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Alpha\" type=\"Button\" parent=\".\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://a.tscn");
+        db.set_file_text(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Beta\" type=\"Button\" parent=\".\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://b.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar b := $Beta\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.sync_source_root();
+        assert!(
+            !has_invalid_node_path(&db),
+            "ambiguous multi-scene attachment must not warn"
         );
     }
 }

@@ -217,7 +217,8 @@ impl Analysis {
             self.db
                 .file_text(pos.file)
                 .map(|ft| {
-                    semantic::member_completions(&self.db, ft, pos.offset)
+                    semantic::node_path_completions(&self.db, ft, pos.offset)
+                        .or_else(|| semantic::member_completions(&self.db, ft, pos.offset))
                         .unwrap_or_else(|| features::completions(&self.db, ft, pos.offset))
                 })
                 .unwrap_or_default()
@@ -418,6 +419,90 @@ mod tests {
         assert!(
             hints.iter().any(|h| h.label.contains("Button")),
             "expected a `: Button` inlay on `var b := $Btn`, got {hints:?}",
+        );
+    }
+
+    #[test]
+    fn node_path_completion_offers_scene_children() {
+        // `$Panel/` offers Panel's children (typed by their `type=`); `$` offers the attach node's.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Panel\" type=\"Panel\" parent=\".\"]\n\
+             [node name=\"Ok\" type=\"Button\" parent=\"Panel\"]\n\
+             [node name=\"Cancel\" type=\"Button\" parent=\"Panel\"]\n",
+        );
+        change.set_file_path(FileId(0), "res://main.tscn");
+        let gd = "extends Control\nfunc _ready():\n\tvar b := $Panel/\n";
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        let offset = u32::try_from(gd.find("$Panel/").unwrap() + "$Panel/".len()).unwrap();
+        let items = analysis
+            .completions(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap();
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Ok") && labels.contains(&"Cancel"),
+            "{labels:?}"
+        );
+        // node completions are typed by their `type=` and don't leak keywords/locals here.
+        assert!(
+            items
+                .iter()
+                .find(|i| i.label == "Ok")
+                .is_some_and(|i| i.detail.as_deref() == Some("Button")),
+            "{items:?}",
+        );
+        assert!(
+            !labels.contains(&"func"),
+            "should be node-path, not keyword, completion"
+        );
+    }
+
+    #[test]
+    fn goto_definition_on_a_node_path_jumps_into_the_tscn() {
+        // Cursor on `$Btn` → a NavTarget pointing at the `[node name="Btn" …]` line in the owning
+        // `.tscn` (the inverse of M1 typing; navigation the engine LSP cannot provide).
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let scene = "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Btn\" type=\"Button\" parent=\".\"]\n";
+        let gd = "extends Control\nfunc _ready():\n\tvar b := $Btn\n";
+        change.change_file(FileId(0), scene);
+        change.set_file_path(FileId(0), "res://main.tscn");
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        let offset = u32::try_from(gd.find("$Btn").unwrap() + 1).unwrap(); // on the `B`
+        let targets = analysis
+            .goto_definition(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap();
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].file, FileId(0), "jumps into the .tscn");
+        let focus =
+            &scene[targets[0].focus_range.start as usize..targets[0].focus_range.end as usize];
+        assert!(
+            focus.contains("Btn"),
+            "focus on the node name, got {focus:?}"
         );
     }
 

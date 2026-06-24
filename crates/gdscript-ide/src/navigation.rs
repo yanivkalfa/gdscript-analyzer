@@ -259,6 +259,17 @@ fn collision_check(db: &dyn Db, def: &GodotDef, new_name: &str) -> Result<(), Re
 /// The declaration target(s) of the symbol under `pos` — the inverse of [`def::classify`].
 #[must_use]
 pub fn goto_definition(db: &dyn Db, pos: FilePosition) -> Vec<NavTarget> {
+    // A node-path expression (`$Path`/`%Unique`/`get_node("…")`) jumps into the owning `.tscn`'s
+    // `[node …]` line — intelligence the engine LSP cannot give.
+    if let Some(t) = def::node_path_target(db, pos) {
+        return vec![NavTarget {
+            file: t.scene,
+            full_range: t.header_span,
+            focus_range: t.name_span,
+            name: t.node_name.to_string(),
+            kind: SymbolKind::Class,
+        }];
+    }
     match def::classify(db, pos) {
         Some(def) => nav_target_of_def(db, &def).into_iter().collect(),
         None => Vec::new(),

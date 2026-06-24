@@ -506,31 +506,6 @@ impl<'a> Parser<'a> {
 
     // ---- pass 2: build the tree ----
 
-    /// Whether `start` or any of its ancestors (up to the root) is an instance boundary
-    /// (`instance=` / `instance_placeholder` / an inherited-scene root). Used to tell an
-    /// into-instance override path from a genuinely dangling parent. Depth-bounded against a cycle.
-    fn descends_from_instance(&self, start: Option<NodeIdx>) -> bool {
-        let mut cur = start;
-        let mut guard = 0u32;
-        while let Some(c) = cur {
-            let Some(node) = self.model.nodes.get(c.0 as usize) else {
-                break;
-            };
-            if node.instance.is_some()
-                || node.instance_placeholder
-                || node.instance_is_inherited_root
-            {
-                return true;
-            }
-            cur = node.parent_idx;
-            guard += 1;
-            if guard > 4096 {
-                break;
-            }
-        }
-        false
-    }
-
     fn build_tree(&mut self) {
         let n = self.model.nodes.len();
         if n == 0 {
@@ -583,7 +558,7 @@ impl<'a> Parser<'a> {
                         // instanced/inherited sub-scene we don't recurse into (an override line) —
                         // expected, NOT dangling (Playbook C12/C13/C20). The root being an inherited
                         // scene makes every override child's missing segment a base-scene node.
-                        if !self.descends_from_instance(deepest) {
+                        if !self.model.descends_from_instance(deepest) {
                             self.model.problems.push(SceneProblem::DanglingParent {
                                 node: idx,
                                 parent_path: SmolStr::new(p),

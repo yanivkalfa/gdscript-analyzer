@@ -259,4 +259,89 @@ impl SceneModel {
             .flatten()
             .filter_map(move |&c| self.node(c).map(|n| (c, n)))
     }
+
+    /// Resolve a name-path from `base`, distinguishing the *reason* a path doesn't resolve — so a
+    /// caller can warn on a genuine [`Missing`](NodePathResolution::Missing) node while staying
+    /// silent on an [`Escaped`](NodePathResolution::Escaped) (`..`/absolute) or an
+    /// [`IntoInstance`](NodePathResolution::IntoInstance) override (the M1 typing uses
+    /// [`resolve_path_from`](Self::resolve_path_from); this is for the `INVALID_NODE_PATH` decision).
+    #[must_use]
+    pub fn classify_path_from(&self, base: NodeIdx, path: &str) -> NodePathResolution {
+        let p = path.trim();
+        if p.is_empty() || p == "." {
+            return NodePathResolution::Resolved(base);
+        }
+        if p.starts_with('/') {
+            return NodePathResolution::Escaped; // absolute `/root/…`
+        }
+        let mut cur = base;
+        for seg in p.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                return NodePathResolution::Escaped;
+            }
+            match self.child_index.get(&(cur, SmolStr::new(seg))) {
+                Some(&next) => cur = next,
+                None => {
+                    return if self.descends_from_instance(Some(cur)) {
+                        NodePathResolution::IntoInstance
+                    } else {
+                        NodePathResolution::Missing
+                    };
+                }
+            }
+        }
+        NodePathResolution::Resolved(cur)
+    }
+
+    /// Resolve a `%Unique` name. A missing unique name is genuinely [`Missing`] (no instance
+    /// ambiguity — `%` is scene-wide).
+    #[must_use]
+    pub fn classify_unique(&self, name: &str) -> NodePathResolution {
+        self.unique_nodes
+            .get(name)
+            .map_or(NodePathResolution::Missing, |&idx| {
+                NodePathResolution::Resolved(idx)
+            })
+    }
+
+    /// Whether `start` or any ancestor (up to the root) is an instance boundary (`instance=` /
+    /// `instance_placeholder` / an inherited-scene root) — i.e. a missing tail below it lives in a
+    /// sub-scene we don't recurse into, not a genuine dangling/missing node. Depth-bounded.
+    pub(crate) fn descends_from_instance(&self, start: Option<NodeIdx>) -> bool {
+        let mut cur = start;
+        let mut guard = 0u32;
+        while let Some(c) = cur {
+            let Some(node) = self.nodes.get(c.0 as usize) else {
+                break;
+            };
+            if node.instance.is_some()
+                || node.instance_placeholder
+                || node.instance_is_inherited_root
+            {
+                return true;
+            }
+            cur = node.parent_idx;
+            guard += 1;
+            if guard > 4096 {
+                break;
+            }
+        }
+        false
+    }
+}
+
+/// The reason a node path did (not) resolve — for the `INVALID_NODE_PATH` decision (M2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodePathResolution {
+    /// Resolved to a concrete node.
+    Resolved(NodeIdx),
+    /// The path escapes the scene (`..` / absolute `/root/…`) — out of the slice; never warn.
+    Escaped,
+    /// The miss descends into an instanced/inherited sub-scene we don't recurse into; never warn.
+    IntoInstance,
+    /// A genuinely absent in-scene node — the `INVALID_NODE_PATH` trigger.
+    Missing,
 }

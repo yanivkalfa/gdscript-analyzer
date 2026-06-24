@@ -24,7 +24,8 @@ mod model;
 mod parse;
 
 pub use model::{
-    ExtId, ExtResource, NodeIdx, SceneKind, SceneModel, SceneNode, SceneProblem, SubResource,
+    ExtId, ExtResource, NodeIdx, NodePathResolution, SceneKind, SceneModel, SceneNode,
+    SceneProblem, SubResource,
 };
 pub use parse::parse_scene;
 
