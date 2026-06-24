@@ -156,11 +156,33 @@ later.
   **godot-demo-projects (456 `.gd`): 0 panics**; cross-file adds only +14 diags over per-file
   (+1 `TYPE_MISMATCH` = a cross-*project* `class_name` collision artifact of merging ~30 demos,
   not a real bug).
+- **M3 — `preload`/`load` const-aliasing + `res://` path map.** `res_path` is a new `MEDIUM`-durability
+  field on the `FileText` salsa input (salsa tracks input fields *individually* — verified against
+  `salsa-0.27.1/src/input.rs` `revisions[field_index]` + its own `expect_reuse_field_x…field_y` test —
+  so it backdates across `text` keystrokes, same firewall as `file_class_name`). `res_path_registry`
+  (path → `FileId`, keyed on `SourceRoot`) mirrors `global_registry`; `preload("res://x.gd")` and
+  `extends "res://x.gd"` resolve through it to the declaring file's `ScriptRef` (reusing `script_member_walk`
+  — no new meta-type variant, since the analyzer already collapses meta-vs-instance like a bare `class_name`).
+  Resolution is by **path**, so a script with *no* `class_name` is still preloadable (`reduce_preload` does
+  the same). `load("…")` was corrected from `Variant` → **`Unknown` (the seam)** so `var r := load(…)` no
+  longer false-warns and is never aliased to `preload` (Godot: `load` is a runtime call returning an opaque
+  `Resource`). Validated: reference corpus **57 → 57** (zero regression, paths layout-verified), 2nd corpus
+  **456 files, 0 panics**; an end-to-end public-API test proves a real `const M = preload(…); M.new().parse()`
+  yields a typed `: int` inlay. The loader supplies paths via `Change::set_file_path` (on add only — a
+  keystroke must omit it, since salsa bumps a field's revision on *every* set, even an identical value).
 
 ### Deferred / found
-- [ ] **`extends "res://path.gd"` (and `preload`/`load`) need a `res://` → `FileId` map.**
-      `resolve_external(ExtendsPath)` still returns `Unknown`. Lit up in **M3** alongside the
-      project-discovery work (the loader must supply each file's `res://` path).
+- [x] **`extends "res://path.gd"` + `preload` need a `res://` → `FileId` map — DONE in M3** (above).
+      `load(var)`/`load("lit")` stay opaque by design (D5).
+- [ ] **Relative `preload`/`extends` paths (`preload("sibling.gd")`) resolve to the seam.** Godot anchors
+      them to the importing script's dir: `resolved = script_path.get_base_dir().path_join(p).simplify_path()`
+      (CONFIRMED `reduce_preload` 4664-4667). Absolute `res://`/`user://` are handled; relative needs the
+      importing file's path threaded into resolution (better done deliberately with **M5**'s file-context
+      work). 0 occurrences in the reference corpus; conservative seam = no false positives.
+- [ ] **Cross-*file* `preload`-const member access is the seam.** `const X = preload(…)` then `X.new()` is
+      typed in the **declaring** file (the member pre-pass infers the initializer). Reading that const from
+      *another* file (`other.X`) sees `script_class`'s annotation-only sig (`Variant`), because `script_class`
+      is offset-free and does not infer const *initializers*. Rare; the corpus pattern is same-file.
 - [ ] **Parser gaps on the broader demo-projects corpus (NEW, Phase-1 follow-up).** Project-mode
       over godot-demo-projects surfaced **307 `GDSCRIPT_SYNTAX`** errors (cascading
       "expected a declaration" — a few unhandled syntactic forms, e.g. some lambda/match/typed
