@@ -108,6 +108,14 @@ fn is_resource_path(p: &str) -> bool {
 /// no project is loaded or the path maps to no known file (a dangling `preload` — imprecise, but
 /// never a false diagnostic).
 fn resolve_res_path(db: &dyn Db, path: &str) -> Ty {
+    // Only a GDScript resource has a script `ScriptRef`. A `.tscn`/`.tres`/`.png`/… resolves to a
+    // PackedScene/Resource, not a script — typing it as a `ScriptRef` would wrongly accept
+    // `X.new()` and member access on it (scene-root typing is Phase 4). The `res_path_registry`
+    // only indexes `.gd` files today, but gate defensively so a future scene-ingesting loader
+    // cannot mis-type `preload("res://x.tscn")`. Non-`.gd` → the conservative seam.
+    if !is_gdscript_path(path) {
+        return Ty::Unknown;
+    }
     let Some(root) = db.source_root() else {
         return Ty::Unknown;
     };

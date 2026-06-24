@@ -134,31 +134,46 @@ fn refuse_if_crosses_boundary(db: &dyn Db, def: &GodotDef) -> Result<(), RenameE
         GodotDef::Autoload { .. } => Err(RenameError::CrossesUnsupportedBoundary {
             what: "autoload name is declared in project.godot (not rewritten by rename)".to_owned(),
         }),
-        // A method/var/const/signal can be referenced by a *string* name (`connect("m")`,
-        // `Callable(o, "m")`, a `.tscn` `[connection method="m"]`) that we cannot prove denotes
-        // this symbol — and scenes are not even ingested. If a same-named string literal exists
-        // anywhere in the project, refuse (we never edit a string literal).
-        GodotDef::Member { owner_file, name } => {
-            let string_referenceable = matches!(
-                member_symbol_kind(db, *owner_file, name),
-                Some(
-                    SymbolKind::Function
-                        | SymbolKind::Method
-                        | SymbolKind::Variable
-                        | SymbolKind::Constant
-                        | SymbolKind::Signal
-                )
-            );
-            if string_referenceable && project_has_string_literal(db, name) {
+        // A member refuses when it has a reference surface we cannot rewrite: a type-only inner
+        // class / named enum, or a method/var/const/signal that may be named by a project string.
+        GodotDef::Member { owner_file, name } => match member_symbol_kind(db, *owner_file, name) {
+            // An inner class / named enum is referenced *as a type* (`var x: Inner`, `: MyEnum`),
+            // which `classify_type_name` cannot resolve to this member (it isn't a `class_name`
+            // global) — so find-refs would miss those sites and the rewrite would be incomplete.
+            // Refuse rather than emit a partial edit.
+            Some(SymbolKind::Class | SymbolKind::Enum) => {
                 Err(RenameError::CrossesUnsupportedBoundary {
                     what: format!(
-                        "`{name}` may be referenced by a string (connect/Callable/scene connection)"
+                        "`{name}` is an inner class / named enum referenced as a type — rename of its type uses is not yet supported"
                     ),
                 })
-            } else {
-                Ok(())
             }
-        }
+            // A method/var/const/signal can be referenced by a *string* name (`connect("m")`,
+            // `Callable(o, "m")`, a `.tscn` `[connection method="m"]`) we cannot prove denotes this
+            // symbol — and scenes are not ingested. If a same-named string literal exists anywhere
+            // in the project, refuse (we never edit a string literal).
+            kind => {
+                let string_referenceable = matches!(
+                    kind,
+                    Some(
+                        SymbolKind::Function
+                            | SymbolKind::Method
+                            | SymbolKind::Variable
+                            | SymbolKind::Constant
+                            | SymbolKind::Signal
+                    )
+                );
+                if string_referenceable && project_has_string_literal(db, name) {
+                    Err(RenameError::CrossesUnsupportedBoundary {
+                        what: format!(
+                            "`{name}` may be referenced by a string (connect/Callable/scene connection)"
+                        ),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        },
     }
 }
 
@@ -169,11 +184,31 @@ fn collision_check(db: &dyn Db, def: &GodotDef, new_name: &str) -> Result<(), Re
         with: new_name.to_owned(),
     };
     match def {
-        GodotDef::Global { .. } => {
+        GodotDef::Global { decl_file, .. } => {
+            // …with another user `class_name` (point at its real declaration, not byte 0).
             if let Some(root) = db.source_root()
-                && let Some(decl) = queries::global_registry(db, root).resolve(new_name)
+                && let Some(other) = queries::global_registry(db, root).resolve(new_name)
             {
-                return Err(collide(decl.file_id(db), TextRange::new(0, 0)));
+                let file = other.file_id(db);
+                let range =
+                    class_decl_target(db, file).map_or(TextRange::new(0, 0), |t| t.focus_range);
+                return Err(collide(file, range));
+            }
+            // …or with an engine/native global (`Node`, `Vector2`, …) or an autoload singleton:
+            // Godot forbids a `class_name` that shadows a native type or another global identifier.
+            // There is no user declaration to point at, so report the renamed class's own site.
+            let shadows_global = db
+                .engine()
+                .is_some_and(|api| gdscript_hir::resolve::resolve_global(api, new_name).is_some())
+                || db.project_config().is_some_and(|config| {
+                    queries::autoload_registry(db, config)
+                        .resolve_path(new_name)
+                        .is_some()
+                });
+            if shadows_global {
+                let range = class_decl_target(db, *decl_file)
+                    .map_or(TextRange::new(0, 0), |t| t.focus_range);
+                return Err(collide(*decl_file, range));
             }
         }
         GodotDef::Member { owner_file, .. } => {
@@ -532,6 +567,15 @@ fn is_keyword(name: &str) -> bool {
             | "true"
             | "false"
             | "null"
+            // Reserved words the lexer emits as fixed-text tokens (renaming TO them is invalid).
+            | "assert"
+            | "namespace"
+            | "yield"
+            // The math-constant tokens (`var PI` is not a legal shadow — they are literal tokens).
+            | "PI"
+            | "TAU"
+            | "INF"
+            | "NAN"
     )
 }
 
@@ -644,6 +688,43 @@ mod tests {
     }
 
     #[test]
+    fn find_refs_and_rename_include_the_extends_clause() {
+        // A `class_name`'s `extends ThatClass` is a by-NAME reference; find-refs must include it
+        // and rename must rewrite it (else the rename leaves a stale `extends` — a corrupting,
+        // incomplete edit).
+        let base = "class_name Base\nfunc m():\n\tpass\n";
+        let derived = "class_name Derived\nextends Base\n";
+        let db = db_with(&[(0, base), (1, derived)]);
+        let refs = find_references(&db, pos(0, "Base", 0, base));
+        assert_eq!(refs.len(), 2, "decl + `extends Base`: {refs:?}");
+        assert!(
+            refs.iter().any(|r| r.file == FileId(1)),
+            "the `extends Base` reference must be found: {refs:?}",
+        );
+        let change = rename(&db, pos(0, "Base", 0, base), "Foundation").expect("rename ok");
+        let total: usize = change.edits.iter().map(|fe| fe.edits.len()).sum();
+        assert_eq!(total, 2, "decl + extends rewritten: {change:?}");
+    }
+
+    #[test]
+    fn find_refs_tags_the_member_declaration_exactly_once() {
+        // Regression: the member `name_range` used to carry a leading space, so a member's own
+        // declaration never matched the (exact-identifier) occurrence range and was mis-tagged
+        // `Read`. find-refs must report exactly one `Declaration`.
+        let a = "class_name A\nfunc update():\n\tpass\nfunc go():\n\tself.update()\n";
+        let db = db_with(&[(0, a)]);
+        let refs = find_references(&db, pos(0, "update", 0, a));
+        assert_eq!(refs.len(), 2, "decl + self.update(): {refs:?}");
+        assert_eq!(
+            refs.iter()
+                .filter(|r| r.kind == ReferenceKind::Declaration)
+                .count(),
+            1,
+            "the member's own declaration must be tagged Declaration: {refs:?}",
+        );
+    }
+
+    #[test]
     fn rename_class_name_rewrites_every_file() {
         let db = db_with(&[(0, WIDGET), (1, USER)]);
         let change = rename(&db, pos(0, "Widget", 0, WIDGET), "Gadget").expect("rename ok");
@@ -739,5 +820,56 @@ mod tests {
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].file, FileId(0));
         assert_eq!(targets[0].name, "Widget");
+    }
+
+    #[test]
+    fn rename_does_not_cross_into_an_inner_class() {
+        // The top-level `update` and the inner `class Inner`'s `update` are unrelated; find-refs
+        // (and therefore rename) on the top-level one must NOT touch the inner one.
+        let src =
+            "class_name A\nfunc update():\n\tpass\nclass Inner:\n\tfunc update():\n\t\tpass\n";
+        let db = db_with(&[(0, src)]);
+        let refs = find_references(&db, pos(0, "update", 0, src));
+        assert_eq!(refs.len(), 1, "only the top-level update decl: {refs:?}");
+    }
+
+    #[test]
+    fn rename_refuses_named_enum_and_inner_class() {
+        // An inner class / named enum is referenced as a TYPE (`var x: Inner`), which find-refs
+        // cannot resolve — so rename refuses rather than emit a partial edit.
+        let enum_src = "class_name A\nenum Color { RED, GREEN }\n";
+        let db = db_with(&[(0, enum_src)]);
+        let err = rename(&db, pos(0, "Color", 0, enum_src), "Hue").unwrap_err();
+        assert!(
+            matches!(err, RenameError::CrossesUnsupportedBoundary { .. }),
+            "{err:?}"
+        );
+        let inner_src = "class_name A\nclass Inner:\n\tvar x := 1\n";
+        let db2 = db_with(&[(0, inner_src)]);
+        let err2 = rename(&db2, pos(0, "Inner", 0, inner_src), "Nested").unwrap_err();
+        assert!(
+            matches!(err2, RenameError::CrossesUnsupportedBoundary { .. }),
+            "{err2:?}"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_reserved_words_and_math_constants() {
+        let db = db_with(&[(0, WIDGET)]);
+        for kw in ["yield", "assert", "namespace", "PI", "NAN"] {
+            let err = rename(&db, pos(0, "Widget", 0, WIDGET), kw).unwrap_err();
+            assert!(
+                matches!(err, RenameError::InvalidIdentifier { .. }),
+                "`{kw}` should be rejected: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_refuses_class_name_shadowing_an_engine_type() {
+        // `class_name Widget` -> `Node` would shadow a native class — Godot forbids it; refuse.
+        let db = db_with(&[(0, WIDGET)]);
+        let err = rename(&db, pos(0, "Widget", 0, WIDGET), "Node").unwrap_err();
+        assert!(matches!(err, RenameError::WouldCollide { .. }), "{err:?}");
     }
 }

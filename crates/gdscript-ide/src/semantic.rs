@@ -99,6 +99,8 @@ pub fn inlay_hints(db: &dyn Db, file: FileText) -> Vec<InlayHint> {
             let show = match b.kind {
                 BindingKind::Var => b.inferred_colon_eq,
                 BindingKind::Param | BindingKind::ForVar => true,
+                // A `match` capture is always `Variant` (suppressed above anyway) — no inlay.
+                BindingKind::MatchBind => false,
             };
             if show && let Some(label) = type_label(db, api, &b.ty) {
                 hints.push(InlayHint {

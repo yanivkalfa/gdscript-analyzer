@@ -253,3 +253,71 @@ later.
 - [ ] **`corpus --project` is a robustness stress test, not a single-project run.** Merging many
       sub-projects into one host shares the `class_name` namespace; cross-project collisions are
       expected. A faithful per-project validation needs `project.godot`-scoped roots (M4).
+
+### Post-M5 bug hunt (adversarial 6-finder + 3-vote-verify pass over all Phase-3 code)
+
+**Fixed in this pass** (11 confirmed defects — find-refs/rename correctness, the no-false-positive
+seam, and rename identifier hygiene; all with regression tests):
+- [x] **`classify` missed `extends Base`** (bare `Ident`, not a `Name`/`TypeRef` node) → a
+      `class_name` rename left `extends ThatClass` stale (incomplete, corrupting edit). Fixed:
+      `cst::extends_head_token` + a classify branch resolving the extends head as a type name.
+- [x] **Member `name_range` carried leading whitespace** (the `Name` CST node absorbs the
+      inter-token space) → off-by-one focus ranges + a member's own declaration mis-tagged `Read`.
+      Fixed at the root in `item_tree::name_range` (trim to the bare identifier).
+- [x] **Inner-class member over-rename (CRITICAL).** `GodotDef::Member` identity is `(file, name)`
+      with no inner-class discriminator, so an inner `class Inner: func update` shared identity with
+      a top-level `func update` → rename rewrote BOTH (cross-class corruption). Fixed: `classify`
+      returns `None` for a declaration nested in an `InnerClassDecl` (correct-or-refuse). Full
+      inner-class navigation identity is deferred (see below).
+- [x] **Local in a `get`/`set` accessor (or class-level-lambda) body mis-classified as a Member.**
+      The discriminator only checked for a `FuncDecl` ancestor; broadened to `Getter`/`Setter`/
+      `LambdaExpr` too.
+- [x] **`resolve_name_to_def` picked the first same-named binding (scope-unaware)** → a shadowed
+      local reference resolved to the wrong binding (e.g. a param instead of the shadowing local),
+      conflating two distinct locals in find-refs / rename. Fixed: pick the nearest-PRECEDING
+      declaration (greatest start `<=` the reference offset = lexical shadowing).
+- [x] **`match`-pattern `var` captures were invisible to navigation** (never recorded as bindings)
+      → a capture reference mis-resolved to a same-named member, corrupting its rename. Fixed:
+      `MatchArm` binds now carry a range, infer records a `BindingKind::MatchBind`, and `classify`
+      routes a `PatternBind` decl to a local.
+- [x] **Rename of an inner-class / named-enum member was a partial edit** (its `var x: Inner` /
+      `: MyEnum` type-annotation uses aren't resolvable by `classify_type_name`). Fixed: refuse
+      renaming a `Member` of kind `Class`/`Enum`.
+- [x] **`is_valid_ident` accepted reserved words as the new name** (`assert`, `namespace`, `yield`)
+      and the math-constant tokens (`PI`/`TAU`/`INF`/`NAN`) → a rename could write invalid code.
+      Added them to the keyword reject set.
+- [x] **Global rename collision ignored engine/native class names and autoload singletons.**
+      `class_name Widget` → `Node` (or an autoload name) passed the collision check. Fixed: also
+      reject when the new name resolves to an engine global or an autoload singleton.
+- [x] **`preload`/`extends "res://…"` of a non-`.gd` resource could resolve to a script `ScriptRef`.**
+      `resolve_res_path` returned a `ScriptRef` for any registered path; a future scene-ingesting
+      loader would mis-type `preload("res://x.tscn")` (accepting bogus `.new()`/member access).
+      Gated `resolve_res_path` on `.gd` (latent today — only `.gd` is indexed — but defensive).
+- [x] **Global `WouldCollide` reported the colliding symbol at byte `(0,0)`** instead of its real
+      `class_name` declaration range. Fixed via `class_decl_target`.
+
+**Deferred** (verified real, but out of Phase-3 scope or needing a deliberate model change):
+- [ ] **Aliased `self` loses the file's own members → a false `UNSAFE_METHOD/PROPERTY_ACCESS`.**
+      `self` is typed as `class.base` (e.g. `Node`), so `var me := self; me.own_method()` doesn't
+      see the script's own methods and warns. The only **false positive** the hunt found. The fix is
+      to type `self` as the current file's own `ScriptRef` (threading the `FileId` into `infer`),
+      which ripples through inference and must be re-validated against the corpus (diagnostic-count
+      stable) — a deliberate change, not a navigation-bugfix rider. **Highest-priority follow-up.**
+- [ ] **Inner-class member navigation identity is not modeled.** Inner members now refuse rather
+      than corrupt (above); a full fix qualifies `GodotDef::Member` by the declaring inner-class
+      scope and resolves against the inner `ItemTree` (pairs naturally with Phase-4/later inner-class
+      type modeling).
+- [ ] **Anonymous-enum variant references/declarations don't classify** (`enum { FIRE }` then
+      `FIRE`). `member_owner` uses `item_tree.member`, which doesn't expose flattened anon-enum
+      variants — so find-refs/goto return nothing (safe: `None`, never a wrong edit). Needs
+      `member_owner` to consult `ClassScope`'s flattening, or an `EnumVariant` identity.
+- [ ] **Member rename collision check misses inherited base-chain members** (only own members are
+      checked). Renaming `foo` → `bar` where `bar` is declared on a user base isn't flagged (a legal
+      GDScript shadow, so not corrupting — just an undetected clash). Walk the `extends` chain.
+- [ ] **Symbols named with soft keywords (`match`/`when`) don't classify** — `classify` gates on
+      `tok.kind() == Ident`, but a reference to `func match()` is a `MatchKw` token. Accept the
+      soft-name keyword kinds (rare; safe `None` today).
+- [ ] **`extends "res://base.gd".Inner` (string + dotted) resolves the base to the OUTER script,**
+      dropping `.Inner`. `parse_extends_tokens` returns `ScriptPath` on the first `String` and never
+      consults the trailing idents. The correct-or-refuse fix routes the string+dotted form to the
+      seam (needs a new `ExtendsRef` variant; pairs with inner-class modeling). Very rare; 0 in corpus.

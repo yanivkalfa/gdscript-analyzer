@@ -145,6 +145,27 @@ pub fn children_of(node: &GdNode, kind: SyntaxKind) -> Vec<GdNode> {
         .collect()
 }
 
+/// The head `Ident` token of `node`'s `extends Base[.Inner]` target — the bare identifier directly
+/// after the `extends` keyword (in an `ExtendsClause`, a `ClassNameDecl`, or an inner-class decl
+/// that inlines its `extends`). `None` when there is no `extends`, or the target is a string path
+/// (`extends "res://x.gd"`). The head names the base *class*; trailing `.Inner` segments are
+/// excluded (only the first `Ident` after `extends` is returned).
+#[must_use]
+pub fn extends_head_token(node: &GdNode) -> Option<GdToken> {
+    let mut after_extends = false;
+    for t in node
+        .children_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+    {
+        if t.kind() == SyntaxKind::ExtendsKw {
+            after_extends = true;
+        } else if after_extends && t.kind() == SyntaxKind::Ident {
+            return Some(t.clone());
+        }
+    }
+    None
+}
+
 /// The first meaningful (non-trivia, non-layout) token of `node`.
 #[must_use]
 pub fn first_token(node: &GdNode) -> Option<GdToken> {

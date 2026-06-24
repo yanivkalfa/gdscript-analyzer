@@ -109,8 +109,18 @@ pub fn classify(db: &dyn Db, pos: FilePosition) -> Option<GodotDef> {
     {
         return Some(def);
     }
-    // (B) A type reference (`var x: Foo`, `extends Foo`, `is Foo`, `as Foo`): the token is inside a
-    //     `TypeRef`. Resolve the type name to a class_name global or an engine class.
+    // (A2) The head name of an `extends Base` clause. Its `Ident` is a *bare* child of the
+    //      `ExtendsClause` / `ClassNameDecl` / inner-class decl — not wrapped in a `Name` or
+    //      `TypeRef` node — so neither (A) nor (B) catches it. Resolve it as a type name so a
+    //      `class_name`'s find-references / rename includes every `extends ThatClass` reference
+    //      (else a rename silently leaves the `extends` stale — an incomplete, corrupting edit).
+    if let Some(head) = cst::extends_head_token(parent)
+        && cst::token_range(&head) == tok_range
+    {
+        return classify_type_name(db, &name);
+    }
+    // (B) A type reference (`var x: Foo`, `is Foo`, `as Foo`): the token is inside a `TypeRef`.
+    //     Resolve the type name to a class_name global or an engine class.
     if has_ancestor(&tok, SyntaxKind::TypeRef) {
         return classify_type_name(db, &name);
     }
@@ -129,32 +139,48 @@ fn classify_decl(
     tok_range: TextRange,
 ) -> Option<GodotDef> {
     let decl = name_node.parent()?;
+    // A `var`/`const` nested inside a function, a property accessor (`get`/`set`), or a lambda body
+    // is a LOCAL — not a class member. (A `FuncDecl` ancestor alone misses an accessor-body or a
+    // class-level-lambda-body local, which would otherwise be mis-typed as a `Member`.)
+    let in_body = node_has_ancestor(decl, SyntaxKind::FuncDecl)
+        || node_has_ancestor(decl, SyntaxKind::Getter)
+        || node_has_ancestor(decl, SyntaxKind::Setter)
+        || node_has_ancestor(decl, SyntaxKind::LambdaExpr);
+    // A declaration nested inside a `class Inner:` body is an inner-class member. Its `(file, name)`
+    // identity would collide with a same-named TOP-LEVEL member, letting find-refs / rename cross
+    // between two unrelated classes (a silent corrupting edit). Inner-class member identity isn't
+    // modeled yet (item_tree stores inner members separately), so treat them as out of scope —
+    // navigation refuses rather than mis-resolves. (The inner class's own *name* is unaffected: its
+    // decl node IS the `InnerClassDecl`, whose ancestor walk starts *above* it.)
+    let in_inner_class = node_has_ancestor(decl, SyntaxKind::InnerClassDecl);
     match decl.kind() {
         SyntaxKind::ClassNameDecl => Some(GodotDef::Global {
             decl_file: file,
             name: name.clone(),
         }),
+        // A parameter, `for`-loop variable, or `match`-pattern `var` capture is always a local.
+        SyntaxKind::Param | SyntaxKind::ForStmt | SyntaxKind::PatternBind => {
+            local_def(db, ft, file, tok_range)
+        }
+        // A `var`/`const` inside a body is a local.
+        SyntaxKind::VarDecl | SyntaxKind::ConstDecl if in_body => {
+            local_def(db, ft, file, tok_range)
+        }
+        // Otherwise a class-level member — but only of the top-level class (inner-class members are
+        // out of scope, see above).
         SyntaxKind::FuncDecl
         | SyntaxKind::SignalDecl
         | SyntaxKind::EnumDecl
-        | SyntaxKind::InnerClassDecl => Some(GodotDef::Member {
-            owner_file: file,
-            name: name.clone(),
-        }),
-        // A `var`/`const` is a class member only at the top level; inside a function body it is a
-        // local. A `FuncDecl` ancestor of the decl is the unambiguous discriminator.
-        SyntaxKind::VarDecl | SyntaxKind::ConstDecl => {
-            if node_has_ancestor(decl, SyntaxKind::FuncDecl) {
-                local_def(db, ft, file, tok_range)
-            } else {
-                Some(GodotDef::Member {
-                    owner_file: file,
-                    name: name.clone(),
-                })
-            }
+        | SyntaxKind::InnerClassDecl
+        | SyntaxKind::VarDecl
+        | SyntaxKind::ConstDecl
+            if !in_inner_class =>
+        {
+            Some(GodotDef::Member {
+                owner_file: file,
+                name: name.clone(),
+            })
         }
-        // A parameter or `for`-loop variable name is always a local.
-        SyntaxKind::Param | SyntaxKind::ForStmt => local_def(db, ft, file, tok_range),
         _ => None,
     }
 }
@@ -212,7 +238,9 @@ fn classify_body_ref(
     let unit = fi.unit_at(offset)?;
     let eid = unit.body.source_map.expr_at_offset(offset)?;
     match unit.body.expr(eid) {
-        crate::body::Expr::Name(n) if n == name => resolve_name_to_def(db, ft, file, unit, name),
+        crate::body::Expr::Name(n) if n == name => {
+            resolve_name_to_def(db, ft, file, offset, unit, name)
+        }
         crate::body::Expr::Field {
             receiver,
             name: fname,
@@ -245,33 +273,48 @@ fn classify_body_ref(
 }
 
 /// Replicate [`crate::infer`]'s bare-name lookup order, returning the *declaration identity*:
-/// local → own/inherited member → engine global → `class_name` global → autoload.
+/// local → own/inherited member → engine global → `class_name` global → autoload. `offset` is the
+/// reference site, used to pick the correct binding when a name is shadowed (lexical scoping).
 fn resolve_name_to_def(
     db: &dyn Db,
     ft: FileText,
     file: FileId,
+    offset: u32,
     unit: &crate::infer::Unit,
     name: &SmolStr,
 ) -> Option<GodotDef> {
-    // 1. A local binding in this unit (var / param / for-var). The binding name_range may carry
-    //    leading whitespace, so trim before comparing and before recording the identity.
+    // 1. A local binding in this unit (var / param / for-var / match-capture). A name can be
+    //    shadowed (a param and a same-named local, or a re-declared `var`), so pick the
+    //    nearest-PRECEDING declaration — the binding with the greatest start `<=` the reference
+    //    offset — mirroring GDScript's lexical shadowing. (First-by-iteration would pick the
+    //    outermost, conflating two distinct locals and corrupting a rename.) The binding
+    //    `name_range` may carry leading whitespace, so trim before comparing / recording.
     let text = ft.text(db);
+    let mut best: Option<TextRange> = None;
     for b in &unit.result.bindings {
-        if matches!(
+        if !matches!(
             b.kind,
             crate::infer::BindingKind::Var
                 | crate::infer::BindingKind::Param
                 | crate::infer::BindingKind::ForVar
+                | crate::infer::BindingKind::MatchBind
         ) {
-            let nr = trim_range(text, b.name_range);
-            if text.get(nr.start as usize..nr.end as usize) == Some(name.as_str()) {
-                return Some(GodotDef::Local {
-                    body_file: file,
-                    body_range: unit.range,
-                    decl_name_range: nr,
-                });
-            }
+            continue;
         }
+        let nr = trim_range(text, b.name_range);
+        if text.get(nr.start as usize..nr.end as usize) != Some(name.as_str()) {
+            continue;
+        }
+        if nr.start <= offset && best.is_none_or(|cur| nr.start >= cur.start) {
+            best = Some(nr);
+        }
+    }
+    if let Some(nr) = best {
+        return Some(GodotDef::Local {
+            body_file: file,
+            body_range: unit.range,
+            decl_name_range: nr,
+        });
     }
     // 2/3. Own or inherited member (walk this script's extends chain).
     if let Some(owner) = member_owner(db, crate::ty::ScriptRefId(file.0), name, 0) {
@@ -475,6 +518,29 @@ mod tests {
     }
 
     #[test]
+    fn extends_user_class_classifies_to_the_global() {
+        // The `Base` in `extends Base` is a bare Ident (not a Name/TypeRef node); it must still
+        // classify to Base's `class_name` global — else find-refs/rename of Base would miss the
+        // `extends` and leave it stale.
+        let base = "class_name Base\nfunc m():\n\tpass\n";
+        let derived = "class_name Derived\nextends Base\n";
+        let db = db_with(&[(0, base), (1, derived)]);
+        let decl = at(&db, 0, "Base", base).unwrap();
+        let ext = at(&db, 1, "Base", derived).unwrap(); // the `Base` in `extends Base`
+        assert!(matches!(
+            decl,
+            GodotDef::Global {
+                decl_file: FileId(0),
+                ..
+            }
+        ));
+        assert_eq!(
+            decl, ext,
+            "`extends Base` must classify to Base's class_name def"
+        );
+    }
+
+    #[test]
     fn inherited_member_resolves_to_the_declaring_base() {
         let base = "class_name Base\nfunc base_m() -> int:\n\treturn 1\n";
         let derived = "class_name Derived\nextends Base\nfunc use_it():\n\tself.base_m()\n";
@@ -491,6 +557,70 @@ mod tests {
         assert_eq!(
             decl, call,
             "inherited call must resolve to the base's member def"
+        );
+    }
+
+    #[test]
+    fn inner_class_member_is_out_of_scope() {
+        // A method inside `class Inner:` must NOT share identity with a same-named top-level method
+        // (that would let rename cross between two unrelated classes). It is out of scope → None.
+        let src =
+            "class_name A\nfunc update():\n\tpass\nclass Inner:\n\tfunc update():\n\t\tpass\n";
+        let db = db_with(&[(0, src)]);
+        let top = at_nth(&db, 0, "update", 0, src).unwrap();
+        let inner = at_nth(&db, 0, "update", 1, src);
+        assert!(matches!(top, GodotDef::Member { .. }), "{top:?}");
+        assert_eq!(
+            inner, None,
+            "an inner-class member must not classify (out of scope), got {inner:?}"
+        );
+    }
+
+    #[test]
+    fn match_capture_classifies_as_local_distinct_from_member() {
+        // A `match`-captured `var cap` is a local that shadows a same-named member; a reference to
+        // it must resolve to the Local, not the member (else rename of the member would corrupt it).
+        let src = "var cap := 0\nfunc f(v):\n\tmatch v:\n\t\tvar cap:\n\t\t\tprint(cap)\n";
+        let db = db_with(&[(0, src)]);
+        let member = at_nth(&db, 0, "cap", 0, src).unwrap();
+        let capture = at_nth(&db, 0, "cap", 1, src).unwrap();
+        let usage = at_nth(&db, 0, "cap", 2, src).unwrap();
+        assert!(matches!(member, GodotDef::Member { .. }), "{member:?}");
+        assert!(matches!(capture, GodotDef::Local { .. }), "{capture:?}");
+        assert_eq!(
+            usage, capture,
+            "`print(cap)` must resolve to the match capture"
+        );
+        assert_ne!(usage, member);
+    }
+
+    #[test]
+    fn accessor_body_local_is_not_a_member() {
+        // A `var` inside a property `get`/`set` accessor is a local, never a class member.
+        let src = "var hp: int:\n\tget:\n\t\tvar tmp = 2\n\t\treturn tmp\n";
+        let db = db_with(&[(0, src)]);
+        let tmp = at_nth(&db, 0, "tmp", 0, src);
+        assert!(
+            !matches!(tmp, Some(GodotDef::Member { .. })),
+            "a local in a get/set body must not be a Member, got {tmp:?}"
+        );
+    }
+
+    #[test]
+    fn shadowed_local_reference_resolves_to_the_nearest_declaration() {
+        // A param `x` and a local `var x`: the `print(x)` reference must resolve to the LOCAL
+        // (nearest-preceding decl), not the param — else find-refs/rename conflates two locals.
+        let src = "func f(x):\n\tvar x := 2\n\tprint(x)\n";
+        let db = db_with(&[(0, src)]);
+        let param = at_nth(&db, 0, "x", 0, src).unwrap();
+        let local = at_nth(&db, 0, "x", 1, src).unwrap();
+        let usage = at_nth(&db, 0, "x", 2, src).unwrap();
+        assert!(matches!(param, GodotDef::Local { .. }), "{param:?}");
+        assert!(matches!(local, GodotDef::Local { .. }), "{local:?}");
+        assert_ne!(param, local, "param x and local x are distinct");
+        assert_eq!(
+            usage, local,
+            "the reference resolves to the nearest (local) declaration"
         );
     }
 }

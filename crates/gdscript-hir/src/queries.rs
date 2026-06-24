@@ -714,6 +714,36 @@ mod tests {
     }
 
     #[test]
+    fn non_gd_preload_resource_stays_seam() {
+        // A `preload` of a non-`.gd` resource must NOT resolve to a script `ScriptRef`, even if the
+        // path is in the res:// registry — typing a `.tscn`/PackedScene as a script would wrongly
+        // accept `.new()`/member access (scene-root typing is Phase 4). Defensive gate (the loader
+        // indexes only `.gd` today, but a future scene-ingesting loader must not mis-type this).
+        let mut db = RootDatabase::default();
+        set_with_path(&mut db, 0, "res://scene.tscn", "class_name SceneRoot\n");
+        set_with_path(
+            &mut db,
+            1,
+            "res://main.gd",
+            "func f():\n\tvar s := preload(\"res://scene.tscn\")\n",
+        );
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("f unit");
+        assert!(
+            !matches!(unit.result.bindings[0].ty, Ty::ScriptRef(_)),
+            "a non-.gd preload must stay the seam, got {:?}",
+            unit.result.bindings[0].ty
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
     fn load_literal_stays_opaque_not_aliased_to_preload() {
         let mut db = RootDatabase::default();
         set_with_path(

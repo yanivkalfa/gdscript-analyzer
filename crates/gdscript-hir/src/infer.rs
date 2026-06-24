@@ -48,6 +48,8 @@ pub enum BindingKind {
     Param,
     /// A `for` loop variable.
     ForVar,
+    /// A `var x` capture in a `match` pattern (typed `Variant`; arm-scoped).
+    MatchBind,
 }
 
 /// A typed local binding — the unit hover + inlay hints read for `var`/param/`for` names.
@@ -453,7 +455,18 @@ impl Cx<'_> {
                 for arm in arms {
                     self.in_branch(|cx| {
                         for b in &arm.binds {
-                            cx.locals.insert(b.clone(), Ty::Variant);
+                            // Record the capture as a binding so navigation (find-refs / rename)
+                            // sees it as a local that shadows a same-named member; the type is the
+                            // Phase-2 `Variant`.
+                            cx.bindings.push(Binding {
+                                name_range: b.range,
+                                ty: Ty::Variant,
+                                init: None,
+                                annotated: false,
+                                inferred_colon_eq: false,
+                                kind: BindingKind::MatchBind,
+                            });
+                            cx.locals.insert(b.name.clone(), Ty::Variant);
                         }
                         if let Some(g) = arm.guard {
                             cx.infer_expr(g, &Expectation::None);

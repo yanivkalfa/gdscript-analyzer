@@ -372,11 +372,26 @@ fn decl_name(name: Option<ast::Name>) -> Option<SmolStr> {
 
 /// The focus range: the name token's range, or the whole declaration's range as a fallback
 /// (anonymous enums, recovered declarations).
+///
+/// The lossless tree flushes the inter-token whitespace *before* the identifier into the `Name`
+/// node (the `Name` marker opens before the `Ident`'s advance), so `Name`'s own range carries a
+/// leading-space. Trim it to the bare identifier — navigation uses this as a symbol's focus range
+/// and to tag its own declaration in find-references, both of which must be the exact identifier.
 fn name_range(name: Option<ast::Name>, decl: &GdNode) -> TextRange {
     name.map_or_else(
         || cst::text_range_of(decl),
-        |n| cst::text_range_of(n.syntax()),
+        |n| trimmed_name_range(n.syntax()),
     )
+}
+
+/// `Name`'s range with the leading whitespace trivia stripped (see [`name_range`]). A `Name` is
+/// `[leading-trivia][Ident]` — no trailing trivia — so trimming the front yields the identifier.
+fn trimmed_name_range(name_node: &GdNode) -> TextRange {
+    let r = cst::text_range_of(name_node);
+    let text = name_node.text().to_string();
+    let lead = u32::try_from(text.len() - text.trim_start().len()).unwrap_or(0);
+    let len = u32::try_from(text.trim().len()).unwrap_or(0);
+    TextRange::new(r.start + lead, r.start + lead + len)
 }
 
 #[cfg(test)]
