@@ -38,9 +38,9 @@ impl AstPtr {
     /// pointer against edited text).
     #[must_use]
     pub fn to_node(self, root: &GdNode) -> Option<GdNode> {
-        ast::descendants(root).into_iter().find(|n| {
-            n.kind() == self.kind && text_range_of(n) == self.range
-        })
+        ast::descendants(root)
+            .into_iter()
+            .find(|n| n.kind() == self.kind && text_range_of(n) == self.range)
     }
 }
 
@@ -99,7 +99,8 @@ pub fn is_expr_kind(kind: SyntaxKind) -> bool {
 
 /// The first direct child node satisfying `pred`.
 pub fn first_child(node: &GdNode, pred: impl Fn(SyntaxKind) -> bool) -> Option<GdNode> {
-    node.children().find_map(|c| pred(c.kind()).then(|| c.clone()))
+    node.children()
+        .find_map(|c| pred(c.kind()).then(|| c.clone()))
 }
 
 /// The first direct child node that is an expression.
@@ -111,13 +112,19 @@ pub fn first_child_expr(node: &GdNode) -> Option<GdNode> {
 /// All direct child nodes that are expressions, in source order.
 #[must_use]
 pub fn child_exprs(node: &GdNode) -> Vec<GdNode> {
-    node.children().filter(|c| is_expr_kind(c.kind())).cloned().collect()
+    node.children()
+        .filter(|c| is_expr_kind(c.kind()))
+        .cloned()
+        .collect()
 }
 
 /// All direct child nodes of the given `kind`, in source order.
 #[must_use]
 pub fn children_of(node: &GdNode, kind: SyntaxKind) -> Vec<GdNode> {
-    node.children().filter(|c| c.kind() == kind).cloned().collect()
+    node.children()
+        .filter(|c| c.kind() == kind)
+        .cloned()
+        .collect()
 }
 
 /// The first meaningful (non-trivia, non-layout) token of `node`.

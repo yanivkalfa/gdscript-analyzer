@@ -289,7 +289,11 @@ fn lower_enum(d: &ast::EnumDecl) -> EnumItem {
     let node = d.syntax();
     EnumItem {
         name: decl_name(d.name()),
-        variants: d.variants().filter_map(|v| v.text()).map(SmolStr::new).collect(),
+        variants: d
+            .variants()
+            .filter_map(|v| v.text())
+            .map(SmolStr::new)
+            .collect(),
         range: cst::text_range_of(node),
         name_range: name_range(d.name(), node),
     }
@@ -344,7 +348,9 @@ fn find_extends(container: &GdNode) -> Option<ExtendsRef> {
 fn parse_extends_tokens(node: &GdNode) -> Option<ExtendsRef> {
     // A string literal path: `extends "res://x.gd"`.
     if let Some(s) = cst::child_token_text(node, SyntaxKind::String) {
-        return Some(ExtendsRef::ScriptPath(SmolStr::new(s.trim_matches(['"', '\'']))));
+        return Some(ExtendsRef::ScriptPath(SmolStr::new(
+            s.trim_matches(['"', '\'']),
+        )));
     }
     // Otherwise one or more dotted identifiers: `extends Node` / `extends A.B`.
     let idents: Vec<String> = node
@@ -367,7 +373,10 @@ fn decl_name(name: Option<ast::Name>) -> Option<SmolStr> {
 /// The focus range: the name token's range, or the whole declaration's range as a fallback
 /// (anonymous enums, recovered declarations).
 fn name_range(name: Option<ast::Name>, decl: &GdNode) -> TextRange {
-    name.map_or_else(|| cst::text_range_of(decl), |n| cst::text_range_of(n.syntax()))
+    name.map_or_else(
+        || cst::text_range_of(decl),
+        |n| cst::text_range_of(n.syntax()),
+    )
 }
 
 #[cfg(test)]

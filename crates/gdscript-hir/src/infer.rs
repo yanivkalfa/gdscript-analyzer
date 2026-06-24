@@ -15,9 +15,11 @@ use gdscript_syntax::GdNode;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
+use std::sync::Arc;
+
 use crate::body::{self, BinOp, Body, Expr, ExprId, Literal, ParamBinding, Stmt, UnOp};
 use crate::cst::{self, AstPtr};
-use crate::item_tree::Member;
+use crate::item_tree::{ItemTree, Member, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
 use crate::ty::{self, Assign, EnumRef, Ty};
 
@@ -36,11 +38,42 @@ pub const UNSAFE_PROPERTY_ACCESS: &str = "UNSAFE_PROPERTY_ACCESS";
 /// A method missing on a statically-known base.
 pub const UNSAFE_METHOD_ACCESS: &str = "UNSAFE_METHOD_ACCESS";
 
+/// What kind of binding a [`Binding`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    /// A local `var` / `const`.
+    Var,
+    /// A function / lambda parameter.
+    Param,
+    /// A `for` loop variable.
+    ForVar,
+}
+
+/// A typed local binding — the unit hover + inlay hints read for `var`/param/`for` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    /// The name token's range.
+    pub name_range: TextRange,
+    /// The binding's resolved type. For an untyped `var x = e` this is the gradual `Variant`;
+    /// the precise initializer type (for an "add type annotation" action) is [`Binding::init`].
+    pub ty: Ty,
+    /// The initializer expression, when the binding has one (a `var`/`const` with `= e`).
+    pub init: Option<ExprId>,
+    /// Whether the source carried an explicit `: T` annotation.
+    pub annotated: bool,
+    /// Whether the source used `:=` (inferred-but-hard).
+    pub inferred_colon_eq: bool,
+    /// What kind of binding this is.
+    pub kind: BindingKind,
+}
+
 /// The result of inferring one body.
 #[derive(Debug, Clone, Default)]
 pub struct InferenceResult {
     /// Every expression's inferred type (feeds hover + inlay).
     pub expr_ty: FxHashMap<ExprId, Ty>,
+    /// The local bindings introduced by the body (params, `var`/`const`, `for` vars).
+    pub bindings: Vec<Binding>,
     /// The §5 type diagnostics raised.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -50,6 +83,14 @@ impl InferenceResult {
     #[must_use]
     pub fn type_of(&self, id: ExprId) -> Option<&Ty> {
         self.expr_ty.get(&id)
+    }
+
+    /// The binding whose name token contains `offset`, if any.
+    #[must_use]
+    pub fn binding_at(&self, offset: u32) -> Option<&Binding> {
+        self.bindings
+            .iter()
+            .find(|b| b.name_range.start <= offset && offset < b.name_range.end)
     }
 }
 
@@ -73,6 +114,7 @@ pub fn infer(
         self_ty,
         return_ty,
         expr_ty: FxHashMap::default(),
+        bindings: Vec::new(),
         diagnostics: Vec::new(),
         locals: FxHashMap::default(),
         narrowing: FxHashMap::default(),
@@ -81,6 +123,14 @@ pub fn infer(
     let params = body.params.clone();
     for p in &params {
         let ty = cx.param_ty(p);
+        cx.bindings.push(Binding {
+            name_range: p.name_range,
+            ty: ty.clone(),
+            init: None,
+            annotated: p.type_ref.is_some(),
+            inferred_colon_eq: false,
+            kind: BindingKind::Param,
+        });
         cx.locals.insert(p.name.clone(), ty);
     }
     if let Some(tail) = body.tail {
@@ -90,6 +140,7 @@ pub fn infer(
     cx.infer_block(&block);
     InferenceResult {
         expr_ty: cx.expr_ty,
+        bindings: cx.bindings,
         diagnostics: cx.diagnostics,
     }
 }
@@ -97,7 +148,12 @@ pub fn infer(
 /// Convenience: recover a function node from its [`AstPtr`], lower its body, resolve its
 /// declared return type, and infer it.
 #[must_use]
-pub fn infer_func(api: &EngineApi, root: &GdNode, class: &ClassScope, ptr: AstPtr) -> InferenceResult {
+pub fn infer_func(
+    api: &EngineApi,
+    root: &GdNode,
+    class: &ClassScope,
+    ptr: AstPtr,
+) -> InferenceResult {
     let Some(node) = ptr.to_node(root) else {
         return InferenceResult::default();
     };
@@ -107,6 +163,101 @@ pub fn infer_func(api: &EngineApi, root: &GdNode, class: &ClassScope, ptr: AstPt
     let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
         .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
     infer(api, root, class, &body, return_ty)
+}
+
+/// One inferred unit of a file: a function body or a class field's initializer, with its
+/// lowered [`Body`] and [`InferenceResult`] (kept so position-based features — hover, inlay,
+/// member completion — can map a cursor back through the source map).
+#[derive(Debug, Clone)]
+pub struct Unit {
+    /// The source range this unit covers (the function decl or the field decl).
+    pub range: TextRange,
+    /// The lowered body.
+    pub body: Body,
+    /// The inference result.
+    pub result: InferenceResult,
+}
+
+/// The full single-file inference: the item tree, every inferred unit, and the merged §5
+/// diagnostics. The whole-file entry point the IDE layer consumes.
+#[derive(Debug, Clone)]
+pub struct FileInference {
+    /// The lowered item tree.
+    pub tree: Arc<ItemTree>,
+    /// The inferred function/field units.
+    pub units: Vec<Unit>,
+    /// All type diagnostics, merged across units.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl FileInference {
+    /// The innermost unit whose range contains `offset`.
+    #[must_use]
+    pub fn unit_at(&self, offset: u32) -> Option<&Unit> {
+        self.units
+            .iter()
+            .filter(|u| u.range.start <= offset && offset < u.range.end)
+            .min_by_key(|u| u.range.end - u.range.start)
+    }
+}
+
+/// Infer an entire file: lower its item tree, then infer every function body and every
+/// class-field initializer against a shared [`ClassScope`]. The single entry point for the
+/// IDE features (Playbook §6 — a pure `(api, parsed file) -> result` function).
+#[must_use]
+pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
+    let tree = item_tree(root);
+    let mut units = Vec::new();
+    let mut diagnostics = Vec::new();
+    {
+        let class = ClassScope::new(api, &tree);
+        for m in &tree.members {
+            let unit = match m {
+                Member::Func(f) => f.ptr.to_node(root).map(|node| {
+                    let body = body::body_of_func(&node);
+                    let return_ty =
+                        cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
+                            .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
+                    let result = infer(api, root, &class, &body, return_ty);
+                    Unit {
+                        range: f.range,
+                        body,
+                        result,
+                    }
+                }),
+                Member::Var(v) if v.has_init => unit_from_decl(api, root, &class, v.ptr, v.range),
+                Member::Const(c) => unit_from_decl(api, root, &class, c.ptr, c.range),
+                _ => None,
+            };
+            if let Some(u) = unit {
+                diagnostics.extend(u.result.diagnostics.iter().cloned());
+                units.push(u);
+            }
+        }
+    }
+    FileInference {
+        tree,
+        units,
+        diagnostics,
+    }
+}
+
+/// Infer a class field declaration as a single local-var statement (full annotation checks).
+fn unit_from_decl(
+    api: &EngineApi,
+    root: &GdNode,
+    class: &ClassScope,
+    ptr: AstPtr,
+    range: TextRange,
+) -> Option<Unit> {
+    let node = ptr.to_node(root)?;
+    let body = body::body_of_decl_stmt(&node);
+    let result = infer(api, root, class, &body, Ty::Variant);
+    Some(Unit {
+        range,
+        body,
+        result,
+    })
 }
 
 /// What type is expected of an expression (bidirectional checking).
@@ -125,6 +276,7 @@ struct Cx<'a> {
     self_ty: Ty,
     return_ty: Ty,
     expr_ty: FxHashMap<ExprId, Ty>,
+    bindings: Vec<Binding>,
     diagnostics: Vec<Diagnostic>,
     /// Function-scoped local bindings (GDScript locals are function-, not block-, scoped).
     locals: FxHashMap<SmolStr, Ty>,
@@ -136,7 +288,9 @@ impl Cx<'_> {
     // ---- small type constructors ----
 
     fn builtin(&self, name: &str) -> Ty {
-        self.api.builtin_by_name(name).map_or(Ty::Variant, Ty::Builtin)
+        self.api
+            .builtin_by_name(name)
+            .map_or(Ty::Variant, Ty::Builtin)
     }
     fn int_ty(&self) -> Ty {
         self.builtin("int")
@@ -182,8 +336,7 @@ impl Cx<'_> {
                 range,
                 Severity::Warning,
                 NARROWING_CONVERSION,
-                "Narrowing conversion (float is converted to int and loses precision)."
-                    .to_owned(),
+                "Narrowing conversion (float is converted to int and loses precision).".to_owned(),
             ),
             Assign::No => {
                 let to_label = to.label(self.api).unwrap_or_else(|| "?".to_owned());
@@ -260,6 +413,14 @@ impl Cx<'_> {
                     || self.loop_var_ty(&iter_ty),
                     |ptr| self.resolve_ptr_ty(*ptr),
                 );
+                self.bindings.push(Binding {
+                    name_range: f.var_range,
+                    ty: var_ty.clone(),
+                    init: None,
+                    annotated: f.var_type.is_some(),
+                    inferred_colon_eq: false,
+                    kind: BindingKind::ForVar,
+                });
                 self.locals.insert(f.var.clone(), var_ty);
                 self.in_branch(|cx| cx.infer_block(&f.body));
             }
@@ -289,7 +450,9 @@ impl Cx<'_> {
     fn infer_local_var(&mut self, v: &body::LocalVar) {
         let annotated = v.type_ref.map(|p| self.resolve_ptr_ty(p));
         let init_ty = v.init.map(|e| {
-            let expected = annotated.as_ref().map_or(Expectation::None, |t| Expectation::Has(t.clone()));
+            let expected = annotated
+                .as_ref()
+                .map_or(Expectation::None, |t| Expectation::Has(t.clone()));
             self.infer_expr(e, &expected)
         });
         let range = v.init.map_or(v.name_range, |e| self.range_of(e));
@@ -327,6 +490,14 @@ impl Cx<'_> {
             }
             (None, None) => Ty::Variant,
         };
+        self.bindings.push(Binding {
+            name_range: v.name_range,
+            ty: binding_ty.clone(),
+            init: v.init,
+            annotated: v.type_ref.is_some(),
+            inferred_colon_eq: v.is_inferred,
+            kind: BindingKind::Var,
+        });
         self.narrowing.remove(v.name.as_str());
         self.locals.insert(v.name.clone(), binding_ty);
     }
@@ -374,7 +545,11 @@ impl Cx<'_> {
                 self.join(&a, &b)
             }
             Expr::Call { callee, args } => self.infer_call(callee, &args),
-            Expr::Field { receiver, name, name_range } => {
+            Expr::Field {
+                receiver,
+                name,
+                name_range,
+            } => {
                 self.infer_field(receiver, &name, name_range, /*as_method=*/ false)
             }
             Expr::Index { base, index } => {
@@ -445,7 +620,9 @@ impl Cx<'_> {
     }
 
     fn node_ty(&self) -> Ty {
-        self.api.class_by_name("Node").map_or(Ty::Unknown, Ty::Object)
+        self.api
+            .class_by_name("Node")
+            .map_or(Ty::Unknown, Ty::Object)
     }
 
     fn infer_bin(&mut self, id: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Ty {
@@ -483,7 +660,11 @@ impl Cx<'_> {
         }
         // Assignment narrowing: bound the narrowed type by the declared slot.
         if let Some(key) = self.narrow_key(lhs) {
-            let narrowed = if slot.is_uninformative() { value.clone() } else { slot.clone() };
+            let narrowed = if slot.is_uninformative() {
+                value.clone()
+            } else {
+                slot.clone()
+            };
             self.narrowing.insert(key, narrowed);
         }
         slot
@@ -523,7 +704,11 @@ impl Cx<'_> {
             self.infer_expr(a, &Expectation::None);
         }
         match self.body.expr(callee).clone() {
-            Expr::Field { receiver, name, name_range } => {
+            Expr::Field {
+                receiver,
+                name,
+                name_range,
+            } => {
                 self.infer_field(receiver, &name, name_range, /*as_method=*/ true)
             }
             Expr::Name(name) => {
@@ -571,14 +756,18 @@ impl Cx<'_> {
     /// Member access `receiver.name`. When `as_method`, resolve a method (and use its return
     /// type); otherwise resolve a property/const/etc. Raises `UNSAFE_*` only on a statically
     /// **known** receiver.
-    fn infer_field(&mut self, receiver: ExprId, name: &str, name_range: TextRange, as_method: bool) -> Ty {
+    fn infer_field(
+        &mut self,
+        receiver: ExprId,
+        name: &str,
+        name_range: TextRange,
+        as_method: bool,
+    ) -> Ty {
         let is_self = matches!(self.body.expr(receiver), Expr::SelfExpr);
         let recv_ty = self.infer_expr(receiver, &Expectation::None);
 
         // `self.member` consults this file's own members first (Playbook §3.2).
-        if is_self
-            && let Some(item) = self.class.lookup(name)
-        {
+        if is_self && let Some(item) = self.class.lookup(name) {
             return self.own_member_ty(item, as_method);
         }
 
@@ -634,7 +823,12 @@ impl Cx<'_> {
             }
             MemberRef::Property(p) => p.enum_of.as_ref().map_or_else(
                 || ty::resolve_tyref(self.api, &p.ty),
-                |q| Ty::Enum(EnumRef { qualified: SmolStr::new(q), bitfield: false }),
+                |q| {
+                    Ty::Enum(EnumRef {
+                        qualified: SmolStr::new(q),
+                        bitfield: false,
+                    })
+                },
             ),
             MemberRef::Const(c) => ty::resolve_tyref(self.api, &c.ty),
             MemberRef::Signal(_) => Ty::Signal(None),
@@ -642,7 +836,13 @@ impl Cx<'_> {
         }
     }
 
-    fn builtin_member_ty(&mut self, recv: &Ty, name: &str, range: TextRange, as_method: bool) -> Ty {
+    fn builtin_member_ty(
+        &mut self,
+        recv: &Ty,
+        name: &str,
+        range: TextRange,
+        as_method: bool,
+    ) -> Ty {
         let Some(bid) = self.builtin_id_of(recv) else {
             return Ty::Variant;
         };
@@ -780,7 +980,11 @@ impl Cx<'_> {
 
     /// Apply the narrowing implied by an `if`/`elif` condition to the current (cloned) branch.
     fn apply_narrowing(&mut self, cond: ExprId) {
-        if let Expr::Is { operand, ty, negated } = self.body.expr(cond).clone()
+        if let Expr::Is {
+            operand,
+            ty,
+            negated,
+        } = self.body.expr(cond).clone()
             && !negated
             && let Some(key) = self.narrow_key(operand)
             && let Some(ptr) = ty
@@ -853,7 +1057,9 @@ fn global_ty(g: &GlobalDef) -> Ty {
 }
 
 fn inference_on_variant_msg(kind: &str) -> String {
-    format!("The {kind} type is being inferred from a Variant value, so it will be typed as Variant.")
+    format!(
+        "The {kind} type is being inferred from a Variant value, so it will be typed as Variant."
+    )
 }
 
 /// The `extension_api.json` operator spelling for a binary operator.
@@ -903,7 +1109,11 @@ mod tests {
     }
 
     fn codes(h: &Harness) -> Vec<&str> {
-        h.result.diagnostics.iter().map(|d| d.code.as_str()).collect()
+        h.result
+            .diagnostics
+            .iter()
+            .map(|d| d.code.as_str())
+            .collect()
     }
 
     #[test]
@@ -933,15 +1143,25 @@ mod tests {
     #[test]
     fn int_to_float_is_silent() {
         let h = infer_first_func("func f():\n\tvar x: float = 3\n");
-        assert!(h.result.diagnostics.is_empty(), "{:?}", h.result.diagnostics);
+        assert!(
+            h.result.diagnostics.is_empty(),
+            "{:?}",
+            h.result.diagnostics
+        );
     }
 
     #[test]
     fn member_access_resolves_engine_property() {
         // In a Node script, bare `get_node(...)` resolves via the inherited base to Object(Node);
         // `get_parent()` is a real Node method → no UNSAFE.
-        let h = infer_first_func("extends Node\nfunc f():\n\tvar n := get_node(\"x\")\n\tn.get_parent()\n");
-        assert!(codes(&h).iter().all(|c| !c.starts_with("UNSAFE")), "{:?}", h.result.diagnostics);
+        let h = infer_first_func(
+            "extends Node\nfunc f():\n\tvar n := get_node(\"x\")\n\tn.get_parent()\n",
+        );
+        assert!(
+            codes(&h).iter().all(|c| !c.starts_with("UNSAFE")),
+            "{:?}",
+            h.result.diagnostics
+        );
     }
 
     #[test]
@@ -949,7 +1169,11 @@ mod tests {
         let h = infer_first_func(
             "extends Node\nfunc f():\n\tvar n := get_node(\"x\")\n\tn.totally_bogus_method()\n",
         );
-        assert!(codes(&h).contains(&UNSAFE_METHOD_ACCESS), "{:?}", h.result.diagnostics);
+        assert!(
+            codes(&h).contains(&UNSAFE_METHOD_ACCESS),
+            "{:?}",
+            h.result.diagnostics
+        );
     }
 
     #[test]
@@ -957,7 +1181,11 @@ mod tests {
         // Without narrowing, `x.free()` on an untyped param would be unchecked anyway; with
         // `is Node` it is checked against Node and `free` IS a Node method → no UNSAFE.
         let h = infer_first_func("func f(x):\n\tif x is Node:\n\t\tx.queue_free()\n");
-        assert!(codes(&h).iter().all(|c| !c.starts_with("UNSAFE")), "{:?}", h.result.diagnostics);
+        assert!(
+            codes(&h).iter().all(|c| !c.starts_with("UNSAFE")),
+            "{:?}",
+            h.result.diagnostics
+        );
     }
 
     #[test]
@@ -971,7 +1199,11 @@ mod tests {
     fn variant_receiver_never_unsafe() {
         // Untyped param → Variant receiver → unchecked, no diagnostic.
         let h = infer_first_func("func f(x):\n\tx.anything_at_all()\n");
-        assert!(h.result.diagnostics.is_empty(), "{:?}", h.result.diagnostics);
+        assert!(
+            h.result.diagnostics.is_empty(),
+            "{:?}",
+            h.result.diagnostics
+        );
     }
 
     #[test]
@@ -985,7 +1217,11 @@ mod tests {
     fn unknown_seam_never_warns() {
         // `preload(...)` is Unknown; `:=` from it does NOT warn, and member access is unchecked.
         let h = infer_first_func("func f():\n\tvar s := preload(\"res://x.gd\")\n\ts.whatever()\n");
-        assert!(h.result.diagnostics.is_empty(), "{:?}", h.result.diagnostics);
+        assert!(
+            h.result.diagnostics.is_empty(),
+            "{:?}",
+            h.result.diagnostics
+        );
     }
 
     #[test]

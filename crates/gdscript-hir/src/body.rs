@@ -137,7 +137,10 @@ impl BinOp {
     /// Whether this is an arithmetic operator (`+ - * / % **`).
     #[must_use]
     pub fn is_arithmetic(self) -> bool {
-        matches!(self, Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod | Self::Pow)
+        matches!(
+            self,
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod | Self::Pow
+        )
     }
 
     /// Whether this is a comparison / logical operator (result is `bool`).
@@ -413,6 +416,16 @@ impl BodySourceMap {
             .min_by_key(|(_, r)| r.end - r.start)
             .map(|(i, _)| ExprId(u32::try_from(i).unwrap_or(u32::MAX)))
     }
+
+    /// The expression whose range exactly equals `range` (for mapping a CST node back to its
+    /// `ExprId` — e.g. a member-completion receiver).
+    #[must_use]
+    pub fn expr_for_range(&self, range: TextRange) -> Option<ExprId> {
+        self.expr_ranges
+            .iter()
+            .position(|r| *r == range)
+            .map(|i| ExprId(u32::try_from(i).unwrap_or(u32::MAX)))
+    }
 }
 
 /// A lowered function body, or a single class-level initializer expression.
@@ -470,6 +483,16 @@ pub fn body_of_expr(expr: &GdNode) -> Body {
     let mut low = Lowerer::default();
     let tail = low.lower_expr(expr);
     low.finish(Vec::new(), Vec::new(), Some(tail))
+}
+
+/// Lower a class-level `VarDecl`/`ConstDecl` node into a [`Body`] holding one local-var
+/// statement — so [`crate::infer`] runs the full annotation/inference checks (and records the
+/// member's binding type) on a class field the same way it does for a local.
+#[must_use]
+pub fn body_of_decl_stmt(decl: &GdNode) -> Body {
+    let mut low = Lowerer::default();
+    let block = low.lower_stmt(decl).into_iter().collect();
+    low.finish(Vec::new(), block, None)
 }
 
 /// Recover the function node for `ptr` from `root` and lower its body.
@@ -657,7 +680,10 @@ impl Lowerer {
     }
 
     fn lower_exprs(&mut self, node: &GdNode) -> Vec<ExprId> {
-        cst::child_exprs(node).iter().map(|c| self.lower_expr(c)).collect()
+        cst::child_exprs(node)
+            .iter()
+            .map(|c| self.lower_expr(c))
+            .collect()
     }
 
     fn lower_params(&mut self, param_list: &GdNode) -> Vec<ParamBinding> {
@@ -677,7 +703,10 @@ impl Lowerer {
     }
 
     fn lower_block(&mut self, block: &GdNode) -> Block {
-        block.children().filter_map(|c| self.lower_stmt(c)).collect()
+        block
+            .children()
+            .filter_map(|c| self.lower_stmt(c))
+            .collect()
     }
 
     fn lower_stmt(&mut self, node: &GdNode) -> Option<StmtId> {
@@ -905,7 +934,10 @@ mod tests {
         // `a + b` — offset on `b` should resolve to the Name(b) expr, not the whole BinExpr.
         let body = func_body("func f(a, b):\n\treturn a + b\n");
         let b_offset = u32::try_from("func f(a, b):\n\treturn a + ".len()).unwrap();
-        let id = body.source_map.expr_at_offset(b_offset).expect("an expr at b");
+        let id = body
+            .source_map
+            .expr_at_offset(b_offset)
+            .expect("an expr at b");
         assert!(matches!(body.expr(id), Expr::Name(n) if n == "b"));
     }
 

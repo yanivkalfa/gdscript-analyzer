@@ -162,9 +162,10 @@ pub fn resolve_base(api: &EngineApi, tree: &ItemTree) -> Ty {
         None => api
             .class_by_name("RefCounted")
             .map_or(Ty::Unknown, Ty::Object),
-        Some(ExtendsRef::Name(n)) => api
-            .class_by_name(n)
-            .map_or_else(|| resolve_external(&ExternalRef::ClassName(n.clone())), Ty::Object),
+        Some(ExtendsRef::Name(n)) => api.class_by_name(n).map_or_else(
+            || resolve_external(&ExternalRef::ClassName(n.clone())),
+            Ty::Object,
+        ),
         Some(ExtendsRef::Path(p) | ExtendsRef::ScriptPath(p)) => {
             resolve_external(&ExternalRef::ExtendsPath(p.clone()))
         }
@@ -206,7 +207,9 @@ impl<'a> ClassScope<'a> {
                 }
                 _ => {
                     if let Some(name) = m.name() {
-                        members.entry(SmolStr::new(name)).or_insert(ClassItem::Member(i));
+                        members
+                            .entry(SmolStr::new(name))
+                            .or_insert(ClassItem::Member(i));
                     }
                 }
             }
@@ -329,7 +332,10 @@ mod tests {
     #[test]
     fn typed_container_annotations() {
         let int = Ty::Builtin(api().builtin_by_name("int").unwrap());
-        assert_eq!(ty_of_annotation("var a: Array[int]\n"), Ty::Array(Box::new(int.clone())));
+        assert_eq!(
+            ty_of_annotation("var a: Array[int]\n"),
+            Ty::Array(Box::new(int.clone()))
+        );
         assert_eq!(ty_of_annotation("var a: Array\n"), Ty::array_of_variant());
         assert_eq!(
             ty_of_annotation("var d: Dictionary[String, int]\n"),
@@ -372,8 +378,10 @@ mod tests {
     #[test]
     fn class_scope_members_and_anon_enum() {
         let tree = item_tree(
-            &parse("var hp := 10\nfunc attack():\n\tpass\nenum { FIRE, ICE }\nenum Named { A, B }\n")
-                .syntax_node(),
+            &parse(
+                "var hp := 10\nfunc attack():\n\tpass\nenum { FIRE, ICE }\nenum Named { A, B }\n",
+            )
+            .syntax_node(),
         );
         let scope = ClassScope::new(api(), &tree);
         assert!(matches!(scope.lookup("hp"), Some(ClassItem::Member(_))));
@@ -388,7 +396,10 @@ mod tests {
 
     #[test]
     fn globals() {
-        assert!(matches!(resolve_global(api(), "PI"), Some(GlobalDef::Const(_))));
+        assert!(matches!(
+            resolve_global(api(), "PI"),
+            Some(GlobalDef::Const(_))
+        ));
         assert!(matches!(
             resolve_global(api(), "Input"),
             Some(GlobalDef::Singleton(_))
