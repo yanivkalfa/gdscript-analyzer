@@ -170,10 +170,41 @@ later.
   **456 files, 0 panics**; an end-to-end public-API test proves a real `const M = preload(…); M.new().parse()`
   yields a typed `: int` inlay. The loader supplies paths via `Change::set_file_path` (on add only — a
   keystroke must omit it, since salsa bumps a field's revision on *every* set, even an identical value).
+- **M4 — autoloads + `is`/`as` user narrowing.** `project.godot` is injected as raw text into a new
+  `ProjectConfig` salsa input (MEDIUM, mirrors `SourceRoot`/`res_path`); a line-oriented
+  `project::parse_autoloads` (NOT a full ConfigFile/Variant port) feeds `autoload_registry`
+  (`*`-singletons only — `Name="*res://…"`, `*` stripped per `project_settings.cpp` `begins_with("*")`
+  + `substr(1)`; non-`*` = loaded-but-not-global). `resolve_external(Autoload)` resolves a `.gd`
+  singleton by **path** → its `ScriptRef` (so a `class_name`-less autoload still resolves + members
+  walk); the autoload tier sits after `class_name` in `resolve_name`. `is`/`as` over user types was
+  found to **already work** (the `!is_uninformative` guard never blocked the informative `ScriptRef`)
+  — M4 only added the **widen-only** refinement (`is_subtype` composing the script `extends` chain
+  with engine `is_subclass`): `if d is Base` where `d: Derived` keeps `Derived`. Validated: reference
+  corpus **57 → 57** (additive, 0 autoloads there); a real autoload subproject (godot-demo-projects
+  `2d/physics_tests`, `Log`/`System` singletons) **0 panics**; an end-to-end public-API test resolves
+  `Audio.volume()` (a no-`class_name` `*`-autoload) to a typed `: int` inlay.
 
 ### Deferred / found
 - [x] **`extends "res://path.gd"` + `preload` need a `res://` → `FileId` map — DONE in M3** (above).
       `load(var)`/`load("lit")` stay opaque by design (D5).
+- [ ] **Scene (`.tscn`) autoloads resolve to the seam, not their scene-root type → Phase 4.** A
+      `*`-autoload pointing at a `.tscn` is `Unknown` (member access is unchecked, never a false warn).
+      Typing it as bare `Node` would *false-warn* on the root script's own members (`Music.play()`);
+      the real fix is Phase-4 scene parsing (read the root node's `class_name` script). `.cs` autoloads
+      likewise → seam (out of scope for a GDScript analyzer).
+- [ ] **Non-`*` autoloads are not resolvable by name (nor via `get_node("/root/Name")`).** We seed
+      globals only for `*`-singletons (matches the engine: no `*` ⇒ not a global constant). The
+      `/root/Name` node-path access is Phase-4 scene/node work. No false positives, just imprecision.
+- [ ] **`is`-narrowing is a deliberate divergence from upstream Godot.** Godot's `reduce_type_test` does
+      **no** flow narrowing (CONFIRMED against `gdscript_analyzer.cpp`); our `is`-narrowing is a Pyright-style
+      UX value-add, kept **widen-only** (never narrows to a type Godot's checker would reject). Intentional
+      non-parity.
+- [ ] **`project.godot` parsing is `[autoload]`-only.** `config/features` (the human engine version) is
+      not yet parsed/consumed; API-version selection from it is Phase-5 (`ApiInput`) work.
+- [ ] **No per-`project.godot` corpus mode yet.** M4 was validated on a single autoload subproject
+      (faithful: one `project.godot`, one namespace). A `--multi-project` harness mode (discover every
+      `project.godot`, one host per sub-project) is the exhaustive demo-projects gate — deferred; the
+      merged `--project` mode remains the panic/robustness stress test. (Supersedes the M2 stress-test note.)
 - [ ] **Relative `preload`/`extends` paths (`preload("sibling.gd")`) resolve to the seam.** Godot anchors
       them to the importing script's dir: `resolved = script_path.get_base_dir().path_join(p).simplify_path()`
       (CONFIRMED `reduce_preload` 4664-4667). Absolute `res://`/`user://` are handled; relative needs the
