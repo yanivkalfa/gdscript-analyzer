@@ -68,7 +68,7 @@ pub struct Binding {
 }
 
 /// The result of inferring one body.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InferenceResult {
     /// Every expression's inferred type (feeds hover + inlay).
     pub expr_ty: FxHashMap<ExprId, Ty>,
@@ -168,7 +168,7 @@ pub fn infer_func(
 /// One inferred unit of a file: a function body or a class field's initializer, with its
 /// lowered [`Body`] and [`InferenceResult`] (kept so position-based features — hover, inlay,
 /// member completion — can map a cursor back through the source map).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unit {
     /// The source range this unit covers (the function decl or the field decl).
     pub range: TextRange,
@@ -180,7 +180,7 @@ pub struct Unit {
 
 /// The full single-file inference: the item tree, every inferred unit, and the merged §5
 /// diagnostics. The whole-file entry point the IDE layer consumes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileInference {
     /// The lowered item tree.
     pub tree: Arc<ItemTree>,
