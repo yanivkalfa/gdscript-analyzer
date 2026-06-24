@@ -283,7 +283,7 @@ pub fn signature_help(db: &dyn Db, file: FileText, offset: u32) -> Option<Signat
     let callee = call.children().next()?;
     let fi = queries::analyze_file(db, file);
     let tree = queries::item_tree(db, file);
-    let sig = resolve_signature(api, callee, &fi, &tree)?;
+    let sig = resolve_signature(db, api, callee, &fi, &tree)?;
 
     let open = u32::from(arglist.text_range().start()) + 1; // just past `(`
     let active = count_top_level_commas(text, open, offset);
@@ -296,6 +296,7 @@ pub fn signature_help(db: &dyn Db, file: FileText, offset: u32) -> Option<Signat
 
 /// Build the signature for a call's callee node (`recv.method` or a bare name).
 fn resolve_signature(
+    db: &dyn Db,
     api: &EngineApi,
     callee: &GdNode,
     fi: &FileInference,
@@ -317,7 +318,7 @@ fn resolve_signature(
                 return Some(util_signature(api, &name, u));
             }
             // A bare call is `self.name(...)` — resolve it against the inherited base.
-            if let Ty::Object(base) = gdscript_hir::resolve::resolve_base(api, tree)
+            if let Ty::Object(base) = gdscript_hir::resolve::resolve_base(db, api, tree)
                 && let Some(MemberRef::Method(sig)) = api.lookup_member(base, &name)
             {
                 return Some(method_signature(api, &name, sig));

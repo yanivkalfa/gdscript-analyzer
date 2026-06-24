@@ -33,6 +33,7 @@ pub fn item_tree(db: &dyn Db, file: FileText) -> Arc<ItemTree> {
 pub fn analyze_file(db: &dyn Db, file: FileText) -> Arc<FileInference> {
     match db.engine() {
         Some(api) => Arc::new(crate::infer::analyze_file(
+            db,
             api,
             &parse(db, file).syntax_node(),
         )),

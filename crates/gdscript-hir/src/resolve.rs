@@ -10,6 +10,7 @@
 use cstree::util::NodeOrToken;
 use gdscript_api::gdscript_layer::LayerTy;
 use gdscript_api::{BuiltinId, ClassId, EngineApi};
+use gdscript_db::Db;
 use gdscript_syntax::{GdNode, SyntaxKind};
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
@@ -38,7 +39,7 @@ pub enum ExternalRef {
 /// hover. Funnel every "would need another file" path through here so Phase 3 has exactly one
 /// function to reimplement.
 #[must_use]
-pub fn resolve_external(_r: &ExternalRef) -> Ty {
+pub fn resolve_external(_db: &dyn Db, _r: &ExternalRef) -> Ty {
     Ty::Unknown
 }
 
@@ -49,7 +50,7 @@ pub fn resolve_external(_r: &ExternalRef) -> Ty {
 /// `Dictionary[K, V]`, global enums, and `Class.Enum`; an unknown bare name is treated as a
 /// (cross-file) `class_name` and funneled through the [`resolve_external`] seam.
 #[must_use]
-pub fn resolve_type_ref(api: &EngineApi, node: &GdNode) -> Ty {
+pub fn resolve_type_ref(db: &dyn Db, api: &EngineApi, node: &GdNode) -> Ty {
     // The leading dotted name comes from this node's *direct* `Ident`/`void` tokens; the type
     // arguments (`[...]`) are *direct child* `TypeRef` nodes (the grammar nests them).
     let names: Vec<String> = node
@@ -63,17 +64,17 @@ pub fn resolve_type_ref(api: &EngineApi, node: &GdNode) -> Ty {
         .filter(|c| c.kind() == SyntaxKind::TypeRef)
         .cloned()
         .collect();
-    resolve_named(api, &names, &args)
+    resolve_named(db, api, &names, &args)
 }
 
 /// Resolve a bare type *name* (no type arguments) — for callers that only have a string
 /// (completion detail, inlay display).
 #[must_use]
-pub fn resolve_type_name(api: &EngineApi, name: &str) -> Ty {
-    resolve_named(api, std::slice::from_ref(&name.to_owned()), &[])
+pub fn resolve_type_name(db: &dyn Db, api: &EngineApi, name: &str) -> Ty {
+    resolve_named(db, api, std::slice::from_ref(&name.to_owned()), &[])
 }
 
-fn resolve_named(api: &EngineApi, names: &[String], args: &[GdNode]) -> Ty {
+fn resolve_named(db: &dyn Db, api: &EngineApi, names: &[String], args: &[GdNode]) -> Ty {
     let Some(head) = names.first() else {
         return Ty::Variant;
     };
@@ -84,11 +85,11 @@ fn resolve_named(api: &EngineApi, names: &[String], args: &[GdNode]) -> Ty {
             // Dedicated variants (see `resolve_tyref`) so annotations match lambda/signal values.
             "Callable" => return Ty::Callable,
             "Signal" => return Ty::Signal(None),
-            "Array" => return Ty::Array(Box::new(elem_arg(api, args, 0))),
+            "Array" => return Ty::Array(Box::new(elem_arg(db, api, args, 0))),
             "Dictionary" => {
                 return Ty::Dict(
-                    Box::new(elem_arg(api, args, 0)),
-                    Box::new(elem_arg(api, args, 1)),
+                    Box::new(elem_arg(db, api, args, 0)),
+                    Box::new(elem_arg(db, api, args, 1)),
                 );
             }
             _ => {}
@@ -106,7 +107,7 @@ fn resolve_named(api: &EngineApi, names: &[String], args: &[GdNode]) -> Ty {
             });
         }
         // Unknown bare name → most likely another script's `class_name` → the seam.
-        return resolve_external(&ExternalRef::ClassName(SmolStr::new(head)));
+        return resolve_external(db, &ExternalRef::ClassName(SmolStr::new(head)));
     }
     // Dotted: try `Class.Enum`; anything else (inner class, namespaced) is the seam.
     if names.len() == 2
@@ -118,15 +119,15 @@ fn resolve_named(api: &EngineApi, names: &[String], args: &[GdNode]) -> Ty {
             bitfield: e.is_bitfield,
         });
     }
-    resolve_external(&ExternalRef::ExtendsPath(SmolStr::new(names.join("."))))
+    resolve_external(db, &ExternalRef::ExtendsPath(SmolStr::new(names.join("."))))
 }
 
 /// Resolve the `i`-th type argument as a container element, collapsing a nested typed
 /// container to `Variant` (Phase 2 does not track nested element types — Playbook §2). A
 /// missing argument (bare `Array`/`Dictionary`) is `Variant`.
-fn elem_arg(api: &EngineApi, args: &[GdNode], i: usize) -> Ty {
+fn elem_arg(db: &dyn Db, api: &EngineApi, args: &[GdNode], i: usize) -> Ty {
     match args.get(i) {
-        Some(node) => match resolve_type_ref(api, node) {
+        Some(node) => match resolve_type_ref(db, api, node) {
             Ty::Array(_) | Ty::Dict(..) => Ty::Variant,
             other => other,
         },
@@ -160,17 +161,17 @@ fn builtin(api: &EngineApi, name: &str) -> Ty {
 /// resolves to `Object(id)`; a script-path / dotted / unknown base goes through the seam to
 /// `Unknown`. With no `extends`, a script implicitly extends `RefCounted`.
 #[must_use]
-pub fn resolve_base(api: &EngineApi, tree: &ItemTree) -> Ty {
+pub fn resolve_base(db: &dyn Db, api: &EngineApi, tree: &ItemTree) -> Ty {
     match &tree.extends {
         None => api
             .class_by_name("RefCounted")
             .map_or(Ty::Unknown, Ty::Object),
         Some(ExtendsRef::Name(n)) => api.class_by_name(n).map_or_else(
-            || resolve_external(&ExternalRef::ClassName(n.clone())),
+            || resolve_external(db, &ExternalRef::ClassName(n.clone())),
             Ty::Object,
         ),
         Some(ExtendsRef::Path(p) | ExtendsRef::ScriptPath(p)) => {
-            resolve_external(&ExternalRef::ExtendsPath(p.clone()))
+            resolve_external(db, &ExternalRef::ExtendsPath(p.clone()))
         }
     }
 }
@@ -202,7 +203,7 @@ pub struct ClassScope<'a> {
 impl<'a> ClassScope<'a> {
     /// Build the scope for `tree` against the engine model.
     #[must_use]
-    pub fn new(api: &EngineApi, tree: &'a ItemTree) -> Self {
+    pub fn new(db: &dyn Db, api: &EngineApi, tree: &'a ItemTree) -> Self {
         let mut members = FxHashMap::default();
         for (i, m) in tree.members.iter().enumerate() {
             match m {
@@ -223,7 +224,7 @@ impl<'a> ClassScope<'a> {
         }
         Self {
             tree,
-            base: resolve_base(api, tree),
+            base: resolve_base(db, api, tree),
             member_types: FxHashMap::default(),
             members,
         }
@@ -305,6 +306,10 @@ mod tests {
         gdscript_api::bundled()
     }
 
+    fn db() -> gdscript_db::RootDatabase {
+        gdscript_db::RootDatabase::default()
+    }
+
     /// Resolve the first `TypeRef` node found in `decl` source.
     fn ty_of_annotation(src: &str) -> Ty {
         let parse = parse(src);
@@ -313,13 +318,13 @@ mod tests {
             .into_iter()
             .find(|n| n.kind() == SyntaxKind::TypeRef)
             .expect("a TypeRef node");
-        resolve_type_ref(api(), &type_ref)
+        resolve_type_ref(&db(), api(), &type_ref)
     }
 
     #[test]
     fn seam_is_unknown() {
         assert_eq!(
-            resolve_external(&ExternalRef::ClassName(SmolStr::new("MyClass"))),
+            resolve_external(&db(), &ExternalRef::ClassName(SmolStr::new("MyClass"))),
             Ty::Unknown
         );
     }
@@ -369,18 +374,18 @@ mod tests {
     fn base_resolution() {
         let extends_node = item_tree(&parse("extends Node2D\n").syntax_node());
         assert_eq!(
-            resolve_base(api(), &extends_node),
+            resolve_base(&db(), api(), &extends_node),
             Ty::Object(api().class_by_name("Node2D").unwrap())
         );
         // No extends → implicit RefCounted.
         let no_extends = item_tree(&parse("var x = 1\n").syntax_node());
         assert_eq!(
-            resolve_base(api(), &no_extends),
+            resolve_base(&db(), api(), &no_extends),
             Ty::Object(api().class_by_name("RefCounted").unwrap())
         );
         // Script-path base → seam.
         let script_base = item_tree(&parse("extends \"res://b.gd\"\n").syntax_node());
-        assert_eq!(resolve_base(api(), &script_base), Ty::Unknown);
+        assert_eq!(resolve_base(&db(), api(), &script_base), Ty::Unknown);
     }
 
     #[test]
@@ -391,7 +396,7 @@ mod tests {
             )
             .syntax_node(),
         );
-        let scope = ClassScope::new(api(), &tree);
+        let scope = ClassScope::new(&db(), api(), &tree);
         assert!(matches!(scope.lookup("hp"), Some(ClassItem::Member(_))));
         assert!(matches!(scope.lookup("attack"), Some(ClassItem::Member(_))));
         // Anonymous-enum variants flatten into the class scope as int consts.

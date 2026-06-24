@@ -11,6 +11,7 @@
 
 use gdscript_api::{EngineApi, MemberRef, TyRef};
 use gdscript_base::{Diagnostic, DiagnosticSource, Severity, TextRange};
+use gdscript_db::Db;
 use gdscript_syntax::GdNode;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
@@ -99,6 +100,7 @@ impl InferenceResult {
 /// initializer body).
 #[must_use]
 pub fn infer(
+    db: &dyn Db,
     api: &EngineApi,
     root: &GdNode,
     class: &ClassScope,
@@ -107,6 +109,7 @@ pub fn infer(
 ) -> InferenceResult {
     let self_ty = class.base.clone();
     let mut cx = Cx {
+        db,
         api,
         root,
         body,
@@ -149,6 +152,7 @@ pub fn infer(
 /// declared return type, and infer it.
 #[must_use]
 pub fn infer_func(
+    db: &dyn Db,
     api: &EngineApi,
     root: &GdNode,
     class: &ClassScope,
@@ -161,8 +165,8 @@ pub fn infer_func(
     // The return-type annotation is the FuncDecl's direct `TypeRef` child (params' type refs
     // are nested inside the ParamList, so they are not direct children).
     let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
-        .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
-    infer(api, root, class, &body, return_ty)
+        .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
+    infer(db, api, root, class, &body, return_ty)
 }
 
 /// One inferred unit of a file: a function body or a class field's initializer, with its
@@ -205,7 +209,7 @@ impl FileInference {
 /// class-field initializer against a shared [`ClassScope`]. The single entry point for the
 /// IDE features (Playbook §6 — a pure `(api, parsed file) -> result` function).
 #[must_use]
-pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
+pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode) -> FileInference {
     let tree = item_tree(root);
     let mut units = Vec::new();
     let mut diagnostics = Vec::new();
@@ -214,14 +218,14 @@ pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
     {
-        let class = ClassScope::new(api, &tree);
+        let class = ClassScope::new(db, api, &tree);
         for m in &tree.members {
             let (ptr, range) = match m {
                 Member::Var(v) => (v.ptr, v.range),
                 Member::Const(c) => (c.ptr, c.range),
                 _ => continue,
             };
-            if let Some(unit) = unit_from_decl(api, root, &class, ptr, range) {
+            if let Some(unit) = unit_from_decl(db, api, root, &class, ptr, range) {
                 if let (Some(name), Some(b)) = (m.name(), unit.result.bindings.first()) {
                     member_types.insert(SmolStr::new(name), b.ty.clone());
                 }
@@ -233,7 +237,7 @@ pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
 
     // Pass 2 — functions, against a scope carrying the seeded field types.
     {
-        let mut class = ClassScope::new(api, &tree);
+        let mut class = ClassScope::new(db, api, &tree);
         class.member_types = member_types;
         for m in &tree.members {
             let Member::Func(f) = m else { continue };
@@ -242,8 +246,8 @@ pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
             };
             let body = body::body_of_func(&node);
             let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
-                .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
-            let result = infer(api, root, &class, &body, return_ty);
+                .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
+            let result = infer(db, api, root, &class, &body, return_ty);
             diagnostics.extend(result.diagnostics.iter().cloned());
             units.push(Unit {
                 range: f.range,
@@ -262,6 +266,7 @@ pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
 
 /// Infer a class field declaration as a single local-var statement (full annotation checks).
 fn unit_from_decl(
+    db: &dyn Db,
     api: &EngineApi,
     root: &GdNode,
     class: &ClassScope,
@@ -270,7 +275,7 @@ fn unit_from_decl(
 ) -> Option<Unit> {
     let node = ptr.to_node(root)?;
     let body = body::body_of_decl_stmt(&node);
-    let result = infer(api, root, class, &body, Ty::Variant);
+    let result = infer(db, api, root, class, &body, Ty::Variant);
     Some(Unit {
         range,
         body,
@@ -287,6 +292,7 @@ enum Expectation {
 }
 
 struct Cx<'a> {
+    db: &'a dyn Db,
     api: &'a EngineApi,
     root: &'a GdNode,
     body: &'a Body,
@@ -812,7 +818,9 @@ impl Cx<'_> {
     }
 
     fn func_return_ty(&self, annotation: Option<&str>) -> Ty {
-        annotation.map_or(Ty::Variant, |t| resolve::resolve_type_name(self.api, t))
+        annotation.map_or(Ty::Variant, |t| {
+            resolve::resolve_type_name(self.db, self.api, t)
+        })
     }
 
     /// Member access `receiver.name`. When `as_method`, resolve a method (and use its return
@@ -1112,7 +1120,9 @@ impl Cx<'_> {
             return Ty::Variant;
         };
         cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
-            .map_or(Ty::Variant, |t| resolve::resolve_type_ref(self.api, &t))
+            .map_or(Ty::Variant, |t| {
+                resolve::resolve_type_ref(self.db, self.api, &t)
+            })
     }
 
     // ---- narrowing ----
@@ -1150,8 +1160,9 @@ impl Cx<'_> {
     }
 
     fn resolve_ptr_ty(&self, ptr: AstPtr) -> Ty {
-        ptr.to_node(self.root)
-            .map_or(Ty::Variant, |n| resolve::resolve_type_ref(self.api, &n))
+        ptr.to_node(self.root).map_or(Ty::Variant, |n| {
+            resolve::resolve_type_ref(self.db, self.api, &n)
+        })
     }
 
     // ---- helpers ----
@@ -1245,17 +1256,18 @@ mod tests {
     /// Infer the (first) function in `src` against a fresh class scope.
     fn infer_first_func(src: &str) -> Harness {
         let api = gdscript_api::bundled();
+        let db = gdscript_db::RootDatabase::default();
         let root = parse(src).syntax_node();
         let tree = item_tree(&root);
-        let class = ClassScope::new(api, &tree);
+        let class = ClassScope::new(&db, api, &tree);
         let func = gdscript_syntax::ast::descendants(&root)
             .into_iter()
             .find(|n| n.kind() == SyntaxKind::FuncDecl)
             .expect("a function");
         let body = body::body_of_func(&func);
         let return_ty = cst::first_child(&func, |k| k == SyntaxKind::TypeRef)
-            .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
-        let result = infer(api, &root, &class, &body, return_ty);
+            .map_or(Ty::Variant, |t| resolve::resolve_type_ref(&db, api, &t));
+        let result = infer(&db, api, &root, &class, &body, return_ty);
         Harness { result, body }
     }
 
