@@ -138,3 +138,34 @@ later.
       *(The parser is now also exercised by `cargo run -p gdscript-ide --example corpus --
       <dir>` against real projects — the ReactiveUI-Godot codebase parses **88/89 files
       clean, 0 panics**; the one remaining diagnostic is the BOM item above.)*
+
+---
+
+## Phase 3 — progress & findings
+
+### Done (branch `feat/phase-3`)
+- **M0 — salsa substrate + VFS migration.** salsa 0.27.1 (wasm32-clean, getrandom-free),
+  `FileText`/`SourceRoot` inputs, tracked `parse`/`item_tree`/`analyze_file`, real cancellation,
+  the body-edit firewall CI gate. Byte-identical to Phase 2.
+- **M1 — global `class_name` resolution.** `global_registry` (offset-free `file_class_name`
+  projection → firewalled), `Ty::ScriptRef` activated (member access, is_assignable, hover label).
+  ~85% of real demand. Project-mode corpus 54→57 = 3 *true-positive* `INFERENCE_ON_VARIANT`
+  (cross-file untyped returns) the seam previously hid; 0 false positives.
+- **M2 — base-chain inheritance.** `script_class` records its `extends` base; member lookup walks
+  own → user base (`ScriptRef`) → engine base (API table), depth-bounded. Validated on
+  **godot-demo-projects (456 `.gd`): 0 panics**; cross-file adds only +14 diags over per-file
+  (+1 `TYPE_MISMATCH` = a cross-*project* `class_name` collision artifact of merging ~30 demos,
+  not a real bug).
+
+### Deferred / found
+- [ ] **`extends "res://path.gd"` (and `preload`/`load`) need a `res://` → `FileId` map.**
+      `resolve_external(ExtendsPath)` still returns `Unknown`. Lit up in **M3** alongside the
+      project-discovery work (the loader must supply each file's `res://` path).
+- [ ] **Parser gaps on the broader demo-projects corpus (NEW, Phase-1 follow-up).** Project-mode
+      over godot-demo-projects surfaced **307 `GDSCRIPT_SYNTAX`** errors (cascading
+      "expected a declaration" — a few unhandled syntactic forms, e.g. some lambda/match/typed
+      constructs the ReactiveUI-Godot corpus didn't exercise). 0 panics. Harden the parser +
+      grow the differential oracle against godot-demo-projects before v1.
+- [ ] **`corpus --project` is a robustness stress test, not a single-project run.** Merging many
+      sub-projects into one host shares the `class_name` namespace; cross-project collisions are
+      expected. A faithful per-project validation needs `project.godot`-scoped roots (M4).
