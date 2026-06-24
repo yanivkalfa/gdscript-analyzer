@@ -1382,4 +1382,52 @@ mod tests {
             "ambiguous multi-scene attachment must not warn"
         );
     }
+
+    // ---- M3: instanced sub-scene recursion ------------------------------------------------
+
+    #[test]
+    fn instanced_node_recurses_into_the_subscene_root_script() {
+        // main.tscn: Root(script=main.gd) > Enemy(instance=enemy.tscn). enemy.tscn's root carries
+        // script=enemy.gd (class_name Enemy, `hp() -> int`). `$Enemy.hp()` must recurse into the
+        // sub-scene root, refine to the Enemy script, and resolve the cross-file method → `int`
+        // (proving the instance recursion + script refine; a bare `Node` would have no `hp()`).
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://enemy.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Enemy\" parent=\".\" instance=ExtResource(\"2\")]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar e := $Enemy.hp()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_file_text(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://enemy.gd\" id=\"1\"]\n\
+             [node name=\"Enemy\" type=\"Button\"]\n\
+             script = ExtResource(\"1\")\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://enemy.tscn");
+        db.set_file_text(
+            FileId(3),
+            "class_name Enemy\nextends Button\nfunc hp() -> int:\n\treturn 1\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(3), "res://enemy.gd");
+        db.sync_source_root();
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "int"),
+            "$Enemy.hp() should recurse into the instanced sub-scene root's script Enemy",
+        );
+    }
 }

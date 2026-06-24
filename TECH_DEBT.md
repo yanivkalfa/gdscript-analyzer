@@ -88,10 +88,18 @@ script attaches to exactly one scene — silent on `..`/absolute escapes, misses
 instanced sub-scene, and ambiguous multi-scene attachments (`SceneModel::classify_path_from` returns
 the 3-state `NodePathResolution`; `SceneAttach::ambiguous` guards the multi-scene case).
 
-**M2 deferrals (→ M3 / later):**
-- [ ] **Instanced sub-scene recursion → M3 (hard tail).** A node with `instance=` (no `type=`) stays
-      `Node`; following `instance=ExtResource("sub.tscn")` to the sub-scene root's type (so `$Enemy`
-      → the enemy scene's root class) needs cross-file scene recursion. `instance` is recorded.
+### M3 — instanced sub-scene recursion — **DONE**
+An instanced node (`instance=ExtResource("sub.tscn")`, no own `type=`/script) now types as the
+**instanced sub-scene's ROOT** node, resolved recursively, so the root's own script / `type=` /
+nested instance all flow through (`$Enemy` → `enemy.tscn`'s root class, e.g. `$Enemy.hp()` resolves
+the cross-file method). `infer::instance_root_ty` follows the ext-resource path through
+`res_path_registry` → `scene_model`, depth-bounded (≤16) against an instancing cycle.
+
+**M2/M3 deferrals (→ later):**
+- [ ] **Paths *into* an instance stay `Node`.** `$Enemy` is now typed (the instance root), but
+      `$Enemy/Sprite` (a node *inside* the sub-scene) still degrades to `Node` (`IntoInstance` — no
+      false warn). Resolving across the scene boundary into the sub-scene's own tree is the remaining
+      tail; the node-type case (the headline) is done.
 - [ ] **`self.get_node("…")` (explicit-self / `obj.get_node`) not intercepted** — only bare
       `get_node("…")` (implicit self) and `$`/`%`. Explicit/foreign forms stay a normal call → `Node`.
 - [ ] **`%Unique` completion deferred.** `$`-path completion is done; `%`-name completion is held

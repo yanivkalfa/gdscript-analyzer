@@ -738,7 +738,7 @@ impl Cx<'_> {
             R::Resolved(idx) => ctx
                 .model
                 .node(idx)
-                .and_then(|n| self.scene_node_ty(&ctx.model, n))
+                .and_then(|n| self.scene_node_ty(&ctx.model, n, 0))
                 .unwrap_or(fallback),
             R::Missing if !ctx.ambiguous => {
                 let what = if unique { "unique name" } else { "node path" };
@@ -767,16 +767,41 @@ impl Cx<'_> {
         crate::queries::scene_context(self.db, ft)
     }
 
-    /// The concrete `Ty` of a scene node: an attached script's own class (most specific) wins; else
-    /// the declared `type=` (native class or `class_name`). `None` for an instanced/unknown node
-    /// (the caller degrades to `Node` — sub-scene recursion is the M2+ hard tail).
-    fn scene_node_ty(&self, scene: &SceneModel, node: &SceneNode) -> Option<Ty> {
+    /// The concrete `Ty` of a scene node, by precedence: an attached script's own class (most
+    /// specific) wins; else the declared `type=` (native class or `class_name`); else — an instanced
+    /// node (`instance=`, no own `type=`/script) — the **instanced sub-scene's root** type (M3,
+    /// recursive). `None` for a node we can't sharpen (the caller degrades to `Node`).
+    fn scene_node_ty(&self, scene: &SceneModel, node: &SceneNode, depth: u32) -> Option<Ty> {
         if let Some(script_ty) = self.node_script_ref(scene, node) {
             return Some(script_ty);
         }
-        let decl = node.decl_type.as_ref()?;
-        let ty = resolve::resolve_type_name(self.db, self.api, decl);
-        (!ty.is_uninformative()).then_some(ty)
+        if let Some(decl) = node.decl_type.as_ref() {
+            let ty = resolve::resolve_type_name(self.db, self.api, decl);
+            if !ty.is_uninformative() {
+                return Some(ty);
+            }
+        }
+        self.instance_root_ty(scene, node, depth)
+    }
+
+    /// An instanced node (`instance=ExtResource(id)`) takes the type of the instanced sub-scene's
+    /// ROOT node — resolved recursively, so the root's own script / `type=` / nested instance all
+    /// flow through (so `$Enemy` types as `enemy.tscn`'s root class, not bare `Node`). Depth-bounded
+    /// against an instancing cycle (scene A instances B instances A).
+    fn instance_root_ty(&self, scene: &SceneModel, node: &SceneNode, depth: u32) -> Option<Ty> {
+        if depth >= 16 {
+            return None;
+        }
+        let inst = node.instance.as_ref()?;
+        let path = scene.ext_resources.get(inst)?.path.as_ref()?;
+        let root = self.db.source_root()?;
+        let file = crate::queries::res_path_registry(self.db, root)
+            .get(path.as_str())
+            .copied()?;
+        let ft = self.db.file_text(file)?;
+        let sub = crate::queries::scene_model(self.db, ft);
+        let root_node = sub.node(sub.root?)?;
+        self.scene_node_ty(&sub, root_node, depth + 1)
     }
 
     /// The `ScriptRef` of a node's attached `.gd` script (`script = ExtResource(id)` → its `res://`
