@@ -138,3 +138,194 @@ later.
       *(The parser is now also exercised by `cargo run -p gdscript-ide --example corpus --
       <dir>` against real projects — the ReactiveUI-Godot codebase parses **88/89 files
       clean, 0 panics**; the one remaining diagnostic is the BOM item above.)*
+
+---
+
+## Phase 3 — progress & findings
+
+### Done (branch `feat/phase-3`)
+- **M0 — salsa substrate + VFS migration.** salsa 0.27.1 (wasm32-clean, getrandom-free),
+  `FileText`/`SourceRoot` inputs, tracked `parse`/`item_tree`/`analyze_file`, real cancellation,
+  the body-edit firewall CI gate. Byte-identical to Phase 2.
+- **M1 — global `class_name` resolution.** `global_registry` (offset-free `file_class_name`
+  projection → firewalled), `Ty::ScriptRef` activated (member access, is_assignable, hover label).
+  ~85% of real demand. Project-mode corpus 54→57 = 3 *true-positive* `INFERENCE_ON_VARIANT`
+  (cross-file untyped returns) the seam previously hid; 0 false positives.
+- **M2 — base-chain inheritance.** `script_class` records its `extends` base; member lookup walks
+  own → user base (`ScriptRef`) → engine base (API table), depth-bounded. Validated on
+  **godot-demo-projects (456 `.gd`): 0 panics**; cross-file adds only +14 diags over per-file
+  (+1 `TYPE_MISMATCH` = a cross-*project* `class_name` collision artifact of merging ~30 demos,
+  not a real bug).
+- **M3 — `preload`/`load` const-aliasing + `res://` path map.** `res_path` is a new `MEDIUM`-durability
+  field on the `FileText` salsa input (salsa tracks input fields *individually* — verified against
+  `salsa-0.27.1/src/input.rs` `revisions[field_index]` + its own `expect_reuse_field_x…field_y` test —
+  so it backdates across `text` keystrokes, same firewall as `file_class_name`). `res_path_registry`
+  (path → `FileId`, keyed on `SourceRoot`) mirrors `global_registry`; `preload("res://x.gd")` and
+  `extends "res://x.gd"` resolve through it to the declaring file's `ScriptRef` (reusing `script_member_walk`
+  — no new meta-type variant, since the analyzer already collapses meta-vs-instance like a bare `class_name`).
+  Resolution is by **path**, so a script with *no* `class_name` is still preloadable (`reduce_preload` does
+  the same). `load("…")` was corrected from `Variant` → **`Unknown` (the seam)** so `var r := load(…)` no
+  longer false-warns and is never aliased to `preload` (Godot: `load` is a runtime call returning an opaque
+  `Resource`). Validated: reference corpus **57 → 57** (zero regression, paths layout-verified), 2nd corpus
+  **456 files, 0 panics**; an end-to-end public-API test proves a real `const M = preload(…); M.new().parse()`
+  yields a typed `: int` inlay. The loader supplies paths via `Change::set_file_path` (on add only — a
+  keystroke must omit it, since salsa bumps a field's revision on *every* set, even an identical value).
+- **M4 — autoloads + `is`/`as` user narrowing.** `project.godot` is injected as raw text into a new
+  `ProjectConfig` salsa input (MEDIUM, mirrors `SourceRoot`/`res_path`); a line-oriented
+  `project::parse_autoloads` (NOT a full ConfigFile/Variant port) feeds `autoload_registry`
+  (`*`-singletons only — `Name="*res://…"`, `*` stripped per `project_settings.cpp` `begins_with("*")`
+  + `substr(1)`; non-`*` = loaded-but-not-global). `resolve_external(Autoload)` resolves a `.gd`
+  singleton by **path** → its `ScriptRef` (so a `class_name`-less autoload still resolves + members
+  walk); the autoload tier sits after `class_name` in `resolve_name`. `is`/`as` over user types was
+  found to **already work** (the `!is_uninformative` guard never blocked the informative `ScriptRef`)
+  — M4 only added the **widen-only** refinement (`is_subtype` composing the script `extends` chain
+  with engine `is_subclass`): `if d is Base` where `d: Derived` keeps `Derived`. Validated: reference
+  corpus **57 → 57** (additive, 0 autoloads there); a real autoload subproject (godot-demo-projects
+  `2d/physics_tests`, `Log`/`System` singletons) **0 panics**; an end-to-end public-API test resolves
+  `Audio.volume()` (a no-`class_name` `*`-autoload) to a typed `: int` inlay.
+- **M5 — cross-file navigation (find-refs, rename, workspace symbols, goto-def) — EXITS PHASE 3.**
+  New `gdscript-hir/src/def.rs`: `GodotDef` (stable identity — `class_name` global → decl file;
+  member → owner file + name; local → body + decl range; autoload; engine) + `classify(db, pos)`,
+  the inverse of inference. `gdscript-ide/src/navigation.rs`: the four features with rust-analyzer's
+  **resolve-don't-string-match** discipline (word-boundary pre-filter → re-`classify` each candidate
+  → keep iff it equals the cursor's `GodotDef`). **Rename is correct-or-refuse** (zero false edits):
+  refuses on an autoload (its `project.godot` key isn't rewritten), on a method/var/signal whose name
+  appears as a project string literal (possible `connect`/`Callable`/scene-`[connection]` ref),
+  collisions (`WouldCollide`), invalid identifiers, and engine symbols. A `class_name` rename
+  **proceeds** (research finding: `.tscn`/`project.godot` reference scripts by *path*, the `.godot`
+  cache is *derived*). `SourceChange` became multi-file (`Vec<FileEdit>`); `goto_definition` now
+  returns `Vec<NavTarget>` (was a stub). No persisted reverse-index — on-demand folds over the
+  memoized queries (no new tracked query / invalidation edge). Found + fixed 3 real `classify` bugs
+  (decl/ref range consistency, the leading-whitespace `name_range` quirk, `self.member`). 5 def + 11
+  navigation + 1 e2e tests (incl. the adversarial same-name set). Reference corpus 57 → 57.
+
+### Deferred / found
+- [x] **`extends "res://path.gd"` + `preload` need a `res://` → `FileId` map — DONE in M3** (above).
+      `load(var)`/`load("lit")` stay opaque by design (D5).
+- [ ] **(M5) Scene/config rewriting deferred → rename refuses.** `.tscn`/`.tres` are not ingested
+      (scene crate is a Phase-4 stub) and `project.godot` is read-only to rename. Method/signal/
+      exported-var renames **refuse** on a detected same-named project string literal; autoload-name
+      renames refuse. **Known probabilistic gap:** a scene `[connection method="…"]` we cannot see
+      makes a method rename *appear* safe — we mitigate by refusing on any same-named `.gd` string,
+      but a pure-scene reference is invisible. Scene-aware rename = Phase 4/6.
+- [ ] **(M5) `classify` duplicates `infer.rs`'s name-lookup order.** Two copies of the local → member
+      → inherited → global → autoload → engine precedence (one returns a `Ty`, one a `GodotDef`).
+      Unify behind shared `def.rs` helpers once the Phase-2 byte-identical inference guarantee can be
+      re-validated. A `classify`↔`infer` agreement test on the corpus would guard the duplication.
+- [ ] **(M5) `Member`/`Global` find-refs scope is project-wide-candidates, not a precise referrer
+      graph.** Correct (the re-resolve confirms) but does wasted `classify`s on files that name-but-
+      don't-reference the symbol. A firewall-safe referrer reverse-index (keyed on `item_tree`, not
+      bodies) is a perf follow-up if the large-project benchmark regresses.
+- [ ] **(M5) `ReferenceKind::Write` not derived.** find-refs tags `Declaration` vs `Read` only;
+      assignment-LHS `Write` is a cheap follow-up off the lowered body.
+- [ ] **Scene (`.tscn`) autoloads resolve to the seam, not their scene-root type → Phase 4.** A
+      `*`-autoload pointing at a `.tscn` is `Unknown` (member access is unchecked, never a false warn).
+      Typing it as bare `Node` would *false-warn* on the root script's own members (`Music.play()`);
+      the real fix is Phase-4 scene parsing (read the root node's `class_name` script). `.cs` autoloads
+      likewise → seam (out of scope for a GDScript analyzer).
+- [ ] **Non-`*` autoloads are not resolvable by name (nor via `get_node("/root/Name")`).** We seed
+      globals only for `*`-singletons (matches the engine: no `*` ⇒ not a global constant). The
+      `/root/Name` node-path access is Phase-4 scene/node work. No false positives, just imprecision.
+- [ ] **`is`-narrowing is a deliberate divergence from upstream Godot.** Godot's `reduce_type_test` does
+      **no** flow narrowing (CONFIRMED against `gdscript_analyzer.cpp`); our `is`-narrowing is a Pyright-style
+      UX value-add, kept **widen-only** (never narrows to a type Godot's checker would reject). Intentional
+      non-parity.
+- [ ] **`project.godot` parsing is `[autoload]`-only.** `config/features` (the human engine version) is
+      not yet parsed/consumed; API-version selection from it is Phase-5 (`ApiInput`) work.
+- [ ] **No per-`project.godot` corpus mode yet.** M4 was validated on a single autoload subproject
+      (faithful: one `project.godot`, one namespace). A `--multi-project` harness mode (discover every
+      `project.godot`, one host per sub-project) is the exhaustive demo-projects gate — deferred; the
+      merged `--project` mode remains the panic/robustness stress test. (Supersedes the M2 stress-test note.)
+- [ ] **Relative `preload`/`extends` paths (`preload("sibling.gd")`) resolve to the seam.** Godot anchors
+      them to the importing script's dir: `resolved = script_path.get_base_dir().path_join(p).simplify_path()`
+      (CONFIRMED `reduce_preload` 4664-4667). Absolute `res://`/`user://` are handled; relative needs the
+      importing file's path threaded into resolution (better done deliberately with **M5**'s file-context
+      work). 0 occurrences in the reference corpus; conservative seam = no false positives.
+- [ ] **Cross-*file* `preload`-const member access is the seam.** `const X = preload(…)` then `X.new()` is
+      typed in the **declaring** file (the member pre-pass infers the initializer). Reading that const from
+      *another* file (`other.X`) sees `script_class`'s annotation-only sig (`Variant`), because `script_class`
+      is offset-free and does not infer const *initializers*. Rare; the corpus pattern is same-file.
+- [ ] **Parser gaps on the broader demo-projects corpus (NEW, Phase-1 follow-up).** Project-mode
+      over godot-demo-projects surfaced **307 `GDSCRIPT_SYNTAX`** errors (cascading
+      "expected a declaration" — a few unhandled syntactic forms, e.g. some lambda/match/typed
+      constructs the ReactiveUI-Godot corpus didn't exercise). 0 panics. Harden the parser +
+      grow the differential oracle against godot-demo-projects before v1.
+- [ ] **`corpus --project` is a robustness stress test, not a single-project run.** Merging many
+      sub-projects into one host shares the `class_name` namespace; cross-project collisions are
+      expected. A faithful per-project validation needs `project.godot`-scoped roots (M4).
+
+### Post-M5 bug hunt (adversarial 6-finder + 3-vote-verify pass over all Phase-3 code)
+
+**Fixed in this pass** (11 confirmed defects — find-refs/rename correctness, the no-false-positive
+seam, and rename identifier hygiene; all with regression tests):
+- [x] **`classify` missed `extends Base`** (bare `Ident`, not a `Name`/`TypeRef` node) → a
+      `class_name` rename left `extends ThatClass` stale (incomplete, corrupting edit). Fixed:
+      `cst::extends_head_token` + a classify branch resolving the extends head as a type name.
+- [x] **Member `name_range` carried leading whitespace** (the `Name` CST node absorbs the
+      inter-token space) → off-by-one focus ranges + a member's own declaration mis-tagged `Read`.
+      Fixed at the root in `item_tree::name_range` (trim to the bare identifier).
+- [x] **Inner-class member over-rename (CRITICAL).** `GodotDef::Member` identity is `(file, name)`
+      with no inner-class discriminator, so an inner `class Inner: func update` shared identity with
+      a top-level `func update` → rename rewrote BOTH (cross-class corruption). Fixed: `classify`
+      returns `None` for a declaration nested in an `InnerClassDecl` (correct-or-refuse). Full
+      inner-class navigation identity is deferred (see below).
+- [x] **Local in a `get`/`set` accessor (or class-level-lambda) body mis-classified as a Member.**
+      The discriminator only checked for a `FuncDecl` ancestor; broadened to `Getter`/`Setter`/
+      `LambdaExpr` too.
+- [x] **`resolve_name_to_def` picked the first same-named binding (scope-unaware)** → a shadowed
+      local reference resolved to the wrong binding (e.g. a param instead of the shadowing local),
+      conflating two distinct locals in find-refs / rename. Fixed: pick the nearest-PRECEDING
+      declaration (greatest start `<=` the reference offset = lexical shadowing).
+- [x] **`match`-pattern `var` captures were invisible to navigation** (never recorded as bindings)
+      → a capture reference mis-resolved to a same-named member, corrupting its rename. Fixed:
+      `MatchArm` binds now carry a range, infer records a `BindingKind::MatchBind`, and `classify`
+      routes a `PatternBind` decl to a local.
+- [x] **Rename of an inner-class / named-enum member was a partial edit** (its `var x: Inner` /
+      `: MyEnum` type-annotation uses aren't resolvable by `classify_type_name`). Fixed: refuse
+      renaming a `Member` of kind `Class`/`Enum`.
+- [x] **`is_valid_ident` accepted reserved words as the new name** (`assert`, `namespace`, `yield`)
+      and the math-constant tokens (`PI`/`TAU`/`INF`/`NAN`) → a rename could write invalid code.
+      Added them to the keyword reject set.
+- [x] **Global rename collision ignored engine/native class names and autoload singletons.**
+      `class_name Widget` → `Node` (or an autoload name) passed the collision check. Fixed: also
+      reject when the new name resolves to an engine global or an autoload singleton.
+- [x] **`preload`/`extends "res://…"` of a non-`.gd` resource could resolve to a script `ScriptRef`.**
+      `resolve_res_path` returned a `ScriptRef` for any registered path; a future scene-ingesting
+      loader would mis-type `preload("res://x.tscn")` (accepting bogus `.new()`/member access).
+      Gated `resolve_res_path` on `.gd` (latent today — only `.gd` is indexed — but defensive).
+- [x] **Global `WouldCollide` reported the colliding symbol at byte `(0,0)`** instead of its real
+      `class_name` declaration range. Fixed via `class_decl_target`.
+
+**Second fix pass** (the high-confidence deferrals, fixed with regression tests):
+- [x] **Aliased `self` false `UNSAFE` — FIXED.** `self` is now typed as the file's *own* `ScriptRef`
+      (`ClassScope::self_ty`, set by `analyze_file` from the `FileId`), not just its engine base — so
+      `var me := self; me.own_method()` resolves the script's own members instead of false-warning.
+      Uniform for engine-base *and* user-base files (a user-base file's aliased `self` previously
+      pointed at the *base*, missing own members). Safe by construction: `is_assignable` treats
+      `ScriptRef → Object` as `Ok` (no new `TYPE_MISMATCH`); direct `self.member` keeps the precise
+      own-member fast path; member completion now walks a `ScriptRef`'s own + base-chain members.
+      Reference corpus **57 → 57** (no regression — the pattern doesn't occur there; the fix is
+      proven by a unit test, and demo-projects 456 files stays at 0 panics).
+- [x] **Member-rename inherited-collision — FIXED.** `collision_check` now walks the user `extends`
+      chain (`user_base_member_decl`), so renaming `Derived.own → shared` where `shared` is on the
+      user base `Base` is refused (`WouldCollide`). Engine-base members stay out of scope.
+- [x] **Anonymous-enum variant navigation — FIXED.** An anon-enum variant (`enum { FIRE }`) now
+      classifies to a `Member` identity (`member_owner` / `classify` consult the anon-enum
+      flattening), so find-refs, goto-definition, and rename reach it; its declaration is located by
+      a parse scan (`anon_enum_variant_target`) since `item_tree` drops per-variant ranges.
+
+**Deferred** (verified real, but needing an AST-layer change or pairing with later inner-class work):
+- [ ] **Inner-class member navigation identity is not modeled.** Inner members now refuse rather
+      than corrupt; a full fix qualifies `GodotDef::Member` by the declaring inner-class scope and
+      resolves against the inner `ItemTree` (pairs with Phase-4/later inner-class type modeling).
+- [ ] **Symbols named with soft keywords (`match`/`when`) aren't modeled — AST-layer, not classify.**
+      `ast::Name::text()` reads only an `Ident` token, so *every* soft-keyword-named declaration is
+      dropped at the AST/semantic layer (item_tree member name `None`, body params skipped) — long
+      before `classify`. The root fix widens `Name::text()` (and the body `NameRef`/`field_member`
+      lowering) to the grammar's `at_name` whitelist (`Ident | MatchKw | WhenKw`), which ripples
+      through item_tree / hover / completion and needs its own corpus validation. Not a classify-only
+      knock-off; rare in real code (safe `None` today).
+- [ ] **`extends "res://base.gd".Inner` (string + dotted) resolves the base to the OUTER script,**
+      dropping `.Inner`. `parse_extends_tokens` returns `ScriptPath` on the first `String` and never
+      consults the trailing idents. The correct-or-refuse fix routes the string+dotted form to the
+      seam (needs a new `ExtendsRef` variant; pairs with inner-class modeling). Very rare; 0 in corpus.

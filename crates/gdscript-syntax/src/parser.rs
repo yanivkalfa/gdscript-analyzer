@@ -71,6 +71,19 @@ impl Parse {
     }
 }
 
+/// Equality compares the lossless green tree and the diagnostics; the **interner is excluded**
+/// because it is a derived token-text cache (two parses with equal green trees reference equal
+/// token text). This makes [`Parse`] a sound `salsa` tracked-fn return: an unchanged reparse
+/// *backdates* instead of invalidating dependents — the Phase-3 incrementality precondition
+/// (Playbook §4). `GreenNode` equality is structural, so this is `O(tree)` worst case but
+/// short-circuits on the first difference.
+impl PartialEq for Parse {
+    fn eq(&self, other: &Self) -> bool {
+        self.green == other.green && self.errors == other.errors
+    }
+}
+impl Eq for Parse {}
+
 /// A byte-ranged syntax diagnostic with an "expected X" style message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxError {

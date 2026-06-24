@@ -7,32 +7,43 @@
 //! `lsp-types`. Each client (LSP server, the guitkx adapter, the CLI, the WASM
 //! playground) maps these POD results to its own protocol.
 //!
-//! Phase 1 (Tier 0) implements four features for real — parse diagnostics, document
-//! symbols, folding ranges, and by-name completion — and stubs the rest. There is no
-//! salsa yet: a plain VFS map and whole-file reparse on query. Every derived
-//! computation is a pure `(text) -> value` function so the Phase-3 salsa swap is
-//! localized. The crate is `wasm32`-safe (CI guards this).
+//! Phase 3 (M0) swaps the engine behind these types from a plain VFS map to a **salsa**
+//! query graph in [`gdscript_db`]: the input world is now `FileText` salsa inputs, mutated
+//! through `apply_change`; [`Analysis`] is a cloned database handle (salsa handles are
+//! `Clone + Send`, replacing the old `Arc<map>` snapshot). Cancellation is now *real* —
+//! a concurrent `apply_change` cancels in-flight reads on outstanding handles, which unwind
+//! into `Err(Cancelled)` at the query boundary (see [`catch`]). The public API shape is
+//! unchanged. The crate stays `wasm32`-safe (CI guards this).
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::sync::Arc;
-
-use rustc_hash::FxHashMap;
 
 use gdscript_base::{
     Cancellable, CodeAction, CompletionItem, Diagnostic, DocumentSymbol, FileId, FilePosition,
     FoldRange, HoverResult, InlayHint, SignatureHelp,
 };
+use gdscript_db::{Db, RootDatabase};
+use salsa::Durability;
 
 mod features;
+mod navigation;
 mod semantic;
+
+/// Run a read query, turning a salsa cancellation (a concurrent `apply_change` invalidated the
+/// snapshot) into `Err(Cancelled)`. The closure is `AssertUnwindSafe` because the database
+/// handle it borrows is shared, immutable for the duration of the read, and salsa's unwind is
+/// panic-safe by design.
+fn catch<T>(f: impl FnOnce() -> T) -> Cancellable<T> {
+    salsa::Cancelled::catch(std::panic::AssertUnwindSafe(f)).map_err(|_| gdscript_base::Cancelled)
+}
 
 /// The single mutable owner of analysis state — one per project/workspace.
 ///
-/// The input world is a virtual file system (`FileId` → UTF-8 text); the host never
-/// reads paths. Clients push text via [`AnalysisHost::apply_change`].
+/// The input world is a virtual file system (`FileId` → UTF-8 text) held as salsa inputs; the
+/// host never reads paths. Clients push text via [`AnalysisHost::apply_change`].
 #[derive(Debug, Clone, Default)]
 pub struct AnalysisHost {
-    files: Arc<FxHashMap<FileId, Arc<str>>>,
+    db: RootDatabase,
 }
 
 /// A batch of input changes. `None` text removes the file.
@@ -40,6 +51,14 @@ pub struct AnalysisHost {
 pub struct Change {
     /// Files to add/replace (`Some`) or remove (`None`).
     pub files: Vec<(FileId, Option<Arc<str>>)>,
+    /// Each file's `res://` path (loader-supplied; M3 `preload`/`extends "res://…"` resolution).
+    /// Supply it when a file is **added**; it is stable across edits, so a keystroke change must
+    /// omit it (salsa bumps an input field's revision on *every* set, even an identical value, so
+    /// re-sending a path each edit would needlessly invalidate the `res_path_registry`).
+    pub paths: Vec<(FileId, String)>,
+    /// The project's `project.godot` text (loader-supplied; M4 `[autoload]` resolution). Set once
+    /// on project open / when it changes; omit on `.gd` keystrokes.
+    pub project_config: Option<Arc<str>>,
 }
 
 impl Change {
@@ -58,6 +77,18 @@ impl Change {
     pub fn remove_file(&mut self, file: FileId) {
         self.files.push((file, None));
     }
+
+    /// Record a file's `res://` path (the project-relative resource path the loader assigns). Set
+    /// it once, when the file is first added; omit it on subsequent edits.
+    pub fn set_file_path(&mut self, file: FileId, path: impl Into<String>) {
+        self.paths.push((file, path.into()));
+    }
+
+    /// Record the project's `project.godot` text (M4 `[autoload]` resolution). Set on project open
+    /// / when it changes; omit on `.gd` keystrokes.
+    pub fn set_project_config(&mut self, text: impl Into<Arc<str>>) {
+        self.project_config = Some(text.into());
+    }
 }
 
 impl AnalysisHost {
@@ -67,53 +98,69 @@ impl AnalysisHost {
         Self::default()
     }
 
-    /// Apply a batch of input changes. The **only** mutation entry point.
+    /// Apply a batch of input changes. The **only** mutation entry point — each `set`/`remove`
+    /// bumps the salsa revision (and cancels any in-flight reads on outstanding [`Analysis`]
+    /// handles). Edited files are `LOW` durability (they change every keystroke).
     pub fn apply_change(&mut self, change: Change) {
-        let files = Arc::make_mut(&mut self.files);
+        let mut structure_changed = false;
         for (id, text) in change.files {
-            match text {
-                Some(t) => {
-                    files.insert(id, t);
-                }
-                None => {
-                    files.remove(&id);
-                }
+            if let Some(t) = text {
+                // A file the project hasn't seen before changes the file *set*.
+                structure_changed |= self.db.file_text(id).is_none();
+                self.db.set_file_text(id, &t, Durability::LOW);
+            } else {
+                structure_changed |= self.db.file_text(id).is_some();
+                self.db.remove_file(id);
             }
+        }
+        // Apply `res://` paths (loader-supplied, on add). `set_file_path` no-ops when the path is
+        // unchanged, so this never invalidates the `res_path_registry` on a redundant set; the
+        // FileText must already exist, so it runs after the text loop above.
+        for (id, path) in change.paths {
+            self.db.set_file_path(id, &path);
+        }
+        // The `project.godot` config (M4 autoloads) — its own MEDIUM input, guarded against no-op
+        // re-sets, so re-opening a project doesn't invalidate the autoload registry.
+        if let Some(text) = change.project_config {
+            self.db.set_project_config(&text);
+        }
+        // Rebuild the project file-set input ONLY on add/remove — never on a body edit — so the
+        // MEDIUM-durability registry stays firewalled against keystrokes.
+        if structure_changed {
+            self.db.sync_source_root();
         }
     }
 
-    /// A cheap, cloneable, `Send` snapshot for read queries.
+    /// A cheap, cloneable, `Send` snapshot for read queries (a cloned salsa database handle).
     #[must_use]
     pub fn analysis(&self) -> Analysis {
         Analysis {
-            files: Arc::clone(&self.files),
+            db: self.db.clone(),
         }
     }
 }
 
-/// An immutable snapshot of the world. Every query is `Cancellable` (Phase 1 never
-/// actually cancels, but the type is on the surface for the Phase-3 salsa swap).
+/// An immutable snapshot of the world — a cloned salsa handle. Every query is [`Cancellable`]:
+/// a concurrent `apply_change` cancels in-flight reads, which the client re-issues against the
+/// fresh snapshot.
 #[derive(Debug, Clone)]
 pub struct Analysis {
-    files: Arc<FxHashMap<FileId, Arc<str>>>,
+    db: RootDatabase,
 }
 
 impl Analysis {
-    fn text(&self, file: FileId) -> Option<&str> {
-        self.files.get(&file).map(|t| &**t)
-    }
-
     // ---- Tier-0 features: real data ----
 
     /// A pretty-printed dump of the syntax tree (debugging / playground).
     ///
     /// # Errors
-    /// Currently infallible; returns `Err(Cancelled)` only once Phase 3 wires real
-    /// cancellation.
+    /// `Err(Cancelled)` if a concurrent `apply_change` invalidated this snapshot.
     pub fn syntax_tree(&self, file: FileId) -> Cancellable<Option<String>> {
-        Ok(self
-            .text(file)
-            .map(|t| gdscript_syntax::parse(t).debug_tree()))
+        catch(|| {
+            self.db
+                .file_text(file)
+                .map(|ft| gdscript_db::parse(&self.db, ft).debug_tree())
+        })
     }
 
     /// Parse-error diagnostics ∪ the Phase-2 §5 type diagnostics.
@@ -121,14 +168,16 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn diagnostics(&self, file: FileId) -> Cancellable<Vec<Diagnostic>> {
-        Ok(self
-            .text(file)
-            .map(|t| {
-                let mut diags = features::diagnostics(t);
-                diags.extend(semantic::type_diagnostics(t));
-                diags
-            })
-            .unwrap_or_default())
+        catch(|| {
+            self.db
+                .file_text(file)
+                .map(|ft| {
+                    let mut diags = features::diagnostics(&self.db, ft);
+                    diags.extend(semantic::type_diagnostics(&self.db, ft));
+                    diags
+                })
+                .unwrap_or_default()
+        })
     }
 
     /// The document outline (classes, funcs, vars, consts, enums, signals, members).
@@ -136,10 +185,12 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn document_symbols(&self, file: FileId) -> Cancellable<Vec<DocumentSymbol>> {
-        Ok(self
-            .text(file)
-            .map(features::document_symbols)
-            .unwrap_or_default())
+        catch(|| {
+            self.db
+                .file_text(file)
+                .map(|ft| features::document_symbols(&self.db, ft))
+                .unwrap_or_default()
+        })
     }
 
     /// Foldable ranges (blocks, `#region` pairs, multi-line brackets).
@@ -147,10 +198,12 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn folding_ranges(&self, file: FileId) -> Cancellable<Vec<FoldRange>> {
-        Ok(self
-            .text(file)
-            .map(features::folding_ranges)
-            .unwrap_or_default())
+        catch(|| {
+            self.db
+                .file_text(file)
+                .map(|ft| features::folding_ranges(&self.db, ft))
+                .unwrap_or_default()
+        })
     }
 
     /// Completions. After `receiver.` it offers the inferred member set; otherwise (or when
@@ -160,13 +213,15 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn completions(&self, pos: FilePosition) -> Cancellable<Vec<CompletionItem>> {
-        Ok(self
-            .text(pos.file)
-            .map(|t| {
-                semantic::member_completions(t, pos.offset)
-                    .unwrap_or_else(|| features::completions(t, pos.offset))
-            })
-            .unwrap_or_default())
+        catch(|| {
+            self.db
+                .file_text(pos.file)
+                .map(|ft| {
+                    semantic::member_completions(&self.db, ft, pos.offset)
+                        .unwrap_or_else(|| features::completions(&self.db, ft, pos.offset))
+                })
+                .unwrap_or_default()
+        })
     }
 
     /// Hover: the inferred type of the expression / binding under the cursor (`Unknown`
@@ -175,9 +230,11 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn hover(&self, pos: FilePosition) -> Cancellable<Option<HoverResult>> {
-        Ok(self
-            .text(pos.file)
-            .and_then(|t| semantic::hover(t, pos.offset)))
+        catch(|| {
+            self.db
+                .file_text(pos.file)
+                .and_then(|ft| semantic::hover(&self.db, ft, pos.offset))
+        })
     }
 
     /// Inlay `: T` hints on `:=` declarations + unannotated params / `for`-vars (suppressed
@@ -186,10 +243,12 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn inlay_hints(&self, file: FileId) -> Cancellable<Vec<InlayHint>> {
-        Ok(self
-            .text(file)
-            .map(semantic::inlay_hints)
-            .unwrap_or_default())
+        catch(|| {
+            self.db
+                .file_text(file)
+                .map(|ft| semantic::inlay_hints(&self.db, ft))
+                .unwrap_or_default()
+        })
     }
 
     /// Signature help at a call site (active parameter by top-level comma count).
@@ -197,9 +256,11 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn signature_help(&self, pos: FilePosition) -> Cancellable<Option<SignatureHelp>> {
-        Ok(self
-            .text(pos.file)
-            .and_then(|t| semantic::signature_help(t, pos.offset)))
+        catch(|| {
+            self.db
+                .file_text(pos.file)
+                .and_then(|ft| semantic::signature_help(&self.db, ft, pos.offset))
+        })
     }
 
     /// Code actions at a position (currently "add type annotation").
@@ -207,22 +268,50 @@ impl Analysis {
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn code_actions(&self, pos: FilePosition) -> Cancellable<Vec<CodeAction>> {
-        Ok(self
-            .text(pos.file)
-            .map(|t| semantic::code_actions(t, pos.offset, pos.file))
-            .unwrap_or_default())
+        catch(|| {
+            self.db
+                .file_text(pos.file)
+                .map(|ft| semantic::code_actions(&self.db, ft, pos.offset))
+                .unwrap_or_default()
+        })
     }
 
-    /// Go-to-definition (Phase 2+).
+    /// Go-to-definition: the declaration target(s) of the symbol under the cursor (cross-file).
     ///
     /// # Errors
     /// See [`Analysis::syntax_tree`].
-    #[allow(clippy::unused_self)]
-    pub fn goto_definition(
+    pub fn goto_definition(&self, pos: FilePosition) -> Cancellable<Vec<gdscript_base::NavTarget>> {
+        catch(|| navigation::goto_definition(&self.db, pos))
+    }
+
+    /// Find every reference to the symbol under the cursor, project-wide (incl. its declaration).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn find_references(&self, pos: FilePosition) -> Cancellable<Vec<gdscript_base::Reference>> {
+        catch(|| navigation::find_references(&self.db, pos))
+    }
+
+    /// Rename the symbol under the cursor to `new_name` — a cross-file edit, or a refusal
+    /// ([`RenameError`](gdscript_base::RenameError)); never a partial edit.
+    ///
+    /// # Errors
+    /// `Err(Cancelled)` if a concurrent `apply_change` invalidated this snapshot. The rename's own
+    /// refusal is the `Result` *inside* the `Cancellable`.
+    pub fn rename(
         &self,
-        _pos: FilePosition,
-    ) -> Cancellable<Vec<gdscript_base::TextRange>> {
-        Ok(Vec::new())
+        pos: FilePosition,
+        new_name: &str,
+    ) -> Cancellable<Result<gdscript_base::SourceChange, gdscript_base::RenameError>> {
+        catch(|| navigation::rename(&self.db, pos, new_name))
+    }
+
+    /// Project-wide symbols matching `query` (fuzzy-ranked class names + members).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn workspace_symbols(&self, query: &str) -> Cancellable<Vec<gdscript_base::NavTarget>> {
+        catch(|| navigation::workspace_symbols(&self.db, query))
     }
 }
 
@@ -246,6 +335,91 @@ mod tests {
         let symbols = analysis.document_symbols(file).unwrap();
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "f");
+    }
+
+    #[test]
+    fn preload_resolves_cross_file_through_the_public_api() {
+        // The real `guitkx.gd` pattern, end-to-end through `apply_change` + `set_file_path`:
+        // `const M = preload("res://…")` then `M.new().method()`.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "class_name Markup\nfunc parse() -> int:\n\treturn 1\n",
+        );
+        change.set_file_path(FileId(0), "res://markup.gd");
+        change.change_file(
+            FileId(1),
+            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        // Valid code → no diagnostics.
+        assert!(analysis.diagnostics(FileId(1)).unwrap().is_empty());
+        // The cross-file preload resolved, so `n` is typed `int`; an inlay hint proves it (an
+        // *unresolved* preload would leave `n` on the seam, suppressing the hint).
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("int")),
+            "expected an `: int` inlay on the preload-resolved binding, got {hints:?}",
+        );
+    }
+
+    #[test]
+    fn autoload_resolves_cross_file_through_the_public_api() {
+        // End-to-end through `apply_change` + `set_project_config`: a `*`-singleton autoload
+        // script (no class_name — resolved by path) used by its bare name.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(FileId(0), "func volume() -> int:\n\treturn 50\n");
+        change.set_file_path(FileId(0), "res://audio.gd");
+        change.change_file(FileId(1), "func go():\n\tvar v := Audio.volume()\n");
+        change.set_file_path(FileId(1), "res://main.gd");
+        change.set_project_config("[autoload]\nAudio=\"*res://audio.gd\"\n");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        assert!(analysis.diagnostics(FileId(1)).unwrap().is_empty());
+        // `Audio.volume()` resolved cross-file via the autoload singleton → `v : int` inlay.
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("int")),
+            "expected an `: int` inlay on the autoload-resolved binding, got {hints:?}",
+        );
+    }
+
+    #[test]
+    fn find_refs_and_rename_cross_file_through_the_public_api() {
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "class_name Widget\nfunc make() -> int:\n\treturn 1\n",
+        );
+        change.set_file_path(FileId(0), "res://widget.gd");
+        change.change_file(
+            FileId(1),
+            "func f():\n\tvar w: Widget\n\tvar x := Widget.new()\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        // The `class_name Widget` declaration name starts at offset 11 (`"class_name "` is 11).
+        let at_decl = FilePosition {
+            file: FileId(0),
+            offset: 11,
+        };
+        // find-refs: declaration (f0) + annotation + `.new()` (f1) = 3.
+        let refs = analysis.find_references(at_decl).unwrap();
+        assert_eq!(refs.len(), 3, "{refs:?}");
+        // rename → a cross-file SourceChange touching both files.
+        let edit = analysis
+            .rename(at_decl, "Gadget")
+            .unwrap()
+            .expect("rename ok");
+        assert_eq!(edit.edits.len(), 2, "both files edited");
     }
 
     #[test]
