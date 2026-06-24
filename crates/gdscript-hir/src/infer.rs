@@ -180,7 +180,7 @@ pub struct Unit {
 
 /// The full single-file inference: the item tree, every inferred unit, and the merged §5
 /// diagnostics. The whole-file entry point the IDE layer consumes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FileInference {
     /// The lowered item tree.
     pub tree: Arc<ItemTree>,

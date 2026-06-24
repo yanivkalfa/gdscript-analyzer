@@ -541,6 +541,7 @@ dependencies = [
  "gdscript-db",
  "gdscript-syntax",
  "rustc-hash",
+ "salsa",
  "smol_str",
  "text-size",
 ]
