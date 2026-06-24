@@ -63,6 +63,22 @@ rustc-hash = "2.1" # deterministic FxHashMap — keeps `getrandom` out of the gr
 # here only — crates opt in with `.workspace = true` in Step 1, so this is inert until then.
 rkyv = "0.8"
 smol_str = "0.3"
+# Phase 3 — incremental engine (new macro-based "salsa 2022"). Pinned EXACTLY (pre-1.0,
+# API churn): `=0.27.1` (NEVER_CHANGE durability + the verified macro surface land here, not
+# 0.27.0). `default-features = false` drops the `rayon` threadpool so the core stays
+# single-threaded + wasm32-clean (no getrandom/Instant/threads); native parallelism is an
+# additive, target-gated opt-in later. See plans/PHASE-3-IMPLEMENTATION-PLAYBOOK.md §4/§7.
+# Keep everything EXCEPT `rayon` (the threadpool — it can't compile on wasm32-unknown-unknown
+# and the core is single-writer/multi-reader anyway). `inventory` does the ingredient
+# registration (dropping it panics "ingredient … was not registered" at runtime); `macros`,
+# `accumulator`, `salsa_unstable` are the API surface M0+ uses.
+salsa = { version = "=0.27.1", default-features = false, features = [
+    "macros",
+    "inventory",
+    "accumulator",
+    "salsa_unstable",
+] }
+dashmap = "6" # FileId -> FileText side-map (the salsa input lives OUTSIDE salsa); wasm-clean
 # FFI — Node addon (napi). Native + wasip1-threads only; never in the wasm32-unknown
 # core gate. napi-build is "2" (the README's "1" is stale — see Playbook §1).
 napi = { version = "3", default-features = true }
