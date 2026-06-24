@@ -45,7 +45,14 @@ pub trait Db: salsa::Database {
 }
 
 /// The VFS leaf: one file's UTF-8 text, as a salsa input, plus its [`FileId`] (so a query
-/// holding only a `FileText` can recover the id for cross-file resolution).
+/// holding only a `FileText` can recover the id for cross-file resolution) and its `res://`
+/// path (so `preload`/`extends "res://…"` resolve to the declaring file — M3).
+///
+/// `res_path` is a **separate salsa input field** from `text`: salsa tracks input fields
+/// individually (per-field `revisions`/`durabilities` — verified against salsa 0.27.1
+/// `input.rs`), so a query reading only `res_path` (the `res_path_registry`) *backdates* across
+/// a `text` keystroke — exactly the firewall that protects `file_class_name`. It is held at
+/// `MEDIUM` durability (set on file add, stable across edits); `text` stays `LOW`.
 #[salsa::input(debug)]
 pub struct FileText {
     /// The file's full text (interned `Arc<str>`; the getter returns `&Arc<str>`).
@@ -53,6 +60,9 @@ pub struct FileText {
     pub text: Arc<str>,
     /// The opaque file id this text belongs to.
     pub file_id: FileId,
+    /// The file's project-relative `res://` path, if the loader supplied one (`None` in
+    /// single-file mode / tests — then `preload`/`extends "res://…"` resolve to the seam).
+    pub res_path: Option<smol_str::SmolStr>,
 }
 
 /// The project's file set — a salsa input so project-wide queries (the global `class_name`
@@ -91,12 +101,30 @@ impl Files {
                     .to(Arc::from(text));
             }
             Entry::Vacant(vac) => {
-                let ft = FileText::builder(Arc::from(text), file)
+                let ft = FileText::builder(Arc::from(text), file, None)
                     .durability(durability)
                     .new(db);
                 vac.insert(ft);
             }
         }
+    }
+
+    /// Set `file`'s `res://` path at `MEDIUM` durability (stable project structure, like the
+    /// source root). No-op if the file is unknown or the path is unchanged: salsa does **not**
+    /// value-backdate an input setter (it bumps the field revision on *every* call, even for an
+    /// identical value — verified against salsa 0.27.1 `input.rs:set_field`), so a redundant set
+    /// would needlessly invalidate the `res_path_registry`. The guard keeps a re-`apply_change`
+    /// of an already-known path free.
+    pub fn set_file_path(&self, db: &mut dyn Db, file: FileId, path: &str) {
+        let Some(ft) = self.inner.get(&file).map(|r| *r) else {
+            return;
+        };
+        if ft.res_path(&*db).as_deref() == Some(path) {
+            return;
+        }
+        ft.set_res_path(db)
+            .with_durability(Durability::MEDIUM)
+            .to(Some(smol_str::SmolStr::new(path)));
     }
 
     /// Drop `file` from the side table (its salsa input lingers, unreferenced, until GC).
@@ -145,6 +173,13 @@ impl RootDatabase {
     pub fn set_file_text(&mut self, file: FileId, text: &str, durability: Durability) {
         let files = self.files.clone();
         files.set_file_text(self, file, text, durability);
+    }
+
+    /// Set `file`'s `res://` path (the loader supplies it on add; M3 `preload`/`extends` resolve
+    /// through it). Guarded against no-op re-sets — see [`Files::set_file_path`].
+    pub fn set_file_path(&mut self, file: FileId, path: &str) {
+        let files = self.files.clone();
+        files.set_file_path(self, file, path);
     }
 
     /// Remove `file`'s entry from the side table.
@@ -225,5 +260,31 @@ mod tests {
         // Remove.
         db.remove_file(id);
         assert!(db.file_text(id).is_none());
+    }
+
+    #[test]
+    fn res_path_round_trips_and_guards_no_op_sets() {
+        let mut db = RootDatabase::default();
+        let id = FileId(3);
+        // No path until the loader sets one.
+        db.set_file_text(id, "class_name A\n", Durability::LOW);
+        assert_eq!(db.file_text(id).unwrap().res_path(&db), None);
+        // Set, then read back.
+        db.set_file_path(id, "res://a.gd");
+        assert_eq!(
+            db.file_text(id).unwrap().res_path(&db).as_deref(),
+            Some("res://a.gd")
+        );
+        // A re-set of the SAME path is a guarded no-op (does not panic / regress); a real rename
+        // updates it.
+        db.set_file_path(id, "res://a.gd");
+        db.set_file_path(id, "res://b.gd");
+        assert_eq!(
+            db.file_text(id).unwrap().res_path(&db).as_deref(),
+            Some("res://b.gd")
+        );
+        // Setting a path for an unknown file is a no-op (no panic).
+        db.set_file_path(FileId(999), "res://ghost.gd");
+        assert!(db.file_text(FileId(999)).is_none());
     }
 }

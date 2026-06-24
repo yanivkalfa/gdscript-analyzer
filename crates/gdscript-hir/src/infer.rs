@@ -645,12 +645,20 @@ impl Cx<'_> {
                 self.infer_lambda(&params, &body);
                 Ty::Callable
             }
-            Expr::Preload { arg } => {
+            Expr::Preload { arg, path } => {
                 if let Some(arg) = arg {
                     self.infer_expr(arg, &Expectation::None);
                 }
-                // `preload(...)` resolves through the seam.
-                Ty::Unknown
+                // A constant string-literal path resolves to the declaring file's `ScriptRef`
+                // (M3 — a SCRIPT meta-type in Godot; `X.new()`/`X.member` then resolve via the
+                // usual `ScriptRef` walk). A non-constant argument (`preload(var)`) — which Godot
+                // itself rejects — stays the seam, never a false diagnostic.
+                match path {
+                    Some(p) => {
+                        resolve::resolve_external(self.db, &resolve::ExternalRef::Preload(p))
+                    }
+                    None => Ty::Unknown,
+                }
             }
             // `$Node`/`%Unique`/`get_node()` are always `Object(Node)` (Playbook §2).
             Expr::GetNode => self.node_ty(),

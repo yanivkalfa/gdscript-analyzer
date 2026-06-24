@@ -82,7 +82,7 @@ pub fn global_consts() -> Vec<GlobalConst> {
 /// it; these are the ones inference and completion rely on in Phase 2.
 #[must_use]
 pub fn builtin_fns() -> Vec<BuiltinFn> {
-    use LayerTy::{Array, Int, Str, Unknown, Variant, Void};
+    use LayerTy::{Array, Int, Str, Unknown, Void};
     vec![
         // `preload(path)` resolves to a script/resource — opaque in Phase 2 (the seam).
         BuiltinFn {
@@ -91,12 +91,16 @@ pub fn builtin_fns() -> Vec<BuiltinFn> {
             max_args: Some(1),
             ret: Unknown,
         },
-        // `load(path)` is dynamic; hir narrows `load("literal")` to `Unknown`.
+        // `load(path)` returns a `Resource` at runtime, but the concrete script/resource type is
+        // unknowable statically (the arg may be a variable, and even a literal is a *runtime*
+        // call — NOT a compile-time constant like `preload`). Model it as the seam (`Unknown`) so
+        // `var r := load(...)` neither warns (`INFERENCE_ON_VARIANT`) nor cascades, and `load` is
+        // never aliased to `preload` (Playbook §3.M3 / D5 — both literal and variable args opaque).
         BuiltinFn {
             name: "load",
             min_args: 1,
             max_args: Some(1),
-            ret: Variant,
+            ret: Unknown,
         },
         BuiltinFn {
             name: "range",

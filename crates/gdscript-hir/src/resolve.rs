@@ -43,10 +43,42 @@ pub fn resolve_external(db: &dyn Db, r: &ExternalRef) -> Ty {
     match r {
         // M1: a project-global `class_name` → its script reference.
         ExternalRef::ClassName(name) => resolve_class_name(db, name),
-        // `extends "res://…"` / `preload` / autoload are lit up in M2 / M3 / M4.
-        ExternalRef::ExtendsPath(_) | ExternalRef::Preload(_) | ExternalRef::Autoload(_) => {
-            Ty::Unknown
-        }
+        // M3: `preload("res://x.gd")` → the declaring file's `ScriptRef` (a compile-time constant
+        // SCRIPT meta-type in Godot; `reduce_preload` — resolved by `res://` PATH, independent of
+        // `class_name`, so a script with no `class_name` is still preloadable). We reuse the
+        // `ScriptRef` representation: `X.new()` → instance, `X.member`/`X.CONST` resolve via the
+        // same `script_member_walk` as a `class_name` reference (the analyzer already collapses
+        // the meta-vs-instance distinction, like a bare `class_name`).
+        ExternalRef::Preload(path) => resolve_res_path(db, path),
+        // M3: `extends "res://x.gd"` lights up the same path map. A *relative* / dotted form
+        // (`extends "sibling.gd"`, `extends A.B`) stays the seam — relative-path anchoring is a
+        // documented follow-up (needs the importing file's dir; 0 occurrences in the corpus).
+        ExternalRef::ExtendsPath(path) if is_resource_path(path) => resolve_res_path(db, path),
+        // `load(...)` is never routed here (it stays an opaque runtime call). Dotted `extends` and
+        // autoloads (M4) remain the seam.
+        ExternalRef::ExtendsPath(_) | ExternalRef::Autoload(_) => Ty::Unknown,
+    }
+}
+
+/// Whether a path is an engine resource URI we resolve project-root-absolutely (no anchor
+/// needed). Godot also accepts relative `preload`/`extends` paths anchored to the importing
+/// script's directory; those are a documented follow-up (they need the importing file's path
+/// threaded into resolution, and the reference corpus has none).
+fn is_resource_path(p: &str) -> bool {
+    p.starts_with("res://") || p.starts_with("user://")
+}
+
+/// Resolve a `res://` resource path to the declaring file's [`Ty::ScriptRef`] via the project
+/// [`res_path_registry`](crate::queries::res_path_registry), or the seam ([`Ty::Unknown`]) when
+/// no project is loaded or the path maps to no known file (a dangling `preload` — imprecise, but
+/// never a false diagnostic).
+fn resolve_res_path(db: &dyn Db, path: &str) -> Ty {
+    let Some(root) = db.source_root() else {
+        return Ty::Unknown;
+    };
+    match crate::queries::res_path_registry(db, root).get(path) {
+        Some(file) => Ty::ScriptRef(ScriptRefId(file.0)),
+        None => Ty::Unknown,
     }
 }
 

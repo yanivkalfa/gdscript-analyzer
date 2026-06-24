@@ -279,10 +279,15 @@ pub enum Expr {
         /// The lambda body.
         body: Block,
     },
-    /// `preload(path)` — resolves through the seam to `Unknown`.
+    /// `preload(path)` — a compile-time resource reference. When `path` is a constant string
+    /// literal (the only form Godot accepts), it is captured here so inference can resolve it to
+    /// the declaring file's `ScriptRef` (M3); a non-literal argument leaves `path` `None` (the
+    /// seam).
     Preload {
-        /// The path argument, if present.
+        /// The lowered path argument expression, if present (kept so it is still type-walked).
         arg: Option<ExprId>,
+        /// The constant-folded path string (unquoted), when the argument is a string literal.
+        path: Option<SmolStr>,
     },
     /// `$Path` / `%Unique` — always `Object(Node)` in Phase 2 (only `as` narrows it).
     GetNode,
@@ -650,10 +655,17 @@ impl Lowerer {
                 Expr::Lambda { params, body }
             }
             K::PreloadExpr => {
-                let arg = cst::first_child(node, |k| k == K::ArgList)
-                    .and_then(|al| cst::first_child_expr(&al))
-                    .map(|e| self.lower_expr(&e));
-                Expr::Preload { arg }
+                let arg_node = cst::first_child(node, |k| k == K::ArgList)
+                    .and_then(|al| cst::first_child_expr(&al));
+                // Constant-fold a string-literal path (`preload("res://x.gd")`) so inference can
+                // resolve it. Trim matching quotes, as the `extends "…"` path lowering does.
+                let path = arg_node
+                    .as_ref()
+                    .filter(|n| n.kind() == K::Literal)
+                    .and_then(|n| cst::child_token_text(n, K::String))
+                    .map(|s| SmolStr::new(s.trim_matches(['"', '\''])));
+                let arg = arg_node.map(|e| self.lower_expr(&e));
+                Expr::Preload { arg, path }
             }
             K::GetNodeExpr | K::UniqueNodeExpr => Expr::GetNode,
             _ => Expr::Missing,

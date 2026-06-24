@@ -37,6 +37,7 @@ fn collect_gd(dir: &Path, out: &mut Vec<PathBuf>) {
 /// and cross-file references actually resolve. Validates that lighting up cross-file resolution
 /// (M1+) introduces no project-scale false positives.
 fn run_project(dir: &str, files: &[PathBuf], show: bool) {
+    let root = Path::new(dir);
     let mut host = AnalysisHost::new();
     let mut change = Change::new();
     let mut loaded = Vec::new();
@@ -44,6 +45,11 @@ fn run_project(dir: &str, files: &[PathBuf], show: bool) {
         if let Ok(src) = std::fs::read_to_string(path) {
             let id = FileId(u32::try_from(i).expect("< 4B files"));
             change.change_file(id, src.as_str());
+            // The `res://` path = the file's path relative to the project root (the arg `dir`),
+            // forward-slashed — so `preload("res://…")`/`extends "res://…"` resolve cross-file.
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            let res_path = format!("res://{}", rel.to_string_lossy().replace('\\', "/"));
+            change.set_file_path(id, res_path);
             loaded.push((id, path.clone(), src));
         }
     }

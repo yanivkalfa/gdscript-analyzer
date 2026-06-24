@@ -94,6 +94,23 @@ pub fn global_registry(db: &dyn Db, root: SourceRoot) -> Arc<GlobalRegistry> {
     Arc::new(GlobalRegistry { classes })
 }
 
+/// The project-wide `res:// path → FileId` registry (M3): the map `preload("res://x.gd")` and
+/// `extends "res://x.gd"` resolve through. Keyed on the [`SourceRoot`] file-set input and each
+/// file's `res_path` salsa-input field. `res_path` is a *separate* input field from `text`
+/// (salsa tracks input fields individually), so this registry **backdates across body edits**
+/// exactly like [`global_registry`] — a keystroke never rebuilds it. A duplicate path keeps the
+/// first by `FileId` order (the file set is sorted), matching `global_registry`'s policy.
+#[salsa::tracked]
+pub fn res_path_registry(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolStr, FileId>> {
+    let mut map = FxHashMap::default();
+    for &file in root.files(db) {
+        if let Some(path) = file.res_path(db) {
+            map.entry(path).or_insert_with(|| file.file_id(db));
+        }
+    }
+    Arc::new(map)
+}
+
 /// One member of a script class, as a cross-file reference sees it (a resolved type, never a
 /// byte range).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,5 +467,254 @@ mod tests {
         // Must terminate (depth cap) — a.nope() walks A->B->A->… and bottoms out at the seam.
         let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    // ---- M3: res:// path map + preload / extends "res://…" const-aliasing -----------------
+
+    /// Add a file with both its text and its `res://` path (the loader's add-time pair).
+    fn set_with_path(db: &mut RootDatabase, id: u32, path: &str, src: &str) {
+        db.set_file_text(FileId(id), src, Durability::LOW);
+        db.set_file_path(FileId(id), path);
+    }
+
+    #[test]
+    fn res_path_registry_maps_paths_to_files() {
+        let mut db = RootDatabase::default();
+        set_with_path(&mut db, 0, "res://a.gd", "class_name A\n");
+        set_with_path(&mut db, 1, "res://sub/b.gd", "func f():\n\tpass\n");
+        db.set_file_text(FileId(2), "func no_path():\n\tpass\n", Durability::LOW); // no res:// path
+        db.sync_source_root();
+        let root = db.source_root().unwrap();
+
+        let reg = res_path_registry(&db, root);
+        assert_eq!(reg.get("res://a.gd"), Some(&FileId(0)));
+        assert_eq!(reg.get("res://sub/b.gd"), Some(&FileId(1)));
+        assert!(reg.get("res://missing.gd").is_none());
+        // A file with no path contributes nothing.
+        assert_eq!(reg.len(), 2);
+    }
+
+    // The res:// path firewall: a body edit must not rebuild the path registry. `res_path` is a
+    // *separate* salsa-input field from `text`, so even a length-changing body edit (which
+    // re-runs `item_tree`) leaves `res_path` — and the registry — untouched.
+
+    static RES_REGISTRY_OBSERVED: AtomicU32 = AtomicU32::new(0);
+
+    #[salsa::tracked]
+    fn observe_res_registry(db: &dyn gdscript_db::Db, root: SourceRoot) -> usize {
+        RES_REGISTRY_OBSERVED.fetch_add(1, Ordering::SeqCst);
+        res_path_registry(db, root).len()
+    }
+
+    #[test]
+    fn body_edit_does_not_invalidate_the_res_path_registry() {
+        let mut db = RootDatabase::default();
+        set_with_path(&mut db, 0, "res://a.gd", "func f():\n\tvar a := 1\n");
+        db.sync_source_root();
+        let root = db.source_root().unwrap();
+
+        assert_eq!(observe_res_registry(&db, root), 1);
+        let runs = RES_REGISTRY_OBSERVED.load(Ordering::SeqCst);
+
+        // Length-CHANGING body edit, NO path re-set, NO sync_source_root: the path is unchanged,
+        // so the registry must not recompute.
+        db.set_file_text(FileId(0), "func f():\n\tvar a := 123456\n", Durability::LOW);
+
+        assert_eq!(observe_res_registry(&db, root), 1);
+        assert_eq!(
+            RES_REGISTRY_OBSERVED.load(Ordering::SeqCst),
+            runs,
+            "REGRESSION: a body edit re-ran a res_path_registry consumer — the path firewall broke",
+        );
+    }
+
+    #[test]
+    fn preload_const_resolves_to_script_ref_members() {
+        let mut db = RootDatabase::default();
+        set_with_path(
+            &mut db,
+            0,
+            "res://widget.gd",
+            "class_name Widget\nfunc make() -> int:\n\treturn 5\nconst MAX := 10\n",
+        );
+        set_with_path(
+            &mut db,
+            1,
+            "res://main.gd",
+            "const W = preload(\"res://widget.gd\")\nfunc use_it():\n\tvar a := W.make()\n\tvar b := W.new()\n",
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| u.result.bindings.len() >= 2)
+            .expect("use_it unit with 2 bindings");
+        // W.make() → int; W.new() → an instance of Widget (a ScriptRef).
+        assert_eq!(
+            unit.result.bindings[0].ty.label(api).as_deref(),
+            Some("int")
+        );
+        assert!(
+            matches!(unit.result.bindings[1].ty, Ty::ScriptRef(_)),
+            "W.new() should be a script instance, got {:?}",
+            unit.result.bindings[1].ty
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn preload_of_script_without_class_name_resolves() {
+        // The key distinction from M1: preload resolves by PATH, so a script with *no* class_name
+        // (absent from the global_registry) is still resolved.
+        let mut db = RootDatabase::default();
+        set_with_path(
+            &mut db,
+            0,
+            "res://helper.gd",
+            "func help() -> String:\n\treturn \"x\"\n",
+        );
+        set_with_path(
+            &mut db,
+            1,
+            "res://main.gd",
+            "func use_it():\n\tvar h := preload(\"res://helper.gd\")\n\tvar s := h.help()\n",
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| u.result.bindings.len() >= 2)
+            .expect("use_it unit");
+        assert!(
+            matches!(unit.result.bindings[0].ty, Ty::ScriptRef(_)),
+            "preload of a class_name-less script must still resolve: {:?}",
+            unit.result.bindings[0].ty
+        );
+        assert_eq!(
+            unit.result.bindings[1].ty.label(api).as_deref(),
+            Some("String")
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn extends_res_path_inherits_members() {
+        let mut db = RootDatabase::default();
+        // base.gd has NO class_name — reachable only by its res:// path.
+        set_with_path(
+            &mut db,
+            0,
+            "res://base.gd",
+            "extends Node\nfunc base_method() -> int:\n\treturn 1\n",
+        );
+        set_with_path(
+            &mut db,
+            1,
+            "res://derived.gd",
+            "class_name Derived\nextends \"res://base.gd\"\nfunc own() -> String:\n\treturn \"x\"\n",
+        );
+        set_with_path(
+            &mut db,
+            2,
+            "res://main.gd",
+            "func use_it():\n\tvar d: Derived\n\tvar a := d.own()\n\tvar b := d.base_method()\n\tvar c := d.get_instance_id()\n",
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| u.result.bindings.len() >= 4)
+            .expect("use_it unit with 4 bindings");
+        // own() (own member), base_method() (via the res:// user base), get_instance_id() (the
+        // engine base behind base.gd).
+        assert_eq!(
+            unit.result.bindings[1].ty.label(api).as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            unit.result.bindings[2].ty.label(api).as_deref(),
+            Some("int")
+        );
+        assert_eq!(
+            unit.result.bindings[3].ty.label(api).as_deref(),
+            Some("int")
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn dangling_preload_is_seam_not_panic() {
+        let mut db = RootDatabase::default();
+        set_with_path(
+            &mut db,
+            0,
+            "res://main.gd",
+            "func use_it():\n\tvar x := preload(\"res://does_not_exist.gd\")\n\tx.whatever()\n",
+        );
+        db.sync_source_root();
+        // An unresolvable path → the seam (Unknown): no diagnostic, no panic.
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn load_literal_stays_opaque_not_aliased_to_preload() {
+        let mut db = RootDatabase::default();
+        set_with_path(
+            &mut db,
+            0,
+            "res://widget.gd",
+            "class_name Widget\nfunc make() -> int:\n\treturn 5\n",
+        );
+        set_with_path(
+            &mut db,
+            1,
+            "res://main.gd",
+            "func use_it():\n\tvar w := load(\"res://widget.gd\")\n",
+        );
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("use_it unit");
+        // `load(...)` is an ordinary runtime call returning an opaque Resource — it must NOT be
+        // aliased to `preload` (no script ScriptRef, no static `.new()` typing).
+        assert!(
+            !matches!(unit.result.bindings[0].ty, Ty::ScriptRef(_)),
+            "load() must stay opaque, not alias preload: {:?}",
+            unit.result.bindings[0].ty
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn renaming_a_files_path_reindexes_the_registry() {
+        // A path change (rename) DOES update the registry (it is not a body edit).
+        let mut db = RootDatabase::default();
+        set_with_path(&mut db, 0, "res://old.gd", "class_name A\n");
+        db.sync_source_root();
+        let root = db.source_root().unwrap();
+        assert_eq!(
+            res_path_registry(&db, root).get("res://old.gd"),
+            Some(&FileId(0))
+        );
+
+        db.set_file_path(FileId(0), "res://new.gd");
+        let root = db.source_root().unwrap();
+        let reg = res_path_registry(&db, root);
+        assert_eq!(reg.get("res://new.gd"), Some(&FileId(0)));
+        assert!(reg.get("res://old.gd").is_none());
     }
 }

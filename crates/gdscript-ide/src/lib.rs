@@ -50,6 +50,11 @@ pub struct AnalysisHost {
 pub struct Change {
     /// Files to add/replace (`Some`) or remove (`None`).
     pub files: Vec<(FileId, Option<Arc<str>>)>,
+    /// Each file's `res://` path (loader-supplied; M3 `preload`/`extends "res://…"` resolution).
+    /// Supply it when a file is **added**; it is stable across edits, so a keystroke change must
+    /// omit it (salsa bumps an input field's revision on *every* set, even an identical value, so
+    /// re-sending a path each edit would needlessly invalidate the `res_path_registry`).
+    pub paths: Vec<(FileId, String)>,
 }
 
 impl Change {
@@ -67,6 +72,12 @@ impl Change {
     /// Queue a file removal.
     pub fn remove_file(&mut self, file: FileId) {
         self.files.push((file, None));
+    }
+
+    /// Record a file's `res://` path (the project-relative resource path the loader assigns). Set
+    /// it once, when the file is first added; omit it on subsequent edits.
+    pub fn set_file_path(&mut self, file: FileId, path: impl Into<String>) {
+        self.paths.push((file, path.into()));
     }
 }
 
@@ -91,6 +102,12 @@ impl AnalysisHost {
                 structure_changed |= self.db.file_text(id).is_some();
                 self.db.remove_file(id);
             }
+        }
+        // Apply `res://` paths (loader-supplied, on add). `set_file_path` no-ops when the path is
+        // unchanged, so this never invalidates the `res_path_registry` on a redundant set; the
+        // FileText must already exist, so it runs after the text loop above.
+        for (id, path) in change.paths {
+            self.db.set_file_path(id, &path);
         }
         // Rebuild the project file-set input ONLY on add/remove — never on a body edit — so the
         // MEDIUM-durability registry stays firewalled against keystrokes.
@@ -277,6 +294,36 @@ mod tests {
         let symbols = analysis.document_symbols(file).unwrap();
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "f");
+    }
+
+    #[test]
+    fn preload_resolves_cross_file_through_the_public_api() {
+        // The real `guitkx.gd` pattern, end-to-end through `apply_change` + `set_file_path`:
+        // `const M = preload("res://…")` then `M.new().method()`.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "class_name Markup\nfunc parse() -> int:\n\treturn 1\n",
+        );
+        change.set_file_path(FileId(0), "res://markup.gd");
+        change.change_file(
+            FileId(1),
+            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        // Valid code → no diagnostics.
+        assert!(analysis.diagnostics(FileId(1)).unwrap().is_empty());
+        // The cross-file preload resolved, so `n` is typed `int`; an inlay hint proves it (an
+        // *unresolved* preload would leave `n` on the seam, suppressing the hint).
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("int")),
+            "expected an `: int` inlay on the preload-resolved binding, got {hints:?}",
+        );
     }
 
     #[test]
