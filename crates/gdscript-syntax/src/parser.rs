@@ -459,6 +459,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multiline_lambda_does_not_absorb_following_paren_line() {
+        // A block-body lambda assigned to a var, followed by a statement that begins with
+        // `(`. The dedent ends the lambda; the `(...)` line is its OWN statement — it must
+        // NOT be parsed as a postfix call on the lambda. (Regression: the parser used to
+        // absorb the `(` as `CallExpr(LambdaExpr, …)`.)
+        let src = "func f():\n\tvar cb := func():\n\t\treturn 1\n\t(self).process()\n";
+        let st = structure(src);
+        assert!(
+            st.contains("(VarDecl (Name) (LambdaExpr"),
+            "lambda should be the var initializer, standalone: {st}"
+        );
+        assert!(
+            !st.contains("CallExpr (LambdaExpr"),
+            "the following `(` line must not be absorbed as a call on the lambda: {st}"
+        );
+        // The `(self).process()` line is a separate ExprStmt with its own call chain.
+        assert!(
+            st.contains("(ExprStmt (CallExpr (FieldExpr (ParenExpr"),
+            "the `(self).process()` line should be its own statement: {st}"
+        );
+        round_trips(src);
+    }
+
+    #[test]
+    fn inline_lambda_still_chains_postfix() {
+        // An *inline* (single-line) lambda has no dedent, so a postfix `.call()` on the same
+        // logical line must still chain — the fix only suppresses postfix after a block body.
+        let src = "var x = (func(): return 1).call()\n";
+        let st = structure(src);
+        assert!(
+            st.contains("CallExpr (FieldExpr (ParenExpr (LambdaExpr"),
+            "inline lambda should still accept a postfix chain: {st}"
+        );
+        round_trips(src);
+    }
+
     /// A broad, realistic GDScript file exercising most of the grammar. The key
     /// invariant is that it round-trips byte-for-byte and parses without panicking.
     const CORPUS: &str = r#"@tool

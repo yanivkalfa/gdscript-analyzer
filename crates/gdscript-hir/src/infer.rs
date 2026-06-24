@@ -771,9 +771,9 @@ impl Cx<'_> {
                 self.expr_ty.insert(callee, Ty::Callable);
                 ret
             }
-            // Calling an arbitrary expression (a `Callable` value, an IIFE, or a parser artifact
-            // where a `(` line was absorbed onto a multi-line lambda): the return type isn't
-            // tracked → the seam, not `Variant`, so `var x := f()()` never warns.
+            // Calling an arbitrary expression — a `Callable` value or an immediately-invoked
+            // lambda (`(func(): …).call()`): the callee's return type isn't tracked, so the
+            // result is the seam (not `Variant`), and `var x := f()()` never warns.
             _ => {
                 self.infer_expr(callee, &Expectation::None);
                 Ty::Unknown
@@ -1157,12 +1157,24 @@ impl Cx<'_> {
     // ---- helpers ----
 
     /// The join (least upper bound) of two branch types — conservative: equal types collapse,
-    /// an uninformative branch absorbs, a subtype widens to its supertype, else `Variant`.
+    /// a subtype widens to its supertype, else `Variant`.
+    ///
+    /// The three uninformative markers do NOT collapse to `Variant` — that would defeat the
+    /// seam. They propagate by priority: `Error` (already diagnosed) → `Unknown` (the cross-file
+    /// seam — must never warn or cascade) → `Variant` (the gradual top). So
+    /// `x if c else <unknown>` stays `Unknown`, and `var y := (x if c else unknown)` does not
+    /// fire a false `INFERENCE_ON_VARIANT`.
     fn join(&self, a: &Ty, b: &Ty) -> Ty {
         if a == b {
             return a.clone();
         }
-        if a.is_uninformative() || b.is_uninformative() {
+        if a.is_error() || b.is_error() {
+            return Ty::Error;
+        }
+        if a.is_unknown() || b.is_unknown() {
+            return Ty::Unknown;
+        }
+        if a.is_variant() || b.is_variant() {
             return Ty::Variant;
         }
         if ty::is_assignable(self.api, a, b) == Assign::Ok {
@@ -1363,14 +1375,44 @@ mod tests {
     }
 
     #[test]
-    fn calling_a_lambda_value_is_seam_not_variant() {
-        // A `(` line absorbed onto a multi-line lambda (a parser artifact) makes the var init a
-        // call whose callee is the lambda; the result is the seam (Unknown), so no false warning.
+    fn multiline_lambda_then_paren_line_no_false_warning() {
+        // A multi-line lambda bound to a var, followed by a statement that begins with `(`.
+        // The parser now ends the lambda at its dedent (the `(` line is its own statement), so
+        // there is no spurious call-on-lambda and no false `INFERENCE_ON_VARIANT`.
         let src = "func f(state, i, loop):\n\tvar cb := func():\n\t\tif i >= state.size():\n\t\t\treturn\n\t(loop as SceneTree).process_frame.connect(cb, CONNECT_ONE_SHOT)\n";
         let h = infer_first_func(src);
         assert!(
             !codes(&h).contains(&INFERENCE_ON_VARIANT),
             "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_a_callable_value_is_seam_not_variant() {
+        // Invoking an arbitrary expression (here a parenthesized `Callable` value) reaches the
+        // seam arm of `infer_call`: the return type isn't tracked, so the result is Unknown,
+        // not `Variant`, and the inferred-on-Variant warning never fires.
+        let src = "func f(cb: Callable):\n\tvar x := (cb)()\n\treturn x\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn ternary_with_seam_branch_does_not_collapse_to_variant() {
+        // A ternary whose else-branch is the seam (`await` is untracked → Unknown) must `join`
+        // to Unknown, NOT Variant — otherwise `var x := …` fires a false INFERENCE_ON_VARIANT.
+        // (Regression: `join` used to absorb any uninformative branch to Variant.)
+        let src =
+            "func f(c: bool):\n\tvar x := 5 if c else await get_tree().process_frame\n\treturn x\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "seam branch should keep the ternary on the seam: {:?}",
             h.result.diagnostics
         );
     }

@@ -98,15 +98,18 @@ later.
       §4.6), so `HoverResult.doc` is empty and hover shows the inferred type / signature only.
 
 ### Genuine workarounds to revisit (flagged honestly)
-- [ ] **Lambda-call mitigation papers over a parser bug.** A multi-line lambda followed by
-      a line that starts with `(` (e.g. `var cb := func(): …` then
-      `(loop as SceneTree).process_frame.connect(cb, …)`) is mis-parsed: the `(` on the next
-      logical line is absorbed as a *postfix call on the lambda* instead of starting a new
-      statement. The **root fix is in the parser** (the lambda block's dedent should
-      terminate the expression). Phase 2 mitigates it in inference (calling a non-resolvable
-      callee yields the seam, not `Variant`, so no false `INFERENCE_ON_VARIANT`) — defensible
-      as inference behaviour on its own, but it masks the parser defect. Fix the parser, then
-      keep the inference rule.
+- [x] **Lambda-call parser bug — FIXED at the root.** A multi-line lambda followed by a line
+      that starts with `(` (e.g. `var cb := func(): …` then
+      `(loop as SceneTree).process_frame.connect(cb, …)`) used to be mis-parsed: the `(` on the
+      next logical line was absorbed as a *postfix call on the lambda*. The fix is in the parser
+      (`grammar.rs`): `block()` now reports whether it parsed an *indented* (multi-line) body, and
+      `lhs()` does **not** run a postfix chain after a block-body lambda — its trailing `DEDENT`
+      terminates the expression, so the `(` line starts its own statement. The inference rule
+      (calling an arbitrary expression yields the seam, not `Variant`) was kept on its own merit
+      — it now only covers genuine `Callable`-value invocation, not a parser artifact. Regression
+      tests: `multiline_lambda_does_not_absorb_following_paren_line`,
+      `inline_lambda_still_chains_postfix` (parser), `multiline_lambda_then_paren_line_no_false_warning`
+      (hir).
 - [ ] **Member field types are seeded by a shallow first pass.** `analyze_file` infers field
       initializers once (empty `member_types`) to seed the function pass, so a field whose
       initializer references *another* field (`var b := a + 1`) sees `a` as `Variant`/seam
