@@ -106,20 +106,29 @@ pub enum MemberSig {
     Signal,
 }
 
-/// A script class's own members, by name — the **offset-free projection** a cross-file
-/// reference resolves against. Reads only `item_tree` signatures (+ annotation resolution),
-/// never bodies or byte ranges, so it backdates on body edits (the cross-file firewall). M1
-/// covers the script's *own* members; inherited (base-chain) members are M2.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// A script class's own members, by name, plus its resolved `extends` base — the **offset-free
+/// projection** a cross-file reference resolves against. Reads only `item_tree` signatures (+
+/// annotation/base resolution), never bodies or byte ranges, so it backdates on body edits (the
+/// cross-file firewall). Member lookup walks the base chain (M2): own members here, inherited
+/// ones via [`base`](ScriptClass::base).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptClass {
     members: FxHashMap<SmolStr, MemberSig>,
+    base: Ty,
 }
 
 impl ScriptClass {
-    /// The signature of the member named `name`, if the class declares one.
+    /// The signature of the member named `name`, if the class declares one *itself* (not
+    /// inherited — the caller walks [`base`](ScriptClass::base) for inherited members).
     #[must_use]
     pub fn member(&self, name: &str) -> Option<&MemberSig> {
         self.members.get(name)
+    }
+
+    /// The resolved `extends` base: an engine `Object`, a user `ScriptRef`, or `Unknown`.
+    #[must_use]
+    pub fn base(&self) -> &Ty {
+        &self.base
     }
 }
 
@@ -138,7 +147,10 @@ pub fn script_ref_name(db: &dyn Db, sref: ScriptRefId) -> Option<SmolStr> {
 pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
     let tree = item_tree(db, file);
     let Some(api) = db.engine() else {
-        return Arc::new(ScriptClass::default());
+        return Arc::new(ScriptClass {
+            members: FxHashMap::default(),
+            base: Ty::Unknown,
+        });
     };
     let resolve_ann = |ann: Option<&str>| -> Ty {
         ann.map_or(Ty::Variant, |t| {
@@ -158,7 +170,10 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
         };
         members.insert(SmolStr::new(name), sig);
     }
-    Arc::new(ScriptClass { members })
+    // The resolved `extends` base — a user `ScriptRef` (another class_name / "res://…") walks
+    // into the inheritance chain; an engine `Object` ends it at the API table.
+    let base = crate::resolve::resolve_base(db, api, &tree);
+    Arc::new(ScriptClass { members, base })
 }
 
 #[cfg(test)]
@@ -373,5 +388,67 @@ mod tests {
             "a missing member on a ScriptRef must not warn: {:?}",
             fi.diagnostics
         );
+    }
+
+    #[test]
+    fn inherited_members_resolve_through_user_and_engine_bases() {
+        let mut db = RootDatabase::default();
+        // Derived -> Base (user) -> Node (engine) -> … -> Object.
+        db.set_file_text(
+            FileId(0),
+            "class_name Base\nextends Node\nfunc base_method() -> int:\n\treturn 1\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(1),
+            "class_name Derived\nextends Base\nfunc own() -> String:\n\treturn \"x\"\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(2),
+            "func use_it():\n\tvar d: Derived\n\tvar own := d.own()\n\tvar from_base := d.base_method()\n\tvar from_engine := d.get_instance_id()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| u.result.bindings.len() >= 4)
+            .expect("use_it unit with 4 bindings");
+        // [0]=d, [1]=own (own member), [2]=base_method (user base), [3]=get_instance_id (engine base).
+        assert_eq!(
+            unit.result.bindings[1].ty.label(api).as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            unit.result.bindings[2].ty.label(api).as_deref(),
+            Some("int")
+        );
+        assert_eq!(
+            unit.result.bindings[3].ty.label(api).as_deref(),
+            Some("int")
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn cyclic_extends_terminates() {
+        let mut db = RootDatabase::default();
+        // A extends B extends A — illegal in Godot, but the member walk must not loop.
+        db.set_file_text(FileId(0), "class_name A\nextends B\n", Durability::LOW);
+        db.set_file_text(FileId(1), "class_name B\nextends A\n", Durability::LOW);
+        db.set_file_text(
+            FileId(2),
+            "func use_it():\n\tvar a: A\n\tvar x := a.nope()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+
+        // Must terminate (depth cap) — a.nope() walks A->B->A->… and bottoms out at the seam.
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
     }
 }

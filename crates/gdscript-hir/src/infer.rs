@@ -882,16 +882,46 @@ impl Cx<'_> {
         if name == "new" {
             return Ty::ScriptRef(sref);
         }
-        let Some(file) = self.db.file_text(FileId(sref.0)) else {
-            return Ty::Unknown;
-        };
-        match crate::queries::script_class(self.db, file).member(name) {
-            Some(crate::queries::MemberSig::Method(ret)) if as_method => ret.clone(),
-            // A method referenced as a value is a `Callable`.
-            Some(crate::queries::MemberSig::Method(_)) => Ty::Callable,
-            Some(crate::queries::MemberSig::Field(t)) => t.clone(),
-            Some(crate::queries::MemberSig::Signal) => Ty::Signal(None),
-            None => Ty::Unknown,
+        self.script_member_walk(sref, name, as_method, 0)
+            .unwrap_or(Ty::Unknown)
+    }
+
+    /// Walk a script class's `extends` chain for `name`: own members first, then a user base
+    /// (another `ScriptRef`), then an engine base (the API table). Depth-bounded so a cyclic
+    /// `extends` cannot loop. `None` = not found anywhere in the chain (the seam).
+    fn script_member_walk(
+        &self,
+        sref: ScriptRefId,
+        name: &str,
+        as_method: bool,
+        depth: u32,
+    ) -> Option<Ty> {
+        if depth > 32 {
+            return None;
+        }
+        let file = self.db.file_text(FileId(sref.0))?;
+        let sc = crate::queries::script_class(self.db, file);
+        if let Some(m) = sc.member(name) {
+            return Some(match m {
+                crate::queries::MemberSig::Method(ret) => {
+                    if as_method {
+                        ret.clone()
+                    } else {
+                        Ty::Callable
+                    }
+                }
+                crate::queries::MemberSig::Field(t) => t.clone(),
+                crate::queries::MemberSig::Signal => Ty::Signal(None),
+            });
+        }
+        // Not an own member — continue up the inheritance chain.
+        match sc.base() {
+            Ty::ScriptRef(base) => self.script_member_walk(*base, name, as_method, depth + 1),
+            Ty::Object(class) => self
+                .api
+                .lookup_member(*class, name)
+                .map(|m| self.member_ref_ty(&m, as_method)),
+            _ => None,
         }
     }
 
@@ -1096,10 +1126,21 @@ impl Cx<'_> {
         if let Some(item) = self.class.lookup(name) {
             return self.own_member_ty(item, false);
         }
-        if let Ty::Object(base) = self.class.base
-            && let Some(m) = self.api.lookup_member(base, name)
-        {
-            return self.member_ref_ty(&m, false);
+        // Inherited members: an engine `Object` base via the API table, or a user `ScriptRef`
+        // base via the script member walk (M2 — so a class extending another class_name sees its
+        // inherited members).
+        match self.class.base.clone() {
+            Ty::Object(base) => {
+                if let Some(m) = self.api.lookup_member(base, name) {
+                    return self.member_ref_ty(&m, false);
+                }
+            }
+            Ty::ScriptRef(base) => {
+                if let Some(t) = self.script_member_walk(base, name, false, 0) {
+                    return t;
+                }
+            }
+            _ => {}
         }
         if let Some(g) = resolve::resolve_global(self.api, name) {
             return global_ty(&g);
