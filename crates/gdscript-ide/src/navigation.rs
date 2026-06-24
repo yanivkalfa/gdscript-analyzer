@@ -212,11 +212,17 @@ fn collision_check(db: &dyn Db, def: &GodotDef, new_name: &str) -> Result<(), Re
             }
         }
         GodotDef::Member { owner_file, .. } => {
+            // …with an own member…
             if let Some(ft) = db.file_text(*owner_file) {
                 let tree = queries::item_tree(db, ft);
                 if let Some(m) = tree.member(new_name) {
                     return Err(collide(*owner_file, member_name_range(m)));
                 }
+            }
+            // …or with an inherited member up the user `extends` chain (GDScript forbids
+            // redeclaring an inherited member). Engine-base members are out of scope here.
+            if let Some((file, range)) = user_base_member_decl(db, *owner_file, new_name, 0) {
+                return Err(collide(file, range));
             }
         }
         GodotDef::Local {
@@ -382,14 +388,18 @@ fn nav_target_of_def(db: &dyn Db, def: &GodotDef) -> Option<NavTarget> {
         GodotDef::Member { owner_file, name } => {
             let ft = db.file_text(*owner_file)?;
             let tree = queries::item_tree(db, ft);
-            let m = tree.member(name)?;
-            Some(NavTarget {
-                file: *owner_file,
-                full_range: member_full_range(m),
-                focus_range: member_name_range(m),
-                name: name.to_string(),
-                kind: member_symbol_kind_of(m),
-            })
+            match tree.member(name) {
+                Some(m) => Some(NavTarget {
+                    file: *owner_file,
+                    full_range: member_full_range(m),
+                    focus_range: member_name_range(m),
+                    name: name.to_string(),
+                    kind: member_symbol_kind_of(m),
+                }),
+                // Not in the member table → an anonymous-enum variant (a class-level constant);
+                // locate its declaration token in the parse (item_tree drops per-variant ranges).
+                None => anon_enum_variant_target(db, *owner_file, name),
+            }
         }
         GodotDef::Local {
             body_file,
@@ -458,6 +468,49 @@ fn class_decl_target(db: &dyn Db, file: FileId) -> Option<NavTarget> {
     })
 }
 
+/// The declaration target of an anonymous-enum variant `name` in `file` — located by scanning the
+/// parse (the item tree stores variant names without ranges). The variant name is the first token
+/// of its `EnumVariant`, so trim the node's leading trivia to the bare identifier. `None` if no
+/// anonymous-enum variant of that name exists.
+fn anon_enum_variant_target(db: &dyn Db, file: FileId, name: &str) -> Option<NavTarget> {
+    let ft = db.file_text(file)?;
+    let root = parse(db, ft).syntax_node();
+    for ev in ast::descendants(&root) {
+        if ev.kind() != SyntaxKind::EnumVariant {
+            continue;
+        }
+        // Anonymous enum only (its parent `EnumDecl` has no `Name` child).
+        let anon = ev.parent().is_some_and(|p| {
+            p.kind() == SyntaxKind::EnumDecl && !p.children().any(|c| c.kind() == SyntaxKind::Name)
+        });
+        if !anon {
+            continue;
+        }
+        let raw = ev.text().to_string();
+        let lead = raw.len() - raw.trim_start().len();
+        let rest = &raw[lead..];
+        // The leading identifier is the variant name; word-boundary match it (a trailing `= expr`
+        // or `,` is fine; `FIRE` must not match `FIREBALL`).
+        let after_ok = rest
+            .get(name.len()..)
+            .and_then(|r| r.chars().next())
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        if rest.starts_with(name) && after_ok {
+            let r = node_range(&ev);
+            let start = r.start + u32::try_from(lead).unwrap_or(0);
+            let focus = TextRange::new(start, start + u32::try_from(name.len()).unwrap_or(0));
+            return Some(NavTarget {
+                file,
+                full_range: r,
+                focus_range: focus,
+                name: name.to_owned(),
+                kind: SymbolKind::Constant,
+            });
+        }
+    }
+    None
+}
+
 /// Whether any `.gd` in the project quotes `name` as a string literal (the refuse trigger for
 /// method/member rename — a possible `connect`/`Callable`/scene-connection reference). A
 /// conservative text scan (refuse-when-unsure): it may match an unrelated string, but never edits
@@ -472,6 +525,35 @@ fn project_has_string_literal(db: &dyn Db, name: &str) -> bool {
         let text = file.text(db);
         text.contains(&dq) || text.contains(&sq)
     })
+}
+
+/// Where `new_name` is declared as a member up `file`'s USER `extends` chain (a base `class_name` /
+/// res:// script) — for the member-rename collision check (GDScript forbids redeclaring an
+/// inherited member). Returns the declaring base file + the member's range, or `None`. Own members
+/// are checked by the caller; engine-base members are out of scope. Depth-bounded against a cyclic
+/// `extends`.
+fn user_base_member_decl(
+    db: &dyn Db,
+    file: FileId,
+    new_name: &str,
+    depth: u32,
+) -> Option<(FileId, TextRange)> {
+    if depth > 32 {
+        return None;
+    }
+    let ft = db.file_text(file)?;
+    match queries::script_class(db, ft).base() {
+        gdscript_hir::ty::Ty::ScriptRef(base) => {
+            let base_file = FileId(base.0);
+            if let Some(bft) = db.file_text(base_file)
+                && let Some(m) = queries::item_tree(db, bft).member(new_name)
+            {
+                return Some((base_file, member_name_range(m)));
+            }
+            user_base_member_decl(db, base_file, new_name, depth + 1)
+        }
+        _ => None,
+    }
 }
 
 fn member_symbol_kind(db: &dyn Db, owner_file: FileId, name: &str) -> Option<SymbolKind> {
@@ -871,5 +953,36 @@ mod tests {
         let db = db_with(&[(0, WIDGET)]);
         let err = rename(&db, pos(0, "Widget", 0, WIDGET), "Node").unwrap_err();
         assert!(matches!(err, RenameError::WouldCollide { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn rename_member_detects_inherited_collision() {
+        // Renaming `Derived.own` -> `shared` collides with the inherited `Base.shared` (GDScript
+        // forbids redeclaring an inherited member) — the collision must be detected up the chain.
+        let base = "class_name Base\nfunc shared():\n\tpass\n";
+        let derived = "class_name Derived\nextends Base\nfunc own():\n\tpass\n";
+        let db = db_with(&[(0, base), (1, derived)]);
+        let err = rename(&db, pos(1, "own", 0, derived), "shared").unwrap_err();
+        assert!(matches!(err, RenameError::WouldCollide { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn find_refs_and_goto_anon_enum_variant() {
+        // An anonymous-enum variant is findable/renamable like a member, even though item_tree
+        // drops its range — its declaration is located by a parse scan.
+        let src = "enum { FIRE, ICE }\nfunc f():\n\tprint(FIRE)\n\tprint(FIRE)\n";
+        let db = db_with(&[(0, src)]);
+        let refs = find_references(&db, pos(0, "FIRE", 0, src));
+        assert_eq!(refs.len(), 3, "decl + 2 uses: {refs:?}");
+        assert_eq!(
+            refs.iter()
+                .filter(|r| r.kind == ReferenceKind::Declaration)
+                .count(),
+            1,
+            "the variant's declaration must be tagged once: {refs:?}",
+        );
+        let targets = goto_definition(&db, pos(0, "FIRE", 1, src)); // a `print(FIRE)` use
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].name, "FIRE");
     }
 }

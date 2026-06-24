@@ -109,7 +109,7 @@ pub fn infer(
     body: &Body,
     return_ty: Ty,
 ) -> InferenceResult {
-    let self_ty = class.base.clone();
+    let self_ty = class.self_ty.clone();
     let mut cx = Cx {
         db,
         api,
@@ -211,16 +211,20 @@ impl FileInference {
 /// class-field initializer against a shared [`ClassScope`]. The single entry point for the
 /// IDE features (Playbook §6 — a pure `(api, parsed file) -> result` function).
 #[must_use]
-pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode) -> FileInference {
+pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId) -> FileInference {
     let tree = item_tree(root);
     let mut units = Vec::new();
     let mut diagnostics = Vec::new();
     let mut member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
+    // `self` is the script's OWN class (a self-`ScriptRef`), not just its engine base — so member
+    // access on an aliased `self` resolves the file's own members (see `ClassScope::self_ty`).
+    let self_ref = Ty::ScriptRef(ScriptRefId(file_id.0));
 
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
     {
-        let class = ClassScope::new(db, api, &tree);
+        let mut class = ClassScope::new(db, api, &tree);
+        class.self_ty = self_ref.clone();
         for m in &tree.members {
             let (ptr, range) = match m {
                 Member::Var(v) => (v.ptr, v.range),
@@ -241,6 +245,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode) -> FileInferenc
     {
         let mut class = ClassScope::new(db, api, &tree);
         class.member_types = member_types;
+        class.self_ty = self_ref.clone();
         for m in &tree.members {
             let Member::Func(f) = m else { continue };
             let Some(node) = f.ptr.to_node(root) else {

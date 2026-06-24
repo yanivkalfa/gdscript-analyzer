@@ -39,6 +39,7 @@ pub fn analyze_file(db: &dyn Db, file: FileText) -> Arc<FileInference> {
             db,
             api,
             &parse(db, file).syntax_node(),
+            file.file_id(db),
         )),
         None => Arc::new(FileInference::default()),
     }
@@ -969,6 +970,36 @@ mod tests {
             AUTOLOAD_OBSERVED.load(Ordering::SeqCst),
             runs,
             "REGRESSION: a body edit re-ran an autoload_registry consumer — the config firewall broke",
+        );
+    }
+
+    #[test]
+    fn aliased_self_resolves_own_members_no_false_unsafe() {
+        // `var me := self; me.own()` must resolve `own` via the file's OWN members — self is the
+        // script's own class (a self-ScriptRef), not just its engine base. Before the fix `me` was
+        // typed as the base (`Node`), so `me.own()` false-warned UNSAFE_METHOD_ACCESS.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "extends Node\nfunc own() -> int:\n\treturn 1\nfunc use_it():\n\tvar me := self\n\tvar n := me.own()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        // `me.own()` resolves to int (own member via aliased self) — proves it isn't the seam.
+        assert!(
+            fi.units
+                .iter()
+                .flat_map(|u| &u.result.bindings)
+                .any(|b| b.ty.label(api).as_deref() == Some("int")),
+            "aliased self.own() should resolve to int",
+        );
+        assert!(
+            fi.diagnostics.is_empty(),
+            "no false UNSAFE on aliased self: {:?}",
+            fi.diagnostics
         );
     }
 

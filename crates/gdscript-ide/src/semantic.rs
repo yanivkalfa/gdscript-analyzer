@@ -13,8 +13,8 @@
 
 use gdscript_api::{BuiltinId, ClassId, EngineApi, MemberRef};
 use gdscript_base::{
-    CodeAction, CompletionItem, CompletionKind, Diagnostic, HoverResult, InlayHint, InlayHintKind,
-    ParamInfo, SignatureHelp, SignatureInfo, SourceChange, TextEdit, TextRange,
+    CodeAction, CompletionItem, CompletionKind, Diagnostic, FileId, HoverResult, InlayHint,
+    InlayHintKind, ParamInfo, SignatureHelp, SignatureInfo, SourceChange, TextEdit, TextRange,
 };
 use gdscript_db::{Db, FileText, parse};
 use gdscript_hir::infer::{BindingKind, FileInference};
@@ -142,6 +142,10 @@ pub fn member_completions(db: &dyn Db, file: FileText, offset: u32) -> Option<Ve
     });
 
     match recv_ty {
+        // A script reference (`self`, an aliased self, or any `ScriptRef` value): own members +
+        // the whole `extends` chain (user bases, then the engine base's members). For `self` the
+        // own members were already added above, so don't repeat them.
+        Some(Ty::ScriptRef(sref)) => items.extend(script_ref_items(db, api, *sref, !self_recv, 0)),
         Some(t) if !t.is_uninformative() => items.extend(members_of_ty(api, t)),
         // `self` with an opaque base still offers this file's own members.
         _ if self_recv => {}
@@ -149,6 +153,40 @@ pub fn member_completions(db: &dyn Db, file: FileText, offset: u32) -> Option<Ve
         _ => return None,
     }
     Some(items)
+}
+
+/// Completion items for the members reachable through a script [`Ty::ScriptRef`]: optionally its
+/// own members, then everything up its `extends` chain (user bases recursively, then the engine
+/// base's members). Depth-bounded against a cyclic `extends`.
+fn script_ref_items(
+    db: &dyn Db,
+    api: &EngineApi,
+    sref: ty::ScriptRefId,
+    include_own: bool,
+    depth: u32,
+) -> Vec<CompletionItem> {
+    if depth > 32 {
+        return Vec::new();
+    }
+    let Some(ft) = db.file_text(FileId(sref.0)) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    if include_own {
+        items.extend(own_member_items(&queries::item_tree(db, ft)));
+    }
+    match queries::script_class(db, ft).base() {
+        Ty::ScriptRef(base) => items.extend(script_ref_items(db, api, *base, true, depth + 1)),
+        Ty::Object(class) => {
+            items.extend(
+                api.members_of(*class)
+                    .iter()
+                    .map(|m| member_ref_item(api, m)),
+            );
+        }
+        _ => {}
+    }
+    items
 }
 
 /// The receiver node of the tightest `FieldExpr` whose `.` precedes `offset`, or `None` if the

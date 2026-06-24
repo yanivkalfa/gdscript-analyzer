@@ -119,6 +119,17 @@ pub fn classify(db: &dyn Db, pos: FilePosition) -> Option<GodotDef> {
     {
         return classify_type_name(db, &name);
     }
+    // (A3) An anonymous-enum variant declaration (`enum { FIRE }`): a bare `Ident` under an
+    //      `EnumVariant` whose enum has no name. Such a variant is a class-level `int` constant, so
+    //      it shares the Member identity space — resolve to Member{file, name} so find-refs / goto
+    //      reach it. (A *named* enum's variants are accessed as `Enum.NAME`, not as bare class-level
+    //      names, so they are out of scope here.)
+    if parent.kind() == SyntaxKind::EnumVariant && in_anon_enum(parent) {
+        return Some(GodotDef::Member {
+            owner_file: pos.file,
+            name,
+        });
+    }
     // (B) A type reference (`var x: Foo`, `is Foo`, `as Foo`): the token is inside a `TypeRef`.
     //     Resolve the type name to a class_name global or an engine class.
     if has_ancestor(&tok, SyntaxKind::TypeRef) {
@@ -370,13 +381,34 @@ fn member_owner(
         return None;
     }
     let file = db.file_text(FileId(sref.0))?;
-    if crate::queries::item_tree(db, file).member(name).is_some() {
+    let tree = crate::queries::item_tree(db, file);
+    // An own member, OR an anonymous-enum variant (a class-level `int` constant that the member
+    // table doesn't expose — its enum has no name and its variants aren't `Member`s).
+    if tree.member(name).is_some() || anon_enum_has_variant(&tree, name) {
         return Some(file.file_id(db));
     }
     match crate::queries::script_class(db, file).base() {
         Ty::ScriptRef(base) => member_owner(db, *base, name, depth + 1),
         _ => None, // engine base member, or none — not a user-declared member
     }
+}
+
+/// Whether `tree` declares `name` as a variant of an **anonymous** `enum { … }` (a flattened
+/// class-level `int` constant). Named-enum variants are excluded — they are accessed as `Enum.NAME`,
+/// not as bare class-level names.
+fn anon_enum_has_variant(tree: &crate::item_tree::ItemTree, name: &str) -> bool {
+    tree.members.iter().any(|m| {
+        matches!(m, crate::item_tree::Member::Enum(e)
+            if e.name.is_none() && e.variants.iter().any(|v| v == name))
+    })
+}
+
+/// Whether `enum_variant` (an `EnumVariant` node) belongs to an anonymous `enum { … }` (no name).
+fn in_anon_enum(enum_variant: &GdNode) -> bool {
+    enum_variant.parent().is_some_and(|enum_decl| {
+        enum_decl.kind() == SyntaxKind::EnumDecl
+            && !enum_decl.children().any(|c| c.kind() == SyntaxKind::Name)
+    })
 }
 
 /// Whether `tok` has an ancestor node of `kind`.
@@ -603,6 +635,21 @@ mod tests {
         assert!(
             !matches!(tmp, Some(GodotDef::Member { .. })),
             "a local in a get/set body must not be a Member, got {tmp:?}"
+        );
+    }
+
+    #[test]
+    fn anon_enum_variant_classifies_as_member() {
+        // An anonymous-enum variant is a class-level constant; its declaration and a bare reference
+        // must classify to the same identity (so find-refs / goto reach it).
+        let src = "enum { FIRE, ICE }\nfunc f():\n\tprint(FIRE)\n";
+        let db = db_with(&[(0, src)]);
+        let decl = at_nth(&db, 0, "FIRE", 0, src).unwrap(); // enum { FIRE }
+        let usage = at_nth(&db, 0, "FIRE", 1, src).unwrap(); // print(FIRE)
+        assert!(matches!(decl, GodotDef::Member { .. }), "{decl:?}");
+        assert_eq!(
+            decl, usage,
+            "an anon-enum variant decl and use share identity"
         );
     }
 

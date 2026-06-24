@@ -288,6 +288,12 @@ pub struct ClassScope<'a> {
     pub tree: &'a ItemTree,
     /// The resolved base type (`Object(id)` for an engine base, else `Unknown`).
     pub base: Ty,
+    /// The static type of `self` in this class's bodies. Defaults to [`base`](Self::base), but
+    /// `analyze_file` overrides it with the script's *own* [`Ty::ScriptRef`] so that member access
+    /// on an **aliased** `self` (`var me := self; me.own_method()`) walks the file's own members
+    /// instead of only the engine base — otherwise a real own-method call would false-warn
+    /// `UNSAFE_METHOD_ACCESS`. (Direct `self.member` already uses the own-member fast path.)
+    pub self_ty: Ty,
     /// Resolved types of this class's own fields (`var`/`const`), seeded by a first inference
     /// pass over the field initializers so member references see the *inferred* type (e.g.
     /// `var n := 0` → `int`), not just the annotation. Empty until populated.
@@ -317,9 +323,11 @@ impl<'a> ClassScope<'a> {
                 }
             }
         }
+        let base = resolve_base(db, api, tree);
         Self {
             tree,
-            base: resolve_base(db, api, tree),
+            self_ty: base.clone(),
+            base,
             member_types: FxHashMap::default(),
             members,
         }

@@ -296,27 +296,35 @@ seam, and rename identifier hygiene; all with regression tests):
 - [x] **Global `WouldCollide` reported the colliding symbol at byte `(0,0)`** instead of its real
       `class_name` declaration range. Fixed via `class_decl_target`.
 
-**Deferred** (verified real, but out of Phase-3 scope or needing a deliberate model change):
-- [ ] **Aliased `self` loses the file's own members → a false `UNSAFE_METHOD/PROPERTY_ACCESS`.**
-      `self` is typed as `class.base` (e.g. `Node`), so `var me := self; me.own_method()` doesn't
-      see the script's own methods and warns. The only **false positive** the hunt found. The fix is
-      to type `self` as the current file's own `ScriptRef` (threading the `FileId` into `infer`),
-      which ripples through inference and must be re-validated against the corpus (diagnostic-count
-      stable) — a deliberate change, not a navigation-bugfix rider. **Highest-priority follow-up.**
+**Second fix pass** (the high-confidence deferrals, fixed with regression tests):
+- [x] **Aliased `self` false `UNSAFE` — FIXED.** `self` is now typed as the file's *own* `ScriptRef`
+      (`ClassScope::self_ty`, set by `analyze_file` from the `FileId`), not just its engine base — so
+      `var me := self; me.own_method()` resolves the script's own members instead of false-warning.
+      Uniform for engine-base *and* user-base files (a user-base file's aliased `self` previously
+      pointed at the *base*, missing own members). Safe by construction: `is_assignable` treats
+      `ScriptRef → Object` as `Ok` (no new `TYPE_MISMATCH`); direct `self.member` keeps the precise
+      own-member fast path; member completion now walks a `ScriptRef`'s own + base-chain members.
+      Reference corpus **57 → 57** (no regression — the pattern doesn't occur there; the fix is
+      proven by a unit test, and demo-projects 456 files stays at 0 panics).
+- [x] **Member-rename inherited-collision — FIXED.** `collision_check` now walks the user `extends`
+      chain (`user_base_member_decl`), so renaming `Derived.own → shared` where `shared` is on the
+      user base `Base` is refused (`WouldCollide`). Engine-base members stay out of scope.
+- [x] **Anonymous-enum variant navigation — FIXED.** An anon-enum variant (`enum { FIRE }`) now
+      classifies to a `Member` identity (`member_owner` / `classify` consult the anon-enum
+      flattening), so find-refs, goto-definition, and rename reach it; its declaration is located by
+      a parse scan (`anon_enum_variant_target`) since `item_tree` drops per-variant ranges.
+
+**Deferred** (verified real, but needing an AST-layer change or pairing with later inner-class work):
 - [ ] **Inner-class member navigation identity is not modeled.** Inner members now refuse rather
-      than corrupt (above); a full fix qualifies `GodotDef::Member` by the declaring inner-class
-      scope and resolves against the inner `ItemTree` (pairs naturally with Phase-4/later inner-class
-      type modeling).
-- [ ] **Anonymous-enum variant references/declarations don't classify** (`enum { FIRE }` then
-      `FIRE`). `member_owner` uses `item_tree.member`, which doesn't expose flattened anon-enum
-      variants — so find-refs/goto return nothing (safe: `None`, never a wrong edit). Needs
-      `member_owner` to consult `ClassScope`'s flattening, or an `EnumVariant` identity.
-- [ ] **Member rename collision check misses inherited base-chain members** (only own members are
-      checked). Renaming `foo` → `bar` where `bar` is declared on a user base isn't flagged (a legal
-      GDScript shadow, so not corrupting — just an undetected clash). Walk the `extends` chain.
-- [ ] **Symbols named with soft keywords (`match`/`when`) don't classify** — `classify` gates on
-      `tok.kind() == Ident`, but a reference to `func match()` is a `MatchKw` token. Accept the
-      soft-name keyword kinds (rare; safe `None` today).
+      than corrupt; a full fix qualifies `GodotDef::Member` by the declaring inner-class scope and
+      resolves against the inner `ItemTree` (pairs with Phase-4/later inner-class type modeling).
+- [ ] **Symbols named with soft keywords (`match`/`when`) aren't modeled — AST-layer, not classify.**
+      `ast::Name::text()` reads only an `Ident` token, so *every* soft-keyword-named declaration is
+      dropped at the AST/semantic layer (item_tree member name `None`, body params skipped) — long
+      before `classify`. The root fix widens `Name::text()` (and the body `NameRef`/`field_member`
+      lowering) to the grammar's `at_name` whitelist (`Ident | MatchKw | WhenKw`), which ripples
+      through item_tree / hover / completion and needs its own corpus validation. Not a classify-only
+      knock-off; rare in real code (safe `None` today).
 - [ ] **`extends "res://base.gd".Inner` (string + dotted) resolves the base to the OUTER script,**
       dropping `.Inner`. `parse_extends_tokens` returns `ScriptPath` on the first `String` and never
       consults the trailing idents. The correct-or-refuse fix routes the string+dotted form to the
