@@ -68,6 +68,11 @@ impl GlobalRegistry {
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty()
     }
+
+    /// Every registered `(class_name, declaring file)` pair (for workspace symbols).
+    pub fn iter(&self) -> impl Iterator<Item = (&SmolStr, FileText)> + '_ {
+        self.classes.iter().map(|(k, v)| (k, *v))
+    }
 }
 
 /// A file's `class_name`, if it declares one — the **offset-free projection** of its item tree

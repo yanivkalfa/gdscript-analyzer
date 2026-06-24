@@ -26,6 +26,7 @@ use gdscript_db::{Db, RootDatabase};
 use salsa::Durability;
 
 mod features;
+mod navigation;
 mod semantic;
 
 /// Run a read query, turning a salsa cancellation (a concurrent `apply_change` invalidated the
@@ -275,16 +276,42 @@ impl Analysis {
         })
     }
 
-    /// Go-to-definition (Phase 2+).
+    /// Go-to-definition: the declaration target(s) of the symbol under the cursor (cross-file).
     ///
     /// # Errors
     /// See [`Analysis::syntax_tree`].
-    #[allow(clippy::unused_self)]
-    pub fn goto_definition(
+    pub fn goto_definition(&self, pos: FilePosition) -> Cancellable<Vec<gdscript_base::NavTarget>> {
+        catch(|| navigation::goto_definition(&self.db, pos))
+    }
+
+    /// Find every reference to the symbol under the cursor, project-wide (incl. its declaration).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn find_references(&self, pos: FilePosition) -> Cancellable<Vec<gdscript_base::Reference>> {
+        catch(|| navigation::find_references(&self.db, pos))
+    }
+
+    /// Rename the symbol under the cursor to `new_name` — a cross-file edit, or a refusal
+    /// ([`RenameError`](gdscript_base::RenameError)); never a partial edit.
+    ///
+    /// # Errors
+    /// `Err(Cancelled)` if a concurrent `apply_change` invalidated this snapshot. The rename's own
+    /// refusal is the `Result` *inside* the `Cancellable`.
+    pub fn rename(
         &self,
-        _pos: FilePosition,
-    ) -> Cancellable<Vec<gdscript_base::TextRange>> {
-        catch(Vec::new)
+        pos: FilePosition,
+        new_name: &str,
+    ) -> Cancellable<Result<gdscript_base::SourceChange, gdscript_base::RenameError>> {
+        catch(|| navigation::rename(&self.db, pos, new_name))
+    }
+
+    /// Project-wide symbols matching `query` (fuzzy-ranked class names + members).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn workspace_symbols(&self, query: &str) -> Cancellable<Vec<gdscript_base::NavTarget>> {
+        catch(|| navigation::workspace_symbols(&self.db, query))
     }
 }
 
@@ -361,6 +388,38 @@ mod tests {
             hints.iter().any(|h| h.label.contains("int")),
             "expected an `: int` inlay on the autoload-resolved binding, got {hints:?}",
         );
+    }
+
+    #[test]
+    fn find_refs_and_rename_cross_file_through_the_public_api() {
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "class_name Widget\nfunc make() -> int:\n\treturn 1\n",
+        );
+        change.set_file_path(FileId(0), "res://widget.gd");
+        change.change_file(
+            FileId(1),
+            "func f():\n\tvar w: Widget\n\tvar x := Widget.new()\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        // The `class_name Widget` declaration name starts at offset 11 (`"class_name "` is 11).
+        let at_decl = FilePosition {
+            file: FileId(0),
+            offset: 11,
+        };
+        // find-refs: declaration (f0) + annotation + `.new()` (f1) = 3.
+        let refs = analysis.find_references(at_decl).unwrap();
+        assert_eq!(refs.len(), 3, "{refs:?}");
+        // rename → a cross-file SourceChange touching both files.
+        let edit = analysis
+            .rename(at_decl, "Gadget")
+            .unwrap()
+            .expect("rename ok");
+        assert_eq!(edit.edits.len(), 2, "both files edited");
     }
 
     #[test]

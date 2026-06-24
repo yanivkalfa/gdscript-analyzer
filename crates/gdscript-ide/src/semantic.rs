@@ -457,13 +457,13 @@ pub fn code_actions(db: &dyn Db, file: FileText, offset: u32) -> Vec<CodeAction>
     vec![CodeAction {
         title: format!("Add type annotation `: {label}`"),
         kind: Some("refactor.rewrite".to_owned()),
-        edit: SourceChange {
-            file: file.file_id(db),
-            edits: vec![TextEdit {
+        edit: SourceChange::single(
+            file.file_id(db),
+            vec![TextEdit {
                 range: TextRange::new(at, at),
                 new_text: format!(": {label}"),
             }],
-        },
+        ),
     }]
 }
 
@@ -560,7 +560,7 @@ mod tests {
         let (db, ft) = db_ft(src);
         let actions = code_actions(&db, ft, offset);
         assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].edit.edits[0].new_text, ": int");
+        assert_eq!(actions[0].edit.edits[0].edits[0].new_text, ": int");
     }
 
     #[test]
