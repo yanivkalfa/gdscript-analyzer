@@ -5,7 +5,10 @@
 //! zero-behaviour-change regression check across the Phase-3 migrations: 0 panics and a
 //! stable diagnostic count on a real project.
 //!
-//! Usage: `cargo run -p gdscript-ide --example corpus -- <dir> [--show]`
+//! `--project` loads every file into ONE host so the global `class_name` registry is populated
+//! and cross-file references resolve — validating project-scale fidelity (M1+).
+//!
+//! Usage: `cargo run -p gdscript-ide --example corpus -- <dir> [--show] [--project]`
 
 use std::path::{Path, PathBuf};
 
@@ -30,14 +33,81 @@ fn collect_gd(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Project mode: load EVERY file into one host so the global `class_name` registry is populated
+/// and cross-file references actually resolve. Validates that lighting up cross-file resolution
+/// (M1+) introduces no project-scale false positives.
+fn run_project(dir: &str, files: &[PathBuf], show: bool) {
+    let mut host = AnalysisHost::new();
+    let mut change = Change::new();
+    let mut loaded = Vec::new();
+    for (i, path) in files.iter().enumerate() {
+        if let Ok(src) = std::fs::read_to_string(path) {
+            let id = FileId(u32::try_from(i).expect("< 4B files"));
+            change.change_file(id, src.as_str());
+            loaded.push((id, path.clone(), src));
+        }
+    }
+    host.apply_change(change);
+    let analysis = host.analysis();
+
+    let (mut clean, mut with_diags, mut total_diags) = (0usize, 0usize, 0usize);
+    let mut panics = Vec::new();
+    for (id, path, src) in &loaded {
+        let id = *id;
+        let snap = analysis.clone();
+        let run = std::panic::AssertUnwindSafe(move || snap.diagnostics(id).unwrap());
+        match std::panic::catch_unwind(run) {
+            Ok(d) if d.is_empty() => clean += 1,
+            Ok(d) => {
+                with_diags += 1;
+                total_diags += d.len();
+                if show {
+                    let idx = LineIndex::new(src);
+                    println!("\n{}  ({} diag)", path.display(), d.len());
+                    for diag in &d {
+                        let lc = idx.line_col(diag.range.start);
+                        let line_text = src.lines().nth(lc.line as usize).unwrap_or("");
+                        println!(
+                            "  {}:{}  [{}] {}",
+                            lc.line + 1,
+                            lc.col + 1,
+                            diag.code,
+                            diag.message
+                        );
+                        println!("      | {}", line_text.trim_end());
+                    }
+                }
+            }
+            Err(_) => panics.push(path.clone()),
+        }
+    }
+    println!(
+        "\n=== corpus (PROJECT mode — cross-file resolution active): {dir} ===\n  files:       {}\n  clean:       {clean}\n  with diags:  {with_diags} ({total_diags} diagnostics)\n  panics:      {}",
+        loaded.len(),
+        panics.len()
+    );
+    for p in &panics {
+        println!("  PANIC: {}", p.display());
+    }
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("usage: corpus <dir> [--show]");
-    let show = args.any(|a| a == "--show");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let dir = args
+        .first()
+        .cloned()
+        .expect("usage: corpus <dir> [--show] [--project]");
+    let show = args.iter().any(|a| a == "--show");
+    let project = args.iter().any(|a| a == "--project");
 
     let mut files = Vec::new();
     collect_gd(Path::new(&dir), &mut files);
     files.sort();
+
+    if project {
+        run_project(&dir, &files, show);
+        return;
+    }
 
     let (mut total, mut clean, mut with_diags, mut total_diags) = (0usize, 0usize, 0usize, 0usize);
     let mut panics = Vec::new();
