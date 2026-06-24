@@ -13,6 +13,16 @@ keywords.workspace = true
 
 [dependencies]
 gdscript-base = { workspace = true }
+rkyv = { workspace = true }
+rustc-hash = { workspace = true }
+
+[features]
+default = ["bundled-api"]
+# `bundled-api` embeds the prebuilt engine-API blob via `include_bytes!` (native only — see
+# `src/lib.rs`). `xtask` builds this crate with `--no-default-features` because it *writes*
+# the blob and so must compile before the blob exists; the wasm binding also leaves it off
+# and fetches the blob as a separate asset (Playbook §4.5).
+bundled-api = []
 
 [lints]
 workspace = true

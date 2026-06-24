@@ -19,10 +19,12 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use gdscript_base::{
-    Cancellable, CompletionItem, Diagnostic, DocumentSymbol, FileId, FilePosition, FoldRange,
+    Cancellable, CodeAction, CompletionItem, Diagnostic, DocumentSymbol, FileId, FilePosition,
+    FoldRange, HoverResult, InlayHint, SignatureHelp,
 };
 
 mod features;
+mod semantic;
 
 /// The single mutable owner of analysis state — one per project/workspace.
 ///
@@ -114,14 +116,18 @@ impl Analysis {
             .map(|t| gdscript_syntax::parse(t).debug_tree()))
     }
 
-    /// Parse-error diagnostics only (no type/lint diagnostics in Tier 0).
+    /// Parse-error diagnostics ∪ the Phase-2 §5 type diagnostics.
     ///
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn diagnostics(&self, file: FileId) -> Cancellable<Vec<Diagnostic>> {
         Ok(self
             .text(file)
-            .map(features::diagnostics)
+            .map(|t| {
+                let mut diags = features::diagnostics(t);
+                diags.extend(semantic::type_diagnostics(t));
+                diags
+            })
             .unwrap_or_default())
     }
 
@@ -147,27 +153,64 @@ impl Analysis {
             .unwrap_or_default())
     }
 
-    /// By-name completions: keywords, annotations (after `@`), and document-local
-    /// symbol names. No member (`.`) completion in Tier 0 (that needs inference).
+    /// Completions. After `receiver.` it offers the inferred member set; otherwise (or when
+    /// the receiver is `Variant`/`Unknown`) it falls back to the Tier-0 by-name completion
+    /// (keywords, annotations after `@`, document-local symbols) so it never regresses.
     ///
     /// # Errors
     /// See [`Analysis::syntax_tree`].
     pub fn completions(&self, pos: FilePosition) -> Cancellable<Vec<CompletionItem>> {
         Ok(self
             .text(pos.file)
-            .map(|t| features::completions(t, pos.offset))
+            .map(|t| {
+                semantic::member_completions(t, pos.offset)
+                    .unwrap_or_else(|| features::completions(t, pos.offset))
+            })
             .unwrap_or_default())
     }
 
-    // ---- present on the API surface; Phase-1 returns empty/None ----
-
-    /// Hover (Phase 2).
+    /// Hover: the inferred type of the expression / binding under the cursor (`Unknown`
+    /// elided). `None` when there is nothing typed there.
     ///
     /// # Errors
     /// See [`Analysis::syntax_tree`].
-    #[allow(clippy::unused_self)]
-    pub fn hover(&self, _pos: FilePosition) -> Cancellable<Option<String>> {
-        Ok(None)
+    pub fn hover(&self, pos: FilePosition) -> Cancellable<Option<HoverResult>> {
+        Ok(self
+            .text(pos.file)
+            .and_then(|t| semantic::hover(t, pos.offset)))
+    }
+
+    /// Inlay `: T` hints on `:=` declarations + unannotated params / `for`-vars (suppressed
+    /// when the type is `Variant`/`Unknown`).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn inlay_hints(&self, file: FileId) -> Cancellable<Vec<InlayHint>> {
+        Ok(self
+            .text(file)
+            .map(semantic::inlay_hints)
+            .unwrap_or_default())
+    }
+
+    /// Signature help at a call site (active parameter by top-level comma count).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn signature_help(&self, pos: FilePosition) -> Cancellable<Option<SignatureHelp>> {
+        Ok(self
+            .text(pos.file)
+            .and_then(|t| semantic::signature_help(t, pos.offset)))
+    }
+
+    /// Code actions at a position (currently "add type annotation").
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn code_actions(&self, pos: FilePosition) -> Cancellable<Vec<CodeAction>> {
+        Ok(self
+            .text(pos.file)
+            .map(|t| semantic::code_actions(t, pos.offset, pos.file))
+            .unwrap_or_default())
     }
 
     /// Go-to-definition (Phase 2+).

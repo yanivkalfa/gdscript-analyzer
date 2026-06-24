@@ -10,7 +10,14 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# The codegen builds an `EngineApi` model and `rkyv`-encodes it. Specified directly (not via
+# the workspace dep) so `default-features = false` can turn off `bundled-api`: xtask builds the
+# crate WITHOUT requiring the blob it is about to write (the bootstrap — Playbook §4.5). `cargo
+# xtask` only builds xtask's own subgraph, so unification never pulls `bundled-api` back in.
+gdscript-api = { path = "../crates/gdscript-api", default-features = false }
+rkyv = { workspace = true }
 
 [lints]
 workspace = true

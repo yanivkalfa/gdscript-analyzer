@@ -5,13 +5,15 @@
 //! `:=`/annotations, member lookup over the engine inheritance table, `is`/`as` narrowing), and the
 //! GDScript warning checks. Single-file in Phase 2; project-wide + scene-aware later.
 //!
-//! Phase 0: empty, compiling stub. Must build for `wasm32`.
+//! Phase 2 builds this out bottom-up: the type model ([`ty`]), then the item tree, body, name
+//! resolution, and inference. Must build for `wasm32`.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        // Phase 0: this crate is an empty, compiling stub.
-    }
-}
+pub mod body;
+mod cst;
+pub mod infer;
+pub mod item_tree;
+pub mod resolve;
+pub mod ty;
+
+pub use cst::AstPtr;

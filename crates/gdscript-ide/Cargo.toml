@@ -17,8 +17,16 @@ gdscript-syntax = { workspace = true }
 gdscript-api = { workspace = true }
 gdscript-db = { workspace = true }
 gdscript-hir = { workspace = true }
+cstree = { workspace = true }
 rustc-hash = { workspace = true }
 text-size = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "analysis"
+harness = false
 
 [lints]
 workspace = true

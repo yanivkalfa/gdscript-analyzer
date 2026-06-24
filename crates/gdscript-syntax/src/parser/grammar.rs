@@ -436,7 +436,12 @@ impl Parser<'_> {
 
     /// A block: indented (`NEWLINE INDENT stmt+ DEDENT`) or an inline run of `;`-
     /// separated statements terminated by a logical newline.
-    fn block(&mut self) {
+    ///
+    /// Returns `true` when it parsed an *indented* (multi-line) block — the body was
+    /// delimited by `INDENT … DEDENT`. Callers that embed a block inside an expression
+    /// (i.e. [`Self::lambda`]) use this to know the expression is statement-terminated by
+    /// the dedent, so no postfix `(`/`[`/`.` from the *next* logical line may chain onto it.
+    fn block(&mut self) -> bool {
         if self.eat(Newline) {
             if self.at(Indent) {
                 let m = self.open();
@@ -450,8 +455,10 @@ impl Parser<'_> {
                 }
                 self.eat(Dedent);
                 self.close(m, Block);
+                return true;
             }
             // else: an empty body (no indentation followed).
+            false
         } else {
             // Inline body, e.g. `func f(): return 1` or a single-line lambda inside a
             // call `map(func(x): x * 2)`. Terminates at a logical newline, a `Dedent`
@@ -465,6 +472,7 @@ impl Parser<'_> {
                 self.stmt();
             }
             self.close(m, Block);
+            false
         }
     }
 
@@ -779,6 +787,15 @@ impl Parser<'_> {
             let kind = if op == AwaitKw { AwaitExpr } else { UnaryExpr };
             return Some(self.close(m, kind));
         }
+        // A lambda is handled here (not via the generic primary→postfix path) so that a
+        // *multi-line* (block-body) lambda does NOT run a postfix chain: its body ends on a
+        // `DEDENT`, which terminates the statement. Otherwise a next logical line beginning
+        // with `(`/`[`/`.` would be wrongly absorbed as a call/index/field on the lambda.
+        // An inline lambda (`func(x): x * 2`) has no dedent and still chains normally.
+        if self.at(FuncKw) {
+            let (lam, multiline) = self.lambda();
+            return Some(if multiline { lam } else { self.postfix(lam) });
+        }
         let primary = self.primary()?;
         Some(self.postfix(primary))
     }
@@ -844,7 +861,9 @@ impl Parser<'_> {
             LBrace => Some(self.dict_lit()),
             Dollar => Some(self.get_node(GetNodeExpr, Dollar)),
             Percent => Some(self.get_node(UniqueNodeExpr, Percent)),
-            FuncKw => Some(self.lambda()),
+            // Lambdas are normally intercepted in `lhs` (to suppress postfix on a multi-line
+            // body); this arm only fires if `primary` is reached with a `func` some other way.
+            FuncKw => Some(self.lambda().0),
             PreloadKw => Some(self.preload_expr()),
             _ => {
                 if self.at_any(&[Newline, Dedent, RParen, RBrack, RBrace, Comma]) || self.eof() {
@@ -904,7 +923,10 @@ impl Parser<'_> {
         self.close(m, node)
     }
 
-    fn lambda(&mut self) -> MarkClosed {
+    /// A lambda (`func`-expression). Returns the closed node and whether its body was an
+    /// indented multi-line block (`true`), in which case the trailing `DEDENT` terminates
+    /// the expression and the caller must not run a postfix chain — see [`Self::lhs`].
+    fn lambda(&mut self) -> (MarkClosed, bool) {
         let m = self.open();
         self.expect(FuncKw);
         self.opt_name();
@@ -913,8 +935,8 @@ impl Parser<'_> {
             self.type_ref();
         }
         self.expect(Colon);
-        self.block();
-        self.close(m, LambdaExpr)
+        let multiline = self.block();
+        (self.close(m, LambdaExpr), multiline)
     }
 
     fn preload_expr(&mut self) -> MarkClosed {

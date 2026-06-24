@@ -16,6 +16,10 @@ gdscript-base = { workspace = true }
 gdscript-syntax = { workspace = true }
 gdscript-api = { workspace = true }
 gdscript-db = { workspace = true }
+cstree = { workspace = true }
+text-size = { workspace = true }
+rustc-hash = { workspace = true }
+smol_str = { workspace = true }
 
 [lints]
 workspace = true
