@@ -460,6 +460,30 @@ mod tests {
     }
 
     #[test]
+    fn leading_utf8_bom_is_trivia_not_an_error() {
+        // A `.gd` saved with a UTF-8 BOM is valid GDScript (Godot strips it). The BOM must
+        // be lexed as trivia, round-trip byte-for-byte, and NOT produce a parse error at 1:1.
+        let src = "\u{feff}class_name Foo\nextends Node\n";
+        let parse = parse(src);
+        assert_eq!(
+            parse.syntax_node().to_string(),
+            src,
+            "BOM file must round-trip byte-for-byte"
+        );
+        assert!(
+            parse.errors().is_empty(),
+            "BOM-prefixed file should parse clean: {:?}",
+            parse.errors()
+        );
+        // The BOM does not shift the first declaration's indentation: `class_name` is at col 0.
+        assert!(
+            structure(src).starts_with("(SourceFile (ClassNameDecl"),
+            "{}",
+            structure(src)
+        );
+    }
+
+    #[test]
     fn multiline_lambda_does_not_absorb_following_paren_line() {
         // A block-body lambda assigned to a var, followed by a statement that begins with
         // `(`. The dedent ends the lambda; the `(...)` line is its OWN statement — it must

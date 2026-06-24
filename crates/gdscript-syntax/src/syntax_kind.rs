@@ -47,6 +47,11 @@ pub enum SyntaxKind {
     /// trivia for losslessness and emits a synthetic [`SyntaxKind::Newline`] where
     /// a statement actually terminates.
     NewlinePhys,
+    /// A UTF-8 byte-order mark (`U+FEFF`). Some editors prepend one to a saved `.gd`
+    /// file; Godot strips a leading BOM, so we keep it as its own trivia token (not
+    /// `Whitespace` — that would mis-count the first line's indentation by 3 bytes, and
+    /// not an `Error` — the file is valid GDScript).
+    Bom,
 
     // ---- tokens: synthetic block structure (zero-width; injected by the pre-pass) ----
     /// Logical statement terminator (outside brackets, not after a continuation).
@@ -374,6 +379,7 @@ impl SyntaxKind {
                 | Self::EndRegionComment
                 | Self::LineContinuation
                 | Self::NewlinePhys
+                | Self::Bom
         )
     }
 

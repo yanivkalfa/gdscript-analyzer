@@ -53,11 +53,12 @@ later.
 - [ ] **Statement-initial bare `match` is always the `match` statement.** `match(...)` /
       `match.x` used as an *identifier* at statement start isn't handled (needs lookahead
       in `stmt`). Rare; not seen in real corpora (member/`func` uses are handled).
-- [ ] **UTF-8 BOM at file start is not skipped.** A leading `U+FEFF` is lexed as an
-      unknown token, so the first declaration errors (`expected a declaration` at 1:1).
-      The fix needs a dedicated BOM trivia token (folding it into `Whitespace` miscounts
-      the indent column by its 3 bytes) plus `column`/`diagnose_indent` handling. Real:
-      some editors save `.gd` with a BOM (one file in the ReactiveUI-Godot corpus).
+- [x] **UTF-8 BOM at file start — FIXED.** A leading `U+FEFF` is now lexed as a dedicated
+      `Bom` trivia token (not `Whitespace`, so it does not mis-count the first line's indent;
+      not `Error`, since the file is valid GDScript). It round-trips byte-for-byte and the
+      first declaration parses clean. Regression test:
+      `leading_utf8_bom_is_trivia_not_an_error`. (Real: some editors save `.gd` with a BOM —
+      one file in the ReactiveUI-Godot corpus did, and it now analyzes clean.)
 
 ### IDE features (Tier 0 → Tier 1)
 - [ ] **Completions are not scope-aware.** By-name completion offers *every* document
