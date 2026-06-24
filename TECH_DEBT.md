@@ -183,10 +183,41 @@ later.
   corpus **57 → 57** (additive, 0 autoloads there); a real autoload subproject (godot-demo-projects
   `2d/physics_tests`, `Log`/`System` singletons) **0 panics**; an end-to-end public-API test resolves
   `Audio.volume()` (a no-`class_name` `*`-autoload) to a typed `: int` inlay.
+- **M5 — cross-file navigation (find-refs, rename, workspace symbols, goto-def) — EXITS PHASE 3.**
+  New `gdscript-hir/src/def.rs`: `GodotDef` (stable identity — `class_name` global → decl file;
+  member → owner file + name; local → body + decl range; autoload; engine) + `classify(db, pos)`,
+  the inverse of inference. `gdscript-ide/src/navigation.rs`: the four features with rust-analyzer's
+  **resolve-don't-string-match** discipline (word-boundary pre-filter → re-`classify` each candidate
+  → keep iff it equals the cursor's `GodotDef`). **Rename is correct-or-refuse** (zero false edits):
+  refuses on an autoload (its `project.godot` key isn't rewritten), on a method/var/signal whose name
+  appears as a project string literal (possible `connect`/`Callable`/scene-`[connection]` ref),
+  collisions (`WouldCollide`), invalid identifiers, and engine symbols. A `class_name` rename
+  **proceeds** (research finding: `.tscn`/`project.godot` reference scripts by *path*, the `.godot`
+  cache is *derived*). `SourceChange` became multi-file (`Vec<FileEdit>`); `goto_definition` now
+  returns `Vec<NavTarget>` (was a stub). No persisted reverse-index — on-demand folds over the
+  memoized queries (no new tracked query / invalidation edge). Found + fixed 3 real `classify` bugs
+  (decl/ref range consistency, the leading-whitespace `name_range` quirk, `self.member`). 5 def + 11
+  navigation + 1 e2e tests (incl. the adversarial same-name set). Reference corpus 57 → 57.
 
 ### Deferred / found
 - [x] **`extends "res://path.gd"` + `preload` need a `res://` → `FileId` map — DONE in M3** (above).
       `load(var)`/`load("lit")` stay opaque by design (D5).
+- [ ] **(M5) Scene/config rewriting deferred → rename refuses.** `.tscn`/`.tres` are not ingested
+      (scene crate is a Phase-4 stub) and `project.godot` is read-only to rename. Method/signal/
+      exported-var renames **refuse** on a detected same-named project string literal; autoload-name
+      renames refuse. **Known probabilistic gap:** a scene `[connection method="…"]` we cannot see
+      makes a method rename *appear* safe — we mitigate by refusing on any same-named `.gd` string,
+      but a pure-scene reference is invisible. Scene-aware rename = Phase 4/6.
+- [ ] **(M5) `classify` duplicates `infer.rs`'s name-lookup order.** Two copies of the local → member
+      → inherited → global → autoload → engine precedence (one returns a `Ty`, one a `GodotDef`).
+      Unify behind shared `def.rs` helpers once the Phase-2 byte-identical inference guarantee can be
+      re-validated. A `classify`↔`infer` agreement test on the corpus would guard the duplication.
+- [ ] **(M5) `Member`/`Global` find-refs scope is project-wide-candidates, not a precise referrer
+      graph.** Correct (the re-resolve confirms) but does wasted `classify`s on files that name-but-
+      don't-reference the symbol. A firewall-safe referrer reverse-index (keyed on `item_tree`, not
+      bodies) is a perf follow-up if the large-project benchmark regresses.
+- [ ] **(M5) `ReferenceKind::Write` not derived.** find-refs tags `Declaration` vs `Read` only;
+      assignment-LHS `Write` is a cheap follow-up off the lowered body.
 - [ ] **Scene (`.tscn`) autoloads resolve to the seam, not their scene-root type → Phase 4.** A
       `*`-autoload pointing at a `.tscn` is `Unknown` (member access is unchecked, never a false warn).
       Typing it as bare `Node` would *false-warn* on the root script's own members (`Music.play()`);
