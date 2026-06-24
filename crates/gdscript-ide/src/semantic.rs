@@ -30,6 +30,16 @@ fn to_base_range(r: text_size::TextRange) -> TextRange {
     TextRange::new(u32::from(r.start()), u32::from(r.end()))
 }
 
+/// A display label for a type. Resolves a `ScriptRef` to its `class_name` via the project
+/// registry (which [`Ty::label`] can't do — it has only the engine model). Other types defer to
+/// [`Ty::label`]; `Unknown`/`Error` stay elided.
+fn type_label(db: &dyn Db, api: &EngineApi, ty: &Ty) -> Option<String> {
+    if let Ty::ScriptRef(sref) = ty {
+        return queries::script_ref_name(db, *sref).map(|n| n.to_string());
+    }
+    ty.label(api)
+}
+
 // ---- diagnostics -------------------------------------------------------------------------
 
 /// The §5 type diagnostics for a file (merged into [`crate::Analysis::diagnostics`]).
@@ -53,7 +63,7 @@ pub fn hover(db: &dyn Db, file: FileText, offset: u32) -> Option<HoverResult> {
     // An expression under the cursor wins (most specific).
     if let Some(eid) = unit.body.source_map.expr_at_offset(offset)
         && let Some(ty) = unit.result.type_of(eid)
-        && let Some(label) = ty.label(api)
+        && let Some(label) = type_label(db, api, ty)
     {
         return Some(HoverResult {
             ty_label: Some(label),
@@ -64,7 +74,7 @@ pub fn hover(db: &dyn Db, file: FileText, offset: u32) -> Option<HoverResult> {
     // Otherwise a binding name (the declaration site of a local / param / for-var).
     let b = unit.result.binding_at(offset)?;
     Some(HoverResult {
-        ty_label: Some(b.ty.label(api)?),
+        ty_label: Some(type_label(db, api, &b.ty)?),
         doc: String::new(),
         range: b.name_range,
     })
@@ -90,7 +100,7 @@ pub fn inlay_hints(db: &dyn Db, file: FileText) -> Vec<InlayHint> {
                 BindingKind::Var => b.inferred_colon_eq,
                 BindingKind::Param | BindingKind::ForVar => true,
             };
-            if show && let Some(label) = b.ty.label(api) {
+            if show && let Some(label) = type_label(db, api, &b.ty) {
                 hints.push(InlayHint {
                     offset: b.name_range.end,
                     label: format!(": {label}"),
@@ -486,8 +496,18 @@ mod tests {
     fn db_ft(src: &str) -> (RootDatabase, FileText) {
         let mut db = RootDatabase::default();
         db.set_file_text(FileId(0), src, Durability::LOW);
+        db.sync_source_root(); // build the class_name registry, as apply_change does
         let ft = db.file_text(FileId(0)).unwrap();
         (db, ft)
+    }
+
+    #[test]
+    fn hover_on_user_class_shows_class_name() {
+        let src = "class_name Widget\nfunc f():\n\tvar w: Widget\n";
+        let offset = u32::try_from(src.find("w: Widget").unwrap()).unwrap();
+        let (db, ft) = db_ft(src);
+        let h = hover(&db, ft, offset).expect("hover");
+        assert_eq!(h.ty_label.as_deref(), Some("Widget"));
     }
 
     #[test]

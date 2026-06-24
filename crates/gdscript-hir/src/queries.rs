@@ -17,9 +17,11 @@ use gdscript_db::{Db, FileText, SourceRoot, parse};
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
+use gdscript_base::FileId;
+
 use crate::infer::FileInference;
 use crate::item_tree::{ItemTree, Member};
-use crate::ty::Ty;
+use crate::ty::{ScriptRefId, Ty};
 
 /// The item tree for `file` (signatures only — the body-edit firewall). Memoized; recomputes
 /// when the parse changes but backdates when the resulting signatures are unchanged.
@@ -119,6 +121,15 @@ impl ScriptClass {
     pub fn member(&self, name: &str) -> Option<&MemberSig> {
         self.members.get(name)
     }
+}
+
+/// The `class_name` behind a [`ScriptRef`](crate::ty::Ty::ScriptRef), for display (hover /
+/// inlay). `Ty::label` cannot resolve this on its own — it has only the engine model, not the
+/// project registry.
+#[must_use]
+pub fn script_ref_name(db: &dyn Db, sref: ScriptRefId) -> Option<SmolStr> {
+    let file = db.file_text(FileId(sref.0))?;
+    file_class_name(db, file)
 }
 
 /// The member table of the script in `file`. Member types are resolved against the engine model
