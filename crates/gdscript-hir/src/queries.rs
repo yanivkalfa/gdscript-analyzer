@@ -18,7 +18,8 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 use crate::infer::FileInference;
-use crate::item_tree::ItemTree;
+use crate::item_tree::{ItemTree, Member};
+use crate::ty::Ty;
 
 /// The item tree for `file` (signatures only — the body-edit firewall). Memoized; recomputes
 /// when the parse changes but backdates when the resulting signatures are unchanged.
@@ -89,6 +90,64 @@ pub fn global_registry(db: &dyn Db, root: SourceRoot) -> Arc<GlobalRegistry> {
         }
     }
     Arc::new(GlobalRegistry { classes })
+}
+
+/// One member of a script class, as a cross-file reference sees it (a resolved type, never a
+/// byte range).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberSig {
+    /// A method — its resolved return type.
+    Method(Ty),
+    /// A `var` / `const` — its resolved type.
+    Field(Ty),
+    /// A signal.
+    Signal,
+}
+
+/// A script class's own members, by name — the **offset-free projection** a cross-file
+/// reference resolves against. Reads only `item_tree` signatures (+ annotation resolution),
+/// never bodies or byte ranges, so it backdates on body edits (the cross-file firewall). M1
+/// covers the script's *own* members; inherited (base-chain) members are M2.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScriptClass {
+    members: FxHashMap<SmolStr, MemberSig>,
+}
+
+impl ScriptClass {
+    /// The signature of the member named `name`, if the class declares one.
+    #[must_use]
+    pub fn member(&self, name: &str) -> Option<&MemberSig> {
+        self.members.get(name)
+    }
+}
+
+/// The member table of the script in `file`. Member types are resolved against the engine model
+/// and the registry (a member typed as another `class_name` resolves to its `ScriptRef`).
+#[salsa::tracked]
+pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
+    let tree = item_tree(db, file);
+    let Some(api) = db.engine() else {
+        return Arc::new(ScriptClass::default());
+    };
+    let resolve_ann = |ann: Option<&str>| -> Ty {
+        ann.map_or(Ty::Variant, |t| {
+            crate::resolve::resolve_type_name(db, api, t)
+        })
+    };
+    let mut members = FxHashMap::default();
+    for m in &tree.members {
+        let Some(name) = m.name() else { continue };
+        let sig = match m {
+            Member::Func(f) => MemberSig::Method(resolve_ann(f.return_type.as_deref())),
+            Member::Var(v) => MemberSig::Field(resolve_ann(v.type_ref.as_deref())),
+            Member::Const(c) => MemberSig::Field(resolve_ann(c.type_ref.as_deref())),
+            Member::Signal(_) => MemberSig::Signal,
+            // Enums + inner classes aren't modeled as instance members yet (M2+).
+            Member::Enum(_) | Member::Class(_) => continue,
+        };
+        members.insert(SmolStr::new(name), sig);
+    }
+    Arc::new(ScriptClass { members })
 }
 
 #[cfg(test)]
@@ -240,6 +299,68 @@ mod tests {
             REGISTRY_OBSERVED.load(Ordering::SeqCst),
             runs,
             "REGRESSION: a body edit re-ran a global_registry consumer — the cross-file firewall broke",
+        );
+    }
+
+    #[test]
+    fn cross_file_class_name_member_resolves() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name Widget\nfunc make() -> int:\n\treturn 5\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(1),
+            "func use_it():\n\tvar w := Widget.make()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+
+        let file1 = db.file_text(FileId(1)).unwrap();
+        let fi = analyze_file(&db, file1);
+        let api = db.engine().unwrap();
+
+        // `w := Widget.make()` resolves `Widget` (a cross-file class_name) to its ScriptRef, then
+        // its `make` method to its `int` return type.
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("a unit with a binding");
+        assert_eq!(
+            unit.result.bindings[0].ty.label(api).as_deref(),
+            Some("int")
+        );
+        assert!(
+            fi.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            fi.diagnostics
+        );
+    }
+
+    #[test]
+    fn unknown_member_on_script_ref_is_seam_not_warning() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name Widget\nfunc make() -> int:\n\treturn 5\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(1),
+            "func use_it():\n\tWidget.not_a_member()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+
+        let file1 = db.file_text(FileId(1)).unwrap();
+        let fi = analyze_file(&db, file1);
+        // A member we don't model is the seam (Unknown) — never UNSAFE_METHOD_ACCESS.
+        assert!(
+            fi.diagnostics.is_empty(),
+            "a missing member on a ScriptRef must not warn: {:?}",
+            fi.diagnostics
         );
     }
 }

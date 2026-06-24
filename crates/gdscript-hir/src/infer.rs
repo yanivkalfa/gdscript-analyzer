@@ -10,7 +10,7 @@
 //! (which lands on `Unknown` via the seam) produces zero false diagnostics.
 
 use gdscript_api::{EngineApi, MemberRef, TyRef};
-use gdscript_base::{Diagnostic, DiagnosticSource, Severity, TextRange};
+use gdscript_base::{Diagnostic, DiagnosticSource, FileId, Severity, TextRange};
 use gdscript_db::Db;
 use gdscript_syntax::GdNode;
 use rustc_hash::FxHashMap;
@@ -22,7 +22,7 @@ use crate::body::{self, BinOp, Body, Expr, ExprId, Literal, ParamBinding, Stmt, 
 use crate::cst::{self, AstPtr};
 use crate::item_tree::{ItemTree, Member, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
-use crate::ty::{self, Assign, EnumRef, Ty};
+use crate::ty::{self, Assign, EnumRef, ScriptRefId, Ty};
 
 // ---- diagnostic codes + message templates (Playbook §5, engine-matching) -----------------
 
@@ -868,7 +868,30 @@ impl Cx<'_> {
             }
             // Enum value access (`MyEnum.VALUE`) is an `int`.
             Ty::Enum(_) => self.int_ty(),
+            // A cross-file script reference: resolve the member against its (own) member table.
+            Ty::ScriptRef(sref) => self.script_member_ty(*sref, name, as_method),
             _ => Ty::Variant,
+        }
+    }
+
+    /// A member of a cross-file script (`ScriptRef`): looked up in the script's own member table
+    /// (M1). A member we don't model — e.g. one inherited from a base we don't resolve until M2 —
+    /// yields the seam (`Unknown`), **never** an `UNSAFE_*` warning. `Class.new(...)` constructs
+    /// an instance of the class.
+    fn script_member_ty(&self, sref: ScriptRefId, name: &str, as_method: bool) -> Ty {
+        if name == "new" {
+            return Ty::ScriptRef(sref);
+        }
+        let Some(file) = self.db.file_text(FileId(sref.0)) else {
+            return Ty::Unknown;
+        };
+        match crate::queries::script_class(self.db, file).member(name) {
+            Some(crate::queries::MemberSig::Method(ret)) if as_method => ret.clone(),
+            // A method referenced as a value is a `Callable`.
+            Some(crate::queries::MemberSig::Method(_)) => Ty::Callable,
+            Some(crate::queries::MemberSig::Field(t)) => t.clone(),
+            Some(crate::queries::MemberSig::Signal) => Ty::Signal(None),
+            None => Ty::Unknown,
         }
     }
 
@@ -1081,8 +1104,13 @@ impl Cx<'_> {
         if let Some(g) = resolve::resolve_global(self.api, name) {
             return global_ty(&g);
         }
-        // An unknown bare identifier is most likely a global we don't model → seam.
-        Ty::Unknown
+        // A project-global `class_name` used as a value — the class itself, for static access
+        // (`V.fc()`) or as a constructor (`Player.new()`). Resolves to a `ScriptRef` via the
+        // registry, or falls back to the seam for a global we don't model.
+        resolve::resolve_external(
+            self.db,
+            &resolve::ExternalRef::ClassName(SmolStr::new(name)),
+        )
     }
 
     fn own_member_ty(&self, item: ClassItem, as_method: bool) -> Ty {

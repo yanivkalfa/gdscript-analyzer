@@ -16,7 +16,7 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 use crate::item_tree::{ExtendsRef, ItemTree, Member};
-use crate::ty::{EnumRef, Ty};
+use crate::ty::{EnumRef, ScriptRefId, Ty};
 
 /// A reference that *would* require another file to resolve — the Phase-3 boundary. Phase 2
 /// never reaches across files, so every variant resolves to the same non-cascading
@@ -39,8 +39,28 @@ pub enum ExternalRef {
 /// hover. Funnel every "would need another file" path through here so Phase 3 has exactly one
 /// function to reimplement.
 #[must_use]
-pub fn resolve_external(_db: &dyn Db, _r: &ExternalRef) -> Ty {
-    Ty::Unknown
+pub fn resolve_external(db: &dyn Db, r: &ExternalRef) -> Ty {
+    match r {
+        // M1: a project-global `class_name` → its script reference.
+        ExternalRef::ClassName(name) => resolve_class_name(db, name),
+        // `extends "res://…"` / `preload` / autoload are lit up in M2 / M3 / M4.
+        ExternalRef::ExtendsPath(_) | ExternalRef::Preload(_) | ExternalRef::Autoload(_) => {
+            Ty::Unknown
+        }
+    }
+}
+
+/// Resolve a global `class_name` against the project registry (M1): the script's
+/// [`Ty::ScriptRef`], or the seam ([`Ty::Unknown`]) when no project is loaded or the name is not
+/// a registered global class. The `ScriptRefId` is the declaring file's `FileId`.
+fn resolve_class_name(db: &dyn Db, name: &str) -> Ty {
+    let Some(root) = db.source_root() else {
+        return Ty::Unknown;
+    };
+    match crate::queries::global_registry(db, root).resolve(name) {
+        Some(file) => Ty::ScriptRef(ScriptRefId(file.file_id(db).0)),
+        None => Ty::Unknown,
+    }
 }
 
 // ---- type-annotation resolution ----------------------------------------------------------
