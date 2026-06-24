@@ -39,6 +39,9 @@ pub trait Db: salsa::Database {
     /// The bundled engine model, or `None` on `wasm32` (no embedded blob — the host wires the
     /// fetched blob in via `EngineApi::from_bytes` in Phase 5).
     fn engine(&self) -> Option<&'static EngineApi>;
+    /// The project's file set, or `None` before any file has been applied. Project-wide queries
+    /// (the global `class_name` registry) take this as their salsa-tracked input.
+    fn source_root(&self) -> Option<SourceRoot>;
 }
 
 /// The VFS leaf: one file's UTF-8 text, as a salsa input, plus its [`FileId`] (so a query
@@ -50,6 +53,17 @@ pub struct FileText {
     pub text: Arc<str>,
     /// The opaque file id this text belongs to.
     pub file_id: FileId,
+}
+
+/// The project's file set — a salsa input so project-wide queries (the global `class_name`
+/// registry, M1) iterate the files incrementally. It changes only when a file is **added or
+/// removed**, never on a body edit, and is held at MEDIUM durability — so a keystroke (a `LOW`
+/// change) never invalidates project-wide derived data.
+#[salsa::input]
+pub struct SourceRoot {
+    /// Every file currently in the project, ordered by `FileId` for determinism.
+    #[returns(ref)]
+    pub files: Vec<FileText>,
 }
 
 /// The `FileId → FileText` side table. `Arc`-backed so a cheap clone shares the same map —
@@ -89,6 +103,14 @@ impl Files {
     pub fn remove(&self, file: FileId) {
         self.inner.remove(&file);
     }
+
+    /// Every file, ordered by `FileId` — the deterministic input to project-wide queries.
+    fn all(&self) -> Vec<FileText> {
+        let mut v: Vec<(FileId, FileText)> =
+            self.inner.iter().map(|r| (*r.key(), *r.value())).collect();
+        v.sort_by_key(|(id, _)| *id);
+        v.into_iter().map(|(_, ft)| ft).collect()
+    }
 }
 
 /// Parse a file to its lossless CST. Memoized; re-parses only when the file text changes.
@@ -103,6 +125,9 @@ pub fn parse(db: &dyn Db, file: FileText) -> Parse {
 pub struct RootDatabase {
     storage: salsa::Storage<Self>,
     files: Files,
+    /// The project file-set input (lazily created on the first file change). Held outside salsa
+    /// as a handle so `apply_change` can update it.
+    root: Option<SourceRoot>,
 }
 
 // `salsa::Storage` is not `Debug`, but the public `AnalysisHost`/`Analysis` that will own a
@@ -126,6 +151,24 @@ impl RootDatabase {
     pub fn remove_file(&mut self, file: FileId) {
         self.files.remove(file);
     }
+
+    /// Rebuild the project file-set input from the current side table. Call this from
+    /// `apply_change` **only when a file was added or removed** — never on a body edit — so the
+    /// MEDIUM-durability project input (and everything derived from it) stays stable across
+    /// keystrokes.
+    pub fn sync_source_root(&mut self) {
+        let files = self.files.all();
+        if let Some(root) = self.root {
+            root.set_files(self)
+                .with_durability(Durability::MEDIUM)
+                .to(files);
+        } else {
+            let root = SourceRoot::builder(files)
+                .durability(Durability::MEDIUM)
+                .new(self);
+            self.root = Some(root);
+        }
+    }
 }
 
 #[salsa::db]
@@ -148,6 +191,10 @@ impl Db for RootDatabase {
         {
             None
         }
+    }
+
+    fn source_root(&self) -> Option<SourceRoot> {
+        self.root
     }
 }
 

@@ -13,7 +13,9 @@
 
 use std::sync::Arc;
 
-use gdscript_db::{Db, FileText, parse};
+use gdscript_db::{Db, FileText, SourceRoot, parse};
+use rustc_hash::FxHashMap;
+use smol_str::SmolStr;
 
 use crate::infer::FileInference;
 use crate::item_tree::ItemTree;
@@ -36,6 +38,56 @@ pub fn analyze_file(db: &dyn Db, file: FileText) -> Arc<FileInference> {
         )),
         None => Arc::new(FileInference::default()),
     }
+}
+
+/// The project-wide global `class_name` registry: each registered name → the file declaring it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GlobalRegistry {
+    classes: FxHashMap<SmolStr, FileText>,
+}
+
+impl GlobalRegistry {
+    /// The file declaring `name` as a global `class_name`, if any.
+    #[must_use]
+    pub fn resolve(&self, name: &str) -> Option<FileText> {
+        self.classes.get(name).copied()
+    }
+
+    /// The number of registered global classes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.classes.len()
+    }
+
+    /// Whether no global class is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.classes.is_empty()
+    }
+}
+
+/// A file's `class_name`, if it declares one — the **offset-free projection** of its item tree
+/// that [`global_registry`] depends on. It reads only `item_tree(file).class_name` (never a byte
+/// range), so a body edit re-runs `item_tree` but this query *backdates* (its value is
+/// unchanged), leaving the registry — and everything cross-file — undisturbed by a keystroke.
+#[salsa::tracked]
+pub fn file_class_name(db: &dyn Db, file: FileText) -> Option<SmolStr> {
+    item_tree(db, file).class_name.clone()
+}
+
+/// The project-wide global `class_name` registry. Keyed on the [`SourceRoot`] file-set input and
+/// the per-file [`file_class_name`] projections. A duplicate `class_name` keeps the first by
+/// `FileId` order (the file set is sorted), so resolution is deterministic. (Collision
+/// diagnostics are an M1 follow-up.)
+#[salsa::tracked]
+pub fn global_registry(db: &dyn Db, root: SourceRoot) -> Arc<GlobalRegistry> {
+    let mut classes = FxHashMap::default();
+    for &file in root.files(db) {
+        if let Some(name) = file_class_name(db, file) {
+            classes.entry(name).or_insert(file);
+        }
+    }
+    Arc::new(GlobalRegistry { classes })
 }
 
 #[cfg(test)]
@@ -121,26 +173,72 @@ mod tests {
     }
 
     #[test]
-    fn length_changing_body_edit_breaks_backdating_until_m1() {
-        // KNOWN LIMITATION (Playbook §8 / M1): `ItemTree` members store absolute byte ranges
-        // (AstPtr/range), so a body edit that changes byte length shifts later members' offsets,
-        // making the item_tree value differ and defeating backdating. M1's offset-free
-        // `item_signatures` projection (positional AstIds) fixes this so the firewall holds for
-        // ALL edits. This test PINS the current behavior so the M1 fix is a visible improvement.
+    fn global_registry_resolves_class_names_across_files() {
         let mut db = RootDatabase::default();
-        db.set_file_text(FileId(0), "func f():\n\tvar a := 1\n", Durability::LOW);
-        let ft = db.file_text(FileId(0)).unwrap();
-        let _ = class_name_witness(&db, ft);
-        let runs = WITNESS_RUNS.load(Ordering::SeqCst);
+        db.set_file_text(
+            FileId(0),
+            "class_name Player\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(1),
+            "class_name Enemy\nvar hp := 10\n",
+            Durability::LOW,
+        );
+        db.set_file_text(FileId(2), "func no_class():\n\tpass\n", Durability::LOW);
+        db.sync_source_root();
+        let root = db.source_root().unwrap();
 
-        // A length-CHANGING body edit (`1` -> `100`) shifts the enclosing decl's end range.
-        db.set_file_text(FileId(0), "func f():\n\tvar a := 100\n", Durability::LOW);
-        let _ = class_name_witness(&db, ft);
+        let reg = global_registry(&db, root);
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.resolve("Player"), db.file_text(FileId(0)));
+        assert_eq!(reg.resolve("Enemy"), db.file_text(FileId(1)));
+        assert!(reg.resolve("Nonexistent").is_none());
+    }
 
+    // The TRUE downstream firewall (the M1 reframe of the pinned M0 limitation): a body edit must
+    // not invalidate the project-wide registry. `file_class_name` is offset-free, so even a
+    // *length-changing* body edit — which shifts `item_tree`'s byte ranges and forces it to
+    // re-execute — leaves `file_class_name` backdating (its value, the class name, is unchanged).
+    // The registry, and every consumer of it, is therefore untouched by a keystroke.
+
+    static REGISTRY_OBSERVED: AtomicU32 = AtomicU32::new(0);
+
+    /// Test-only consumer of the registry; re-runs iff the registry's value actually changes.
+    #[salsa::tracked]
+    fn observe_registry(db: &dyn gdscript_db::Db, root: SourceRoot) -> usize {
+        REGISTRY_OBSERVED.fetch_add(1, Ordering::SeqCst);
+        global_registry(db, root).len()
+    }
+
+    #[test]
+    fn body_edit_does_not_invalidate_the_global_registry() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name Player\nfunc f():\n\tvar a := 1\n",
+            Durability::LOW,
+        );
+        db.set_file_text(FileId(1), "class_name Enemy\n", Durability::LOW);
+        db.sync_source_root();
+        let root = db.source_root().unwrap();
+
+        assert_eq!(observe_registry(&db, root), 2);
+        let runs = REGISTRY_OBSERVED.load(Ordering::SeqCst);
+
+        // A length-CHANGING body edit (`1` -> `123456`) — NO sync_source_root (a body edit is not
+        // a structure change). The class name is unchanged, so the registry must not recompute.
+        db.set_file_text(
+            FileId(0),
+            "class_name Player\nfunc f():\n\tvar a := 123456\n",
+            Durability::LOW,
+        );
+
+        assert_eq!(observe_registry(&db, root), 2);
         assert_eq!(
-            WITNESS_RUNS.load(Ordering::SeqCst),
-            runs + 1,
-            "expected the documented pre-M1 limitation: a length-changing body edit re-runs item_tree consumers",
+            REGISTRY_OBSERVED.load(Ordering::SeqCst),
+            runs,
+            "REGRESSION: a body edit re-ran a global_registry consumer — the cross-file firewall broke",
         );
     }
 }

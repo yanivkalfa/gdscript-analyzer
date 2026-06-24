@@ -81,11 +81,21 @@ impl AnalysisHost {
     /// bumps the salsa revision (and cancels any in-flight reads on outstanding [`Analysis`]
     /// handles). Edited files are `LOW` durability (they change every keystroke).
     pub fn apply_change(&mut self, change: Change) {
+        let mut structure_changed = false;
         for (id, text) in change.files {
-            match text {
-                Some(t) => self.db.set_file_text(id, &t, Durability::LOW),
-                None => self.db.remove_file(id),
+            if let Some(t) = text {
+                // A file the project hasn't seen before changes the file *set*.
+                structure_changed |= self.db.file_text(id).is_none();
+                self.db.set_file_text(id, &t, Durability::LOW);
+            } else {
+                structure_changed |= self.db.file_text(id).is_some();
+                self.db.remove_file(id);
             }
+        }
+        // Rebuild the project file-set input ONLY on add/remove — never on a body edit — so the
+        // MEDIUM-durability registry stays firewalled against keystrokes.
+        if structure_changed {
+            self.db.sync_source_root();
         }
     }
 
