@@ -18,6 +18,7 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 use gdscript_base::FileId;
+use gdscript_scene::{NodeIdx, SceneModel};
 
 use crate::infer::FileInference;
 use crate::item_tree::{ItemTree, Member};
@@ -239,6 +240,85 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
     // into the inheritance chain; an engine `Object` ends it at the API table.
     let base = crate::resolve::resolve_base(db, api, &tree);
     Arc::new(ScriptClass { members, base })
+}
+
+// ---- M1: scenes (.tscn/.tres) ------------------------------------------------------------
+
+/// Whether a `res://` path is a *text* scene/resource we parse (`.tscn`/`.tres`). Binary
+/// `.scn`/`.res` are detected-and-degraded by the parser, but we don't waste a parse on a `.gd`.
+fn is_scene_path(path: &str) -> bool {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    ext.eq_ignore_ascii_case("tscn") || ext.eq_ignore_ascii_case("tres")
+}
+
+/// The parsed [`SceneModel`] for `file` (M1) — memoized; recomputes only when the file text
+/// changes. A non-scene file (a `.gd`, or no `res://` path) yields an empty model (so the query is
+/// total). The pure `gdscript_scene::parse_scene` is the cache body; this just wraps + gates it.
+#[salsa::tracked]
+pub fn scene_model(db: &dyn Db, file: FileText) -> Arc<SceneModel> {
+    let is_scene = file.res_path(db).as_deref().is_some_and(is_scene_path);
+    if is_scene {
+        Arc::new(gdscript_scene::parse_scene(file.text(db)))
+    } else {
+        Arc::new(gdscript_scene::parse_scene(""))
+    }
+}
+
+/// Where a script (`.gd`) is attached in a scene: the owning scene file + the node carrying the
+/// `script = ExtResource(...)`. `$Path` in that script resolves relative to this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneAttach {
+    /// The owning scene's file.
+    pub scene: FileId,
+    /// The node the script attaches to (the `$`-path base).
+    pub node: NodeIdx,
+}
+
+/// The project-wide **script → owning scene** index (M1): each `.gd`'s `res://` path → the (first)
+/// scene + node that attaches it. Built by scanning every scene's `ext_resources` for a
+/// `type="Script"` reference. Keyed on the [`SourceRoot`] file-set + each scene file's text (via
+/// [`scene_model`]); a `.gd` **body** edit never touches a `.tscn` text, so this **backdates across
+/// `.gd` keystrokes** — the firewall (a scene edit correctly invalidates it). A duplicate (one
+/// script in many scenes) keeps the first by `FileId` order (the slice's single-scene policy).
+#[salsa::tracked]
+pub fn script_scene_index(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolStr, SceneAttach>> {
+    let mut map: FxHashMap<SmolStr, SceneAttach> = FxHashMap::default();
+    for &file in root.files(db) {
+        if !file.res_path(db).as_deref().is_some_and(is_scene_path) {
+            continue;
+        }
+        let model = scene_model(db, file);
+        let scene = file.file_id(db);
+        for (i, node) in model.nodes.iter().enumerate() {
+            let Some(script_id) = node.script.as_ref() else {
+                continue;
+            };
+            let Some(path) = model
+                .ext_resources
+                .get(script_id)
+                .and_then(|e| e.path.clone())
+            else {
+                continue;
+            };
+            map.entry(path).or_insert(SceneAttach {
+                scene,
+                node: NodeIdx(u32::try_from(i).unwrap_or(u32::MAX)),
+            });
+        }
+    }
+    Arc::new(map)
+}
+
+/// The owning-scene context for the script in `file` (M1): the parsed scene + the attach node, so
+/// `$Path`/`%Unique`/`get_node("…")` can resolve. `None` when the project has no scene attaching
+/// this script (the overwhelmingly common single-file / dynamic-UI case → node paths stay `Node`).
+#[must_use]
+pub fn scene_context(db: &dyn Db, file: FileText) -> Option<(Arc<SceneModel>, NodeIdx)> {
+    let res_path = file.res_path(db)?;
+    let root = db.source_root()?;
+    let attach = *script_scene_index(db, root).get(res_path.as_str())?;
+    let scene_file = db.file_text(attach.scene)?;
+    Some((scene_model(db, scene_file), attach.node))
 }
 
 #[cfg(test)]
@@ -1039,5 +1119,148 @@ mod tests {
             "expected both own_m() calls to type as String (narrow-down + widen-only), got {strings}",
         );
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    // ---- M1: scene-aware node-path typing ($Path / %Unique) -------------------------------
+
+    /// A db with file 0 = a scene and file 1 = its attached script, both with res:// paths.
+    fn scene_db(scene_text: &str, gd_text: &str) -> RootDatabase {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), scene_text, Durability::LOW);
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(FileId(1), gd_text, Durability::LOW);
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.sync_source_root();
+        db
+    }
+
+    fn binding_labels(db: &RootDatabase) -> Vec<String> {
+        let api = db.engine().unwrap();
+        let fi = analyze_file(db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            fi.diagnostics.is_empty(),
+            "unexpected diags: {:?}",
+            fi.diagnostics
+        );
+        fi.units
+            .iter()
+            .flat_map(|u| &u.result.bindings)
+            .filter_map(|b| b.ty.label(api))
+            .collect()
+    }
+
+    const SCENE: &str = "[gd_scene format=3]\n\
+        [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+        [node name=\"Root\" type=\"Control\"]\n\
+        script = ExtResource(\"1\")\n\
+        [node name=\"Panel\" type=\"Panel\" parent=\".\"]\n\
+        [node name=\"Box\" type=\"VBoxContainer\" parent=\"Panel\"]\n\
+        [node name=\"Btn\" type=\"Button\" parent=\"Panel/Box\"]\n\
+        unique_name_in_owner = true\n";
+
+    #[test]
+    fn dollar_path_types_to_the_concrete_node() {
+        // `$Panel/Box/Btn` → Button (not bare Node) — the killer feature, zero annotations.
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar b := $Panel/Box/Btn\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "$Panel/Box/Btn should type as Button",
+        );
+    }
+
+    #[test]
+    fn unique_name_path_types_to_the_concrete_node() {
+        // `%Btn` resolves via unique_name_in_owner → Button.
+        let db = scene_db(SCENE, "extends Control\nfunc _ready():\n\tvar b := %Btn\n");
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "%Btn should type as Button"
+        );
+    }
+
+    #[test]
+    fn onready_var_from_a_node_path_is_typed() {
+        // `@onready var x := $Path` types `x` from the resolved node at the decl site. (`:=` is the
+        // typed form; plain `=` stays `Variant` per Godot's gradual typing — Phase-2 rule.)
+        let db = scene_db(
+            SCENE,
+            "extends Control\n@onready var btn := $Panel/Box/Btn\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "@onready var := $Path should type to Button",
+        );
+    }
+
+    #[test]
+    fn get_node_string_literal_types_like_dollar() {
+        // `get_node("Panel/Box/Btn")` (string literal) types identically to `$Panel/Box/Btn`.
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar b := get_node(\"Panel/Box/Btn\")\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "get_node(\"...\") should type as Button",
+        );
+    }
+
+    #[test]
+    fn attached_script_refines_the_node_type() {
+        // A node `type="Button"` + `script=Fancy.gd (class_name Fancy)` → `$That` is `Fancy`, so
+        // `$That.fancy()` resolves to its cross-file return type (proving the script refine).
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"Script\" path=\"res://fancy.gd\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"That\" type=\"Button\" parent=\".\"]\n\
+             script = ExtResource(\"2\")\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar n := $That.fancy()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_file_text(
+            FileId(2),
+            "class_name Fancy\nextends Button\nfunc fancy() -> int:\n\treturn 1\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://fancy.gd");
+        db.sync_source_root();
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "int"),
+            "$That.fancy() should resolve via the attached script Fancy",
+        );
+    }
+
+    #[test]
+    fn computed_or_unresolvable_node_path_stays_node_without_warning() {
+        // A computed `get_node(var)` and a `$Nope` with no owning scene both stay `Node` — never a
+        // false node-path warning.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(1),
+            "extends Node\nfunc f(p):\n\tvar a := get_node(p)\n\tvar b := $Nope\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://lone.gd");
+        db.sync_source_root();
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            fi.diagnostics.is_empty(),
+            "no false node-path warnings: {:?}",
+            fi.diagnostics
+        );
     }
 }

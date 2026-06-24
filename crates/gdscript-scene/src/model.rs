@@ -31,7 +31,8 @@ pub enum SceneKind {
 
 /// One parsed `.tscn`/`.tres`. Produced by [`crate::parse_scene`]; **never** an `Err` — every
 /// malformed/binary/unknown form degrades to an empty-or-partial model plus a [`SceneProblem`].
-#[derive(Debug, Clone)]
+/// `PartialEq`/`Eq` so it can be a backdated salsa query result (`Arc<SceneModel>`) in M1.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneModel {
     /// Scene vs resource (from the header tag).
     pub kind: SceneKind,
@@ -70,7 +71,7 @@ pub struct SceneModel {
 }
 
 /// One `[node …]` section: its header attributes + the two body properties we read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneNode {
     /// The node name (unescaped; may contain spaces).
     pub name: SmolStr,
@@ -97,7 +98,7 @@ pub struct SceneNode {
 }
 
 /// An `[ext_resource …]` declaration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtResource {
     /// `type="Script" | "PackedScene" | "Texture2D" | …`.
     pub res_type: SmolStr,
@@ -110,7 +111,7 @@ pub struct ExtResource {
 }
 
 /// A `[sub_resource …]` declaration (type only — the value body is skipped).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubResource {
     /// `type="…"`.
     pub res_type: SmolStr,

@@ -540,6 +540,7 @@ dependencies = [
  "gdscript-api",
  "gdscript-base",
  "gdscript-db",
+ "gdscript-scene",
  "gdscript-syntax",
  "rustc-hash",
  "salsa",

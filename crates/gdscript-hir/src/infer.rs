@@ -12,6 +12,7 @@
 use gdscript_api::{EngineApi, MemberRef, TyRef};
 use gdscript_base::{Diagnostic, DiagnosticSource, FileId, Severity, TextRange};
 use gdscript_db::Db;
+use gdscript_scene::{NodeIdx, SceneModel, SceneNode};
 use gdscript_syntax::GdNode;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
@@ -678,8 +679,9 @@ impl Cx<'_> {
                     None => Ty::Unknown,
                 }
             }
-            // `$Node`/`%Unique`/`get_node()` are always `Object(Node)` (Playbook §2).
-            Expr::GetNode => self.node_ty(),
+            // `$Path`/`%Unique` — resolve the literal path against the owning scene to the node's
+            // concrete type (Phase-4 M1); a computed/unresolvable path stays `Object(Node)`.
+            Expr::GetNode { path, unique } => self.resolve_node_path(path.as_deref(), unique),
         }
     }
 
@@ -705,6 +707,67 @@ impl Cx<'_> {
         self.api
             .class_by_name("Node")
             .map_or(Ty::Unknown, Ty::Object)
+    }
+
+    // ---- scene-aware node-path typing (Phase-4 M1) ----
+
+    /// Resolve a `$Path`/`%Unique` literal node path against the owning scene to the node's concrete
+    /// type. A computed (`None`) path, no owning scene, or an unresolvable path all degrade to
+    /// `Object(Node)` — never a false positive (the floor matches the engine's `Node`-everywhere).
+    fn resolve_node_path(&self, path: Option<&str>, unique: bool) -> Ty {
+        let fallback = self.node_ty();
+        let Some(path) = path else {
+            return fallback; // computed `get_node(var)` — stays `Node`
+        };
+        let Some((scene, attach)) = self.owning_scene() else {
+            return fallback; // no scene attaches this script (dynamic UI / single-file)
+        };
+        let idx = if unique {
+            scene.resolve_unique(path)
+        } else {
+            scene.resolve_path_from(attach, path)
+        };
+        let Some(node) = idx.and_then(|i| scene.node(i)) else {
+            return fallback; // unresolvable path → `Node`, never an INVALID warning in M1
+        };
+        self.scene_node_ty(&scene, node).unwrap_or(fallback)
+    }
+
+    /// The owning scene + the script's attach node for the current file. Recovered from `self_ty`,
+    /// which `analyze_file` sets to the file's own `ScriptRef` (so no extra `FileId` threading).
+    fn owning_scene(&self) -> Option<(Arc<SceneModel>, NodeIdx)> {
+        let Ty::ScriptRef(sref) = &self.self_ty else {
+            return None;
+        };
+        let ft = self.db.file_text(FileId(sref.0))?;
+        crate::queries::scene_context(self.db, ft)
+    }
+
+    /// The concrete `Ty` of a scene node: an attached script's own class (most specific) wins; else
+    /// the declared `type=` (native class or `class_name`). `None` for an instanced/unknown node
+    /// (the caller degrades to `Node` — sub-scene recursion is the M2+ hard tail).
+    fn scene_node_ty(&self, scene: &SceneModel, node: &SceneNode) -> Option<Ty> {
+        if let Some(script_ty) = self.node_script_ref(scene, node) {
+            return Some(script_ty);
+        }
+        let decl = node.decl_type.as_ref()?;
+        let ty = resolve::resolve_type_name(self.db, self.api, decl);
+        (!ty.is_uninformative()).then_some(ty)
+    }
+
+    /// The `ScriptRef` of a node's attached `.gd` script (`script = ExtResource(id)` → its `res://`
+    /// path → `FileId`), or `None` if it has no resolvable external script.
+    fn node_script_ref(&self, scene: &SceneModel, node: &SceneNode) -> Option<Ty> {
+        let path = scene
+            .ext_resources
+            .get(node.script.as_ref()?)?
+            .path
+            .as_ref()?;
+        let root = self.db.source_root()?;
+        let file = crate::queries::res_path_registry(self.db, root)
+            .get(path.as_str())
+            .copied()?;
+        Some(Ty::ScriptRef(ScriptRefId(file.0)))
     }
 
     fn infer_bin(&mut self, id: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Ty {

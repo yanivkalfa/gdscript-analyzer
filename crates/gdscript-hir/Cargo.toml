@@ -16,6 +16,7 @@ gdscript-base = { workspace = true }
 gdscript-syntax = { workspace = true }
 gdscript-api = { workspace = true }
 gdscript-db = { workspace = true }
+gdscript-scene = { workspace = true }
 salsa = { workspace = true }
 cstree = { workspace = true }
 text-size = { workspace = true }

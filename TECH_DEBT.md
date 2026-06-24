@@ -40,6 +40,51 @@ matrix + a vendored real-file corpus), and **524/524 godot-demo-projects scenes 
       `crates/gdscript-scene/tests/corpus/`; the broad robustness run is ad hoc via
       `cargo run -p gdscript-scene --example scene_corpus -- <dir>` (not in CI).
 
+### M0 adversarial bug hunt (5-finder → 3-vote verify) — fixed + deferred
+The post-M0 hunt (9 confirmed, 6 rejected; never-panic + UTF-8 safety signed off) fixed:
+- [x] **`..`/absolute (`/root/…`) parent paths false-flagged `DanglingParent`.** Spec §5/§7 say these
+      degrade silently. `walk_path` now returns a 3-state `Walk { Resolved | Escaped | Missed }`;
+      only a genuine `Missed` is a candidate dangling. (Found 4× independently.)
+- [x] **`instance_is_inherited_root` set on spurious extra roots** in a `MultipleRoots` scene — now
+      gated on being THE chosen root.
+- [x] **Duplicate sibling names: `by_path`/`resolve_path` now first-wins** (`or_insert`), matching
+      `unique_nodes`; `children_of` still lists both.
+
+Deferred (low / cosmetic / engine-impossible):
+- [ ] **`unescape` drops `\uXXXX`/`\UXXXXXX`/`\b`/`\f`** → a name with such an escape mis-decodes
+      (e.g. `A` → `u0041`). Cosmetic *and consistent* (applied to both `name=` and `parent=`, so
+      path matching still works); display/go-to-def only. Rare. Extend `unescape` if it surfaces.
+- [ ] **Cascading dangling:** a node parented to a sibling whose own parent dangled is itself
+      flagged. Secondary effect; rare. Track an "upstream-dangling" set to suppress the secondary.
+- [ ] **A node literally named `"."`** makes `by_path["."]` that `resolve_path` can't return —
+      engine-impossible input; **wontfix**.
+
+### M1 — scene-aware node-path typing — **DONE**
+`$Path` / `%Unique` / `@onready var x := $Path` / `get_node("literal")` resolve to the node's concrete
+type (the 90% slice): an attached script's own `class_name` (most specific) wins, else the declared
+`type=` (native class or `class_name` registry). Computed `get_node(var)`, an unresolvable path, or
+no owning scene all degrade to `Object(Node)` with **no false warning** (the engine floor). Wiring:
+salsa `scene_model(db, FileText)` + the firewalled project-wide `script_scene_index(db, root)` (a
+`.gd` body edit never invalidates it); `scene_context(db, file)` recovers the owning scene + attach
+node (via `self_ty` = the file's own `ScriptRef`, no extra `FileId` threading). `.tscn` is ingested
+through the normal `apply_change` path (a `FileText` with a `.tscn` `res://` path). Hover/inlay show
+the resolved type automatically. Validated: `xtask ci` green + 7 new typing tests + a public-API
+end-to-end inlay test.
+
+**M1 deferrals (→ M2+):**
+- [ ] **Instanced sub-scene recursion → M2+ (hard tail).** A node with `instance=` (no `type=`) stays
+      `Node`; following `instance=ExtResource("sub.tscn")` to the sub-scene root's type needs the
+      cross-file recursion. Records `instance` for it.
+- [ ] **`self.get_node("…")` (explicit-self / `obj.get_node`) is not intercepted** — only the bare
+      `get_node("…")` (implicit self) and `$`/`%`. Explicit/foreign forms stay a normal call → `Node`.
+- [ ] **No `INVALID_NODE_PATH` diagnostic, node-path completion, or `.tscn` go-to-def yet → M2.**
+      M1 only *types* the path; a bad `$DoesNotExist` silently degrades to `Node` (no warn) rather
+      than diagnosing.
+- [ ] **1-script-many-scenes = first scene wins.** `script_scene_index` keeps the first attaching
+      scene; the common-base union policy (Playbook §6.3) is a later refinement.
+- [ ] **`.tscn`-autoload sharpening still seam.** A `*`-autoload pointing at a `.tscn` could now read
+      the scene root's type (M1 has the machinery); wired in M2+.
+
 ---
 
 ## Repo / ops state

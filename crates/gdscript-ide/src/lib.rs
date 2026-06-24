@@ -391,6 +391,37 @@ mod tests {
     }
 
     #[test]
+    fn scene_node_path_typing_through_the_public_api() {
+        // The Phase-4 killer feature end-to-end: a `.tscn` injected via `apply_change` + a script it
+        // attaches → `$Btn` types as `Button`, surfaced as an `: Button` inlay (zero annotations).
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Btn\" type=\"Button\" parent=\".\"]\n",
+        );
+        change.set_file_path(FileId(0), "res://main.tscn");
+        change.change_file(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar b := $Btn\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        assert!(analysis.diagnostics(FileId(1)).unwrap().is_empty());
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("Button")),
+            "expected a `: Button` inlay on `var b := $Btn`, got {hints:?}",
+        );
+    }
+
+    #[test]
     fn find_refs_and_rename_cross_file_through_the_public_api() {
         let mut host = AnalysisHost::new();
         let mut change = Change::new();
