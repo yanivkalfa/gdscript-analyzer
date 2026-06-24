@@ -15,6 +15,10 @@ keywords.workspace = true
 gdscript-base = { workspace = true }
 gdscript-syntax = { workspace = true }
 gdscript-api = { workspace = true }
+salsa = { workspace = true }
+dashmap = { workspace = true }
+rustc-hash = { workspace = true }
+smol_str = { workspace = true }
 
 [lints]
 workspace = true

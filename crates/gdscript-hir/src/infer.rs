@@ -10,7 +10,8 @@
 //! (which lands on `Unknown` via the seam) produces zero false diagnostics.
 
 use gdscript_api::{EngineApi, MemberRef, TyRef};
-use gdscript_base::{Diagnostic, DiagnosticSource, Severity, TextRange};
+use gdscript_base::{Diagnostic, DiagnosticSource, FileId, Severity, TextRange};
+use gdscript_db::Db;
 use gdscript_syntax::GdNode;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
@@ -21,7 +22,7 @@ use crate::body::{self, BinOp, Body, Expr, ExprId, Literal, ParamBinding, Stmt, 
 use crate::cst::{self, AstPtr};
 use crate::item_tree::{ItemTree, Member, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
-use crate::ty::{self, Assign, EnumRef, Ty};
+use crate::ty::{self, Assign, EnumRef, ScriptRefId, Ty};
 
 // ---- diagnostic codes + message templates (Playbook §5, engine-matching) -----------------
 
@@ -47,6 +48,8 @@ pub enum BindingKind {
     Param,
     /// A `for` loop variable.
     ForVar,
+    /// A `var x` capture in a `match` pattern (typed `Variant`; arm-scoped).
+    MatchBind,
 }
 
 /// A typed local binding — the unit hover + inlay hints read for `var`/param/`for` names.
@@ -68,7 +71,7 @@ pub struct Binding {
 }
 
 /// The result of inferring one body.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InferenceResult {
     /// Every expression's inferred type (feeds hover + inlay).
     pub expr_ty: FxHashMap<ExprId, Ty>,
@@ -99,14 +102,16 @@ impl InferenceResult {
 /// initializer body).
 #[must_use]
 pub fn infer(
+    db: &dyn Db,
     api: &EngineApi,
     root: &GdNode,
     class: &ClassScope,
     body: &Body,
     return_ty: Ty,
 ) -> InferenceResult {
-    let self_ty = class.base.clone();
+    let self_ty = class.self_ty.clone();
     let mut cx = Cx {
+        db,
         api,
         root,
         body,
@@ -149,6 +154,7 @@ pub fn infer(
 /// declared return type, and infer it.
 #[must_use]
 pub fn infer_func(
+    db: &dyn Db,
     api: &EngineApi,
     root: &GdNode,
     class: &ClassScope,
@@ -161,14 +167,14 @@ pub fn infer_func(
     // The return-type annotation is the FuncDecl's direct `TypeRef` child (params' type refs
     // are nested inside the ParamList, so they are not direct children).
     let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
-        .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
-    infer(api, root, class, &body, return_ty)
+        .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
+    infer(db, api, root, class, &body, return_ty)
 }
 
 /// One inferred unit of a file: a function body or a class field's initializer, with its
 /// lowered [`Body`] and [`InferenceResult`] (kept so position-based features — hover, inlay,
 /// member completion — can map a cursor back through the source map).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unit {
     /// The source range this unit covers (the function decl or the field decl).
     pub range: TextRange,
@@ -180,7 +186,7 @@ pub struct Unit {
 
 /// The full single-file inference: the item tree, every inferred unit, and the merged §5
 /// diagnostics. The whole-file entry point the IDE layer consumes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FileInference {
     /// The lowered item tree.
     pub tree: Arc<ItemTree>,
@@ -205,23 +211,27 @@ impl FileInference {
 /// class-field initializer against a shared [`ClassScope`]. The single entry point for the
 /// IDE features (Playbook §6 — a pure `(api, parsed file) -> result` function).
 #[must_use]
-pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
+pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId) -> FileInference {
     let tree = item_tree(root);
     let mut units = Vec::new();
     let mut diagnostics = Vec::new();
     let mut member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
+    // `self` is the script's OWN class (a self-`ScriptRef`), not just its engine base — so member
+    // access on an aliased `self` resolves the file's own members (see `ClassScope::self_ty`).
+    let self_ref = Ty::ScriptRef(ScriptRefId(file_id.0));
 
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
     {
-        let class = ClassScope::new(api, &tree);
+        let mut class = ClassScope::new(db, api, &tree);
+        class.self_ty = self_ref.clone();
         for m in &tree.members {
             let (ptr, range) = match m {
                 Member::Var(v) => (v.ptr, v.range),
                 Member::Const(c) => (c.ptr, c.range),
                 _ => continue,
             };
-            if let Some(unit) = unit_from_decl(api, root, &class, ptr, range) {
+            if let Some(unit) = unit_from_decl(db, api, root, &class, ptr, range) {
                 if let (Some(name), Some(b)) = (m.name(), unit.result.bindings.first()) {
                     member_types.insert(SmolStr::new(name), b.ty.clone());
                 }
@@ -233,8 +243,9 @@ pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
 
     // Pass 2 — functions, against a scope carrying the seeded field types.
     {
-        let mut class = ClassScope::new(api, &tree);
+        let mut class = ClassScope::new(db, api, &tree);
         class.member_types = member_types;
+        class.self_ty = self_ref.clone();
         for m in &tree.members {
             let Member::Func(f) = m else { continue };
             let Some(node) = f.ptr.to_node(root) else {
@@ -242,8 +253,8 @@ pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
             };
             let body = body::body_of_func(&node);
             let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
-                .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
-            let result = infer(api, root, &class, &body, return_ty);
+                .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
+            let result = infer(db, api, root, &class, &body, return_ty);
             diagnostics.extend(result.diagnostics.iter().cloned());
             units.push(Unit {
                 range: f.range,
@@ -262,6 +273,7 @@ pub fn analyze_file(api: &EngineApi, root: &GdNode) -> FileInference {
 
 /// Infer a class field declaration as a single local-var statement (full annotation checks).
 fn unit_from_decl(
+    db: &dyn Db,
     api: &EngineApi,
     root: &GdNode,
     class: &ClassScope,
@@ -270,7 +282,7 @@ fn unit_from_decl(
 ) -> Option<Unit> {
     let node = ptr.to_node(root)?;
     let body = body::body_of_decl_stmt(&node);
-    let result = infer(api, root, class, &body, Ty::Variant);
+    let result = infer(db, api, root, class, &body, Ty::Variant);
     Some(Unit {
         range,
         body,
@@ -287,6 +299,7 @@ enum Expectation {
 }
 
 struct Cx<'a> {
+    db: &'a dyn Db,
     api: &'a EngineApi,
     root: &'a GdNode,
     body: &'a Body,
@@ -447,7 +460,18 @@ impl Cx<'_> {
                 for arm in arms {
                     self.in_branch(|cx| {
                         for b in &arm.binds {
-                            cx.locals.insert(b.clone(), Ty::Variant);
+                            // Record the capture as a binding so navigation (find-refs / rename)
+                            // sees it as a local that shadows a same-named member; the type is the
+                            // Phase-2 `Variant`.
+                            cx.bindings.push(Binding {
+                                name_range: b.range,
+                                ty: Ty::Variant,
+                                init: None,
+                                annotated: false,
+                                inferred_colon_eq: false,
+                                kind: BindingKind::MatchBind,
+                            });
+                            cx.locals.insert(b.name.clone(), Ty::Variant);
                         }
                         if let Some(g) = arm.guard {
                             cx.infer_expr(g, &Expectation::None);
@@ -639,12 +663,20 @@ impl Cx<'_> {
                 self.infer_lambda(&params, &body);
                 Ty::Callable
             }
-            Expr::Preload { arg } => {
+            Expr::Preload { arg, path } => {
                 if let Some(arg) = arg {
                     self.infer_expr(arg, &Expectation::None);
                 }
-                // `preload(...)` resolves through the seam.
-                Ty::Unknown
+                // A constant string-literal path resolves to the declaring file's `ScriptRef`
+                // (M3 — a SCRIPT meta-type in Godot; `X.new()`/`X.member` then resolve via the
+                // usual `ScriptRef` walk). A non-constant argument (`preload(var)`) — which Godot
+                // itself rejects — stays the seam, never a false diagnostic.
+                match path {
+                    Some(p) => {
+                        resolve::resolve_external(self.db, &resolve::ExternalRef::Preload(p))
+                    }
+                    None => Ty::Unknown,
+                }
             }
             // `$Node`/`%Unique`/`get_node()` are always `Object(Node)` (Playbook §2).
             Expr::GetNode => self.node_ty(),
@@ -812,7 +844,9 @@ impl Cx<'_> {
     }
 
     fn func_return_ty(&self, annotation: Option<&str>) -> Ty {
-        annotation.map_or(Ty::Variant, |t| resolve::resolve_type_name(self.api, t))
+        annotation.map_or(Ty::Variant, |t| {
+            resolve::resolve_type_name(self.db, self.api, t)
+        })
     }
 
     /// Member access `receiver.name`. When `as_method`, resolve a method (and use its return
@@ -860,7 +894,111 @@ impl Cx<'_> {
             }
             // Enum value access (`MyEnum.VALUE`) is an `int`.
             Ty::Enum(_) => self.int_ty(),
+            // A cross-file script reference: resolve the member against its (own) member table.
+            Ty::ScriptRef(sref) => self.script_member_ty(*sref, name, as_method),
             _ => Ty::Variant,
+        }
+    }
+
+    /// A member of a cross-file script (`ScriptRef`): looked up in the script's own member table
+    /// (M1). A member we don't model — e.g. one inherited from a base we don't resolve until M2 —
+    /// yields the seam (`Unknown`), **never** an `UNSAFE_*` warning. `Class.new(...)` constructs
+    /// an instance of the class.
+    fn script_member_ty(&self, sref: ScriptRefId, name: &str, as_method: bool) -> Ty {
+        if name == "new" {
+            return Ty::ScriptRef(sref);
+        }
+        self.script_member_walk(sref, name, as_method, 0)
+            .unwrap_or(Ty::Unknown)
+    }
+
+    /// Walk a script class's `extends` chain for `name`: own members first, then a user base
+    /// (another `ScriptRef`), then an engine base (the API table). Depth-bounded so a cyclic
+    /// `extends` cannot loop. `None` = not found anywhere in the chain (the seam).
+    fn script_member_walk(
+        &self,
+        sref: ScriptRefId,
+        name: &str,
+        as_method: bool,
+        depth: u32,
+    ) -> Option<Ty> {
+        if depth > 32 {
+            return None;
+        }
+        let file = self.db.file_text(FileId(sref.0))?;
+        let sc = crate::queries::script_class(self.db, file);
+        if let Some(m) = sc.member(name) {
+            return Some(match m {
+                crate::queries::MemberSig::Method(ret) => {
+                    if as_method {
+                        ret.clone()
+                    } else {
+                        Ty::Callable
+                    }
+                }
+                crate::queries::MemberSig::Field(t) => t.clone(),
+                crate::queries::MemberSig::Signal => Ty::Signal(None),
+            });
+        }
+        // Not an own member — continue up the inheritance chain.
+        match sc.base() {
+            Ty::ScriptRef(base) => self.script_member_walk(*base, name, as_method, depth + 1),
+            Ty::Object(class) => self
+                .api
+                .lookup_member(*class, name)
+                .map(|m| self.member_ref_ty(&m, as_method)),
+            _ => None,
+        }
+    }
+
+    /// Whether a value of type `sub` is statically a subtype of `sup` — composing user `ScriptRef`
+    /// `extends` chains with the engine class table (M4, for `is`/`as` widen-only narrowing). A
+    /// `ScriptRef` IS-A its native base (so `script_value is Node` holds), but Godot's asymmetry is
+    /// honored: a native/script value is **not** a subtype of an *unrelated* user script.
+    fn is_subtype(&self, sub: &Ty, sup: &Ty) -> bool {
+        match (sub, sup) {
+            (Ty::Object(a), Ty::Object(b)) => self.api.is_subclass(*a, *b),
+            (Ty::ScriptRef(a), Ty::ScriptRef(b)) => self.script_is_subtype(*a, *b, 0),
+            (Ty::ScriptRef(a), Ty::Object(b)) => self.script_extends_engine(*a, *b, 0),
+            _ => false,
+        }
+    }
+
+    /// Whether script `sub` is `sup` or transitively extends it — walk the `extends` base chain by
+    /// script identity (depth-bounded, like [`script_member_walk`](Self::script_member_walk)).
+    fn script_is_subtype(&self, sub: ScriptRefId, sup: ScriptRefId, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        if sub == sup {
+            return true;
+        }
+        let Some(file) = self.db.file_text(FileId(sub.0)) else {
+            return false;
+        };
+        match crate::queries::script_class(self.db, file).base() {
+            Ty::ScriptRef(base) => self.script_is_subtype(*base, sup, depth + 1),
+            _ => false,
+        }
+    }
+
+    /// Whether script `sub`'s `extends` chain reaches engine class `sup_native` at its native base.
+    fn script_extends_engine(
+        &self,
+        sub: ScriptRefId,
+        sup_native: gdscript_api::ClassId,
+        depth: u32,
+    ) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let Some(file) = self.db.file_text(FileId(sub.0)) else {
+            return false;
+        };
+        match crate::queries::script_class(self.db, file).base() {
+            Ty::ScriptRef(base) => self.script_extends_engine(*base, sup_native, depth + 1),
+            Ty::Object(native) => self.api.is_subclass(*native, sup_native),
+            _ => false,
         }
     }
 
@@ -1065,16 +1203,37 @@ impl Cx<'_> {
         if let Some(item) = self.class.lookup(name) {
             return self.own_member_ty(item, false);
         }
-        if let Ty::Object(base) = self.class.base
-            && let Some(m) = self.api.lookup_member(base, name)
-        {
-            return self.member_ref_ty(&m, false);
+        // Inherited members: an engine `Object` base via the API table, or a user `ScriptRef`
+        // base via the script member walk (M2 — so a class extending another class_name sees its
+        // inherited members).
+        match self.class.base.clone() {
+            Ty::Object(base) => {
+                if let Some(m) = self.api.lookup_member(base, name) {
+                    return self.member_ref_ty(&m, false);
+                }
+            }
+            Ty::ScriptRef(base) => {
+                if let Some(t) = self.script_member_walk(base, name, false, 0) {
+                    return t;
+                }
+            }
+            _ => {}
         }
         if let Some(g) = resolve::resolve_global(self.api, name) {
             return global_ty(&g);
         }
-        // An unknown bare identifier is most likely a global we don't model → seam.
-        Ty::Unknown
+        // A project-global `class_name` used as a value — the class itself, for static access
+        // (`V.fc()`) or as a constructor (`Player.new()`). Resolves to a `ScriptRef` via the
+        // registry. Precedence (Godot `reduce_identifier`): `class_name` global ≫ autoload
+        // singleton. So try `class_name` first, then a `*`-autoload, then the seam.
+        let by_class = resolve::resolve_external(
+            self.db,
+            &resolve::ExternalRef::ClassName(SmolStr::new(name)),
+        );
+        if !by_class.is_unknown() {
+            return by_class;
+        }
+        resolve::resolve_external(self.db, &resolve::ExternalRef::Autoload(SmolStr::new(name)))
     }
 
     fn own_member_ty(&self, item: ClassItem, as_method: bool) -> Ty {
@@ -1112,26 +1271,40 @@ impl Cx<'_> {
             return Ty::Variant;
         };
         cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
-            .map_or(Ty::Variant, |t| resolve::resolve_type_ref(self.api, &t))
+            .map_or(Ty::Variant, |t| {
+                resolve::resolve_type_ref(self.db, self.api, &t)
+            })
     }
 
     // ---- narrowing ----
 
     /// Apply the narrowing implied by an `if`/`elif` condition to the current (cloned) branch.
+    ///
+    /// `is`-narrowing is a deliberate divergence from upstream Godot (whose `is` does **not**
+    /// flow-narrow); we add it as a UX improvement but keep it **widen-only** so it never produces
+    /// a type Godot's checker would reject: narrow only when the tested type is a strict downcast
+    /// of the operand's current type, or the operand is uninformative. If the operand is already a
+    /// subtype of the test (`d: Derived; if d is Base`), keep it — do not un-narrow. The
+    /// `is_uninformative` guard also stays: never narrow to a type we couldn't resolve.
     fn apply_narrowing(&mut self, cond: ExprId) {
-        if let Expr::Is {
+        let Expr::Is {
             operand,
-            ty,
-            negated,
+            ty: Some(ptr),
+            negated: false,
         } = self.body.expr(cond).clone()
-            && !negated
-            && let Some(key) = self.narrow_key(operand)
-            && let Some(ptr) = ty
-        {
-            let narrowed = self.resolve_ptr_ty(ptr);
-            if !narrowed.is_uninformative() {
-                self.narrowing.insert(key, narrowed);
-            }
+        else {
+            return;
+        };
+        let Some(key) = self.narrow_key(operand) else {
+            return;
+        };
+        let narrowed = self.resolve_ptr_ty(ptr);
+        if narrowed.is_uninformative() {
+            return;
+        }
+        let cur = self.expr_ty.get(&operand).cloned().unwrap_or(Ty::Variant);
+        if cur.is_uninformative() || self.is_subtype(&narrowed, &cur) {
+            self.narrowing.insert(key, narrowed);
         }
     }
 
@@ -1150,8 +1323,9 @@ impl Cx<'_> {
     }
 
     fn resolve_ptr_ty(&self, ptr: AstPtr) -> Ty {
-        ptr.to_node(self.root)
-            .map_or(Ty::Variant, |n| resolve::resolve_type_ref(self.api, &n))
+        ptr.to_node(self.root).map_or(Ty::Variant, |n| {
+            resolve::resolve_type_ref(self.db, self.api, &n)
+        })
     }
 
     // ---- helpers ----
@@ -1245,17 +1419,18 @@ mod tests {
     /// Infer the (first) function in `src` against a fresh class scope.
     fn infer_first_func(src: &str) -> Harness {
         let api = gdscript_api::bundled();
+        let db = gdscript_db::RootDatabase::default();
         let root = parse(src).syntax_node();
         let tree = item_tree(&root);
-        let class = ClassScope::new(api, &tree);
+        let class = ClassScope::new(&db, api, &tree);
         let func = gdscript_syntax::ast::descendants(&root)
             .into_iter()
             .find(|n| n.kind() == SyntaxKind::FuncDecl)
             .expect("a function");
         let body = body::body_of_func(&func);
         let return_ty = cst::first_child(&func, |k| k == SyntaxKind::TypeRef)
-            .map_or(Ty::Variant, |t| resolve::resolve_type_ref(api, &t));
-        let result = infer(api, &root, &class, &body, return_ty);
+            .map_or(Ty::Variant, |t| resolve::resolve_type_ref(&db, api, &t));
+        let result = infer(&db, api, &root, &class, &body, return_ty);
         Harness { result, body }
     }
 

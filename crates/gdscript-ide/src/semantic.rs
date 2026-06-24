@@ -16,44 +16,38 @@ use gdscript_base::{
     CodeAction, CompletionItem, CompletionKind, Diagnostic, FileId, HoverResult, InlayHint,
     InlayHintKind, ParamInfo, SignatureHelp, SignatureInfo, SourceChange, TextEdit, TextRange,
 };
-use gdscript_hir::infer::{BindingKind, analyze_file};
+use gdscript_db::{Db, FileText, parse};
+use gdscript_hir::infer::{BindingKind, FileInference};
 use gdscript_hir::item_tree::{ItemTree, Member};
+use gdscript_hir::queries;
 use gdscript_hir::ty::{self, Ty};
 use gdscript_syntax::ast;
-use gdscript_syntax::{GdNode, SyntaxKind, parse};
+use gdscript_syntax::{GdNode, SyntaxKind};
 
 use cstree::util::NodeOrToken;
 
-/// The bundled engine model, or `None` on `wasm32` (no embedded blob — see the module docs).
-#[must_use]
-// The native arm is always `Some`, but the `wasm32` arm is genuinely `None`; clippy only sees
-// the active target, so the `Option` is not actually unnecessary.
-#[allow(clippy::unnecessary_wraps)]
-fn engine() -> Option<&'static EngineApi> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        Some(gdscript_api::bundled())
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        None
-    }
-}
-
 fn to_base_range(r: text_size::TextRange) -> TextRange {
     TextRange::new(u32::from(r.start()), u32::from(r.end()))
+}
+
+/// A display label for a type. Resolves a `ScriptRef` to its `class_name` via the project
+/// registry (which [`Ty::label`] can't do — it has only the engine model). Other types defer to
+/// [`Ty::label`]; `Unknown`/`Error` stay elided.
+fn type_label(db: &dyn Db, api: &EngineApi, ty: &Ty) -> Option<String> {
+    if let Ty::ScriptRef(sref) = ty {
+        return queries::script_ref_name(db, *sref).map(|n| n.to_string());
+    }
+    ty.label(api)
 }
 
 // ---- diagnostics -------------------------------------------------------------------------
 
 /// The §5 type diagnostics for a file (merged into [`crate::Analysis::diagnostics`]).
 #[must_use]
-pub fn type_diagnostics(text: &str) -> Vec<Diagnostic> {
-    let Some(api) = engine() else {
-        return Vec::new();
-    };
-    let root = parse(text).syntax_node();
-    analyze_file(api, &root).diagnostics
+pub fn type_diagnostics(db: &dyn Db, file: FileText) -> Vec<Diagnostic> {
+    // `analyze_file` already yields an empty result with no engine model (wasm32), so the
+    // diagnostics are naturally empty there — no separate guard needed.
+    queries::analyze_file(db, file).diagnostics.clone()
 }
 
 // ---- hover -------------------------------------------------------------------------------
@@ -61,16 +55,15 @@ pub fn type_diagnostics(text: &str) -> Vec<Diagnostic> {
 /// Hover: the inferred type of the expression / binding under the cursor. `Unknown` (the
 /// Phase-3 seam) is elided — its label is `None`, so no placeholder is shown.
 #[must_use]
-pub fn hover(text: &str, offset: u32) -> Option<HoverResult> {
-    let api = engine()?;
-    let root = parse(text).syntax_node();
-    let fi = analyze_file(api, &root);
+pub fn hover(db: &dyn Db, file: FileText, offset: u32) -> Option<HoverResult> {
+    let api = db.engine()?;
+    let fi = queries::analyze_file(db, file);
     let unit = fi.unit_at(offset)?;
 
     // An expression under the cursor wins (most specific).
     if let Some(eid) = unit.body.source_map.expr_at_offset(offset)
         && let Some(ty) = unit.result.type_of(eid)
-        && let Some(label) = ty.label(api)
+        && let Some(label) = type_label(db, api, ty)
     {
         return Some(HoverResult {
             ty_label: Some(label),
@@ -81,7 +74,7 @@ pub fn hover(text: &str, offset: u32) -> Option<HoverResult> {
     // Otherwise a binding name (the declaration site of a local / param / for-var).
     let b = unit.result.binding_at(offset)?;
     Some(HoverResult {
-        ty_label: Some(b.ty.label(api)?),
+        ty_label: Some(type_label(db, api, &b.ty)?),
         doc: String::new(),
         range: b.name_range,
     })
@@ -92,12 +85,11 @@ pub fn hover(text: &str, offset: u32) -> Option<HoverResult> {
 /// Inlay `: T` hints on `:=` declarations + unannotated params / `for`-vars — suppressed when
 /// the type is uninformative (`Variant`/`Unknown`), the differentiator the engine LSP lacks.
 #[must_use]
-pub fn inlay_hints(text: &str) -> Vec<InlayHint> {
-    let Some(api) = engine() else {
+pub fn inlay_hints(db: &dyn Db, file: FileText) -> Vec<InlayHint> {
+    let Some(api) = db.engine() else {
         return Vec::new();
     };
-    let root = parse(text).syntax_node();
-    let fi = analyze_file(api, &root);
+    let fi = queries::analyze_file(db, file);
     let mut hints = Vec::new();
     for unit in &fi.units {
         for b in &unit.result.bindings {
@@ -107,8 +99,10 @@ pub fn inlay_hints(text: &str) -> Vec<InlayHint> {
             let show = match b.kind {
                 BindingKind::Var => b.inferred_colon_eq,
                 BindingKind::Param | BindingKind::ForVar => true,
+                // A `match` capture is always `Variant` (suppressed above anyway) — no inlay.
+                BindingKind::MatchBind => false,
             };
-            if show && let Some(label) = b.ty.label(api) {
+            if show && let Some(label) = type_label(db, api, &b.ty) {
                 hints.push(InlayHint {
                     offset: b.name_range.end,
                     label: format!(": {label}"),
@@ -127,11 +121,11 @@ pub fn inlay_hints(text: &str) -> Vec<InlayHint> {
 /// the receiver is `Variant`/`Unknown` (the caller then falls back to the Tier-0 by-name path
 /// so completion never regresses below Phase 1).
 #[must_use]
-pub fn member_completions(text: &str, offset: u32) -> Option<Vec<CompletionItem>> {
-    let api = engine()?;
-    let root = parse(text).syntax_node();
+pub fn member_completions(db: &dyn Db, file: FileText, offset: u32) -> Option<Vec<CompletionItem>> {
+    let api = db.engine()?;
+    let root = parse(db, file).syntax_node();
     let receiver = member_context(&root, offset)?;
-    let fi = analyze_file(api, &root);
+    let fi = queries::analyze_file(db, file);
 
     let mut items = Vec::new();
     let self_recv = is_self_node(&receiver);
@@ -148,6 +142,10 @@ pub fn member_completions(text: &str, offset: u32) -> Option<Vec<CompletionItem>
     });
 
     match recv_ty {
+        // A script reference (`self`, an aliased self, or any `ScriptRef` value): own members +
+        // the whole `extends` chain (user bases, then the engine base's members). For `self` the
+        // own members were already added above, so don't repeat them.
+        Some(Ty::ScriptRef(sref)) => items.extend(script_ref_items(db, api, *sref, !self_recv, 0)),
         Some(t) if !t.is_uninformative() => items.extend(members_of_ty(api, t)),
         // `self` with an opaque base still offers this file's own members.
         _ if self_recv => {}
@@ -155,6 +153,40 @@ pub fn member_completions(text: &str, offset: u32) -> Option<Vec<CompletionItem>
         _ => return None,
     }
     Some(items)
+}
+
+/// Completion items for the members reachable through a script [`Ty::ScriptRef`]: optionally its
+/// own members, then everything up its `extends` chain (user bases recursively, then the engine
+/// base's members). Depth-bounded against a cyclic `extends`.
+fn script_ref_items(
+    db: &dyn Db,
+    api: &EngineApi,
+    sref: ty::ScriptRefId,
+    include_own: bool,
+    depth: u32,
+) -> Vec<CompletionItem> {
+    if depth > 32 {
+        return Vec::new();
+    }
+    let Some(ft) = db.file_text(FileId(sref.0)) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    if include_own {
+        items.extend(own_member_items(&queries::item_tree(db, ft)));
+    }
+    match queries::script_class(db, ft).base() {
+        Ty::ScriptRef(base) => items.extend(script_ref_items(db, api, *base, true, depth + 1)),
+        Ty::Object(class) => {
+            items.extend(
+                api.members_of(*class)
+                    .iter()
+                    .map(|m| member_ref_item(api, m)),
+            );
+        }
+        _ => {}
+    }
+    items
 }
 
 /// The receiver node of the tightest `FieldExpr` whose `.` precedes `offset`, or `None` if the
@@ -280,9 +312,10 @@ fn builtin_member_items(api: &EngineApi, b: BuiltinId) -> Vec<CompletionItem> {
 /// Signature help at a call site: the callee's parameter list with the active parameter
 /// resolved by counting top-level commas before the cursor.
 #[must_use]
-pub fn signature_help(text: &str, offset: u32) -> Option<SignatureHelp> {
-    let api = engine()?;
-    let root = parse(text).syntax_node();
+pub fn signature_help(db: &dyn Db, file: FileText, offset: u32) -> Option<SignatureHelp> {
+    let api = db.engine()?;
+    let root = parse(db, file).syntax_node();
+    let text = file.text(db);
 
     // The tightest `ArgList` whose parentheses enclose the cursor.
     let arglist = ast::descendants(&root)
@@ -298,7 +331,9 @@ pub fn signature_help(text: &str, offset: u32) -> Option<SignatureHelp> {
         return None;
     }
     let callee = call.children().next()?;
-    let sig = resolve_signature(api, &root, callee)?;
+    let fi = queries::analyze_file(db, file);
+    let tree = queries::item_tree(db, file);
+    let sig = resolve_signature(db, api, callee, &fi, &tree)?;
 
     let open = u32::from(arglist.text_range().start()) + 1; // just past `(`
     let active = count_top_level_commas(text, open, offset);
@@ -310,12 +345,18 @@ pub fn signature_help(text: &str, offset: u32) -> Option<SignatureHelp> {
 }
 
 /// Build the signature for a call's callee node (`recv.method` or a bare name).
-fn resolve_signature(api: &EngineApi, root: &GdNode, callee: &GdNode) -> Option<SignatureInfo> {
+fn resolve_signature(
+    db: &dyn Db,
+    api: &EngineApi,
+    callee: &GdNode,
+    fi: &FileInference,
+    tree: &ItemTree,
+) -> Option<SignatureInfo> {
     match callee.kind() {
         SyntaxKind::FieldExpr => {
             let receiver = callee.children().next()?;
             let method = field_member_name(callee)?;
-            let recv_class = receiver_class(api, root, receiver)?;
+            let recv_class = receiver_class(fi, receiver)?;
             if let Some(MemberRef::Method(sig)) = api.lookup_member(recv_class, &method) {
                 return Some(method_signature(api, &method, sig));
             }
@@ -327,8 +368,7 @@ fn resolve_signature(api: &EngineApi, root: &GdNode, callee: &GdNode) -> Option<
                 return Some(util_signature(api, &name, u));
             }
             // A bare call is `self.name(...)` — resolve it against the inherited base.
-            let tree = gdscript_hir::item_tree::item_tree(root);
-            if let Ty::Object(base) = gdscript_hir::resolve::resolve_base(api, &tree)
+            if let Ty::Object(base) = gdscript_hir::resolve::resolve_base(db, api, tree)
                 && let Some(MemberRef::Method(sig)) = api.lookup_member(base, &name)
             {
                 return Some(method_signature(api, &name, sig));
@@ -340,8 +380,7 @@ fn resolve_signature(api: &EngineApi, root: &GdNode, callee: &GdNode) -> Option<
 }
 
 /// The class id a receiver expression resolves to, for signature lookup.
-fn receiver_class(api: &EngineApi, root: &GdNode, receiver: &GdNode) -> Option<ClassId> {
-    let fi = analyze_file(api, root);
+fn receiver_class(fi: &FileInference, receiver: &GdNode) -> Option<ClassId> {
     let recv_range = to_base_range(receiver.text_range());
     let offset = recv_range.start;
     let unit = fi.unit_at(offset)?;
@@ -430,12 +469,11 @@ fn count_top_level_commas(text: &str, start: u32, offset: u32) -> u32 {
 /// The "add type annotation" code action: on an unannotated local `var` with a known inferred
 /// type, insert `: T` after the name (Playbook §1.1.7).
 #[must_use]
-pub fn code_actions(text: &str, offset: u32, file: FileId) -> Vec<CodeAction> {
-    let Some(api) = engine() else {
+pub fn code_actions(db: &dyn Db, file: FileText, offset: u32) -> Vec<CodeAction> {
+    let Some(api) = db.engine() else {
         return Vec::new();
     };
-    let root = parse(text).syntax_node();
-    let fi = analyze_file(api, &root);
+    let fi = queries::analyze_file(db, file);
     let Some(unit) = fi.unit_at(offset) else {
         return Vec::new();
     };
@@ -459,13 +497,13 @@ pub fn code_actions(text: &str, offset: u32, file: FileId) -> Vec<CodeAction> {
     vec![CodeAction {
         title: format!("Add type annotation `: {label}`"),
         kind: Some("refactor.rewrite".to_owned()),
-        edit: SourceChange {
-            file,
-            edits: vec![TextEdit {
+        edit: SourceChange::single(
+            file.file_id(db),
+            vec![TextEdit {
                 range: TextRange::new(at, at),
                 new_text: format!(": {label}"),
             }],
-        },
+        ),
     }]
 }
 
@@ -491,24 +529,47 @@ fn node_first_ident(node: &GdNode) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gdscript_base::FileId;
+    use gdscript_db::RootDatabase;
+    use salsa::Durability;
+
+    fn db_ft(src: &str) -> (RootDatabase, FileText) {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), src, Durability::LOW);
+        db.sync_source_root(); // build the class_name registry, as apply_change does
+        let ft = db.file_text(FileId(0)).unwrap();
+        (db, ft)
+    }
+
+    #[test]
+    fn hover_on_user_class_shows_class_name() {
+        let src = "class_name Widget\nfunc f():\n\tvar w: Widget\n";
+        let offset = u32::try_from(src.find("w: Widget").unwrap()).unwrap();
+        let (db, ft) = db_ft(src);
+        let h = hover(&db, ft, offset).expect("hover");
+        assert_eq!(h.ty_label.as_deref(), Some("Widget"));
+    }
 
     #[test]
     fn hover_reports_inferred_type() {
         let offset = u32::try_from("func f():\n\tvar n := ".len()).unwrap() + 1;
-        let h = hover("func f():\n\tvar n := 42\n", offset).expect("hover");
+        let (db, ft) = db_ft("func f():\n\tvar n := 42\n");
+        let h = hover(&db, ft, offset).expect("hover");
         assert_eq!(h.ty_label.as_deref(), Some("int"));
     }
 
     #[test]
     fn inlay_hint_on_inferred_var() {
-        let hints = inlay_hints("func f():\n\tvar n := 42\n");
+        let (db, ft) = db_ft("func f():\n\tvar n := 42\n");
+        let hints = inlay_hints(&db, ft);
         assert!(hints.iter().any(|h| h.label == ": int"));
     }
 
     #[test]
     fn inlay_suppressed_on_variant() {
         // Untyped param → Variant; `:=` from it is Variant → no inlay (and it would warn).
-        let hints = inlay_hints("func f(x):\n\tvar y := x\n");
+        let (db, ft) = db_ft("func f(x):\n\tvar y := x\n");
+        let hints = inlay_hints(&db, ft);
         assert!(hints.iter().all(|h| h.label != ": Variant"));
     }
 
@@ -517,7 +578,8 @@ mod tests {
         // `extends Node` + `self.` → Node members present, plus this file's own `f`.
         let src = "extends Node\nfunc f():\n\tself.\n";
         let offset = u32::try_from(src.find("self.").unwrap() + "self.".len()).unwrap();
-        let items = member_completions(src, offset).expect("member context");
+        let (db, ft) = db_ft(src);
+        let items = member_completions(&db, ft, offset).expect("member context");
         assert!(items.iter().any(|i| i.label == "add_child"));
         assert!(items.iter().any(|i| i.label == "f"));
     }
@@ -527,23 +589,26 @@ mod tests {
         // Untyped receiver → None so the caller uses Tier-0.
         let src = "func f(x):\n\tx.\n";
         let offset = u32::try_from(src.find("x.").unwrap() + "x.".len()).unwrap();
-        assert!(member_completions(src, offset).is_none());
+        let (db, ft) = db_ft(src);
+        assert!(member_completions(&db, ft, offset).is_none());
     }
 
     #[test]
     fn code_action_adds_annotation() {
         let src = "func f():\n\tvar n = 42\n";
         let offset = u32::try_from(src.find("n =").unwrap()).unwrap();
-        let actions = code_actions(src, offset, FileId(0));
+        let (db, ft) = db_ft(src);
+        let actions = code_actions(&db, ft, offset);
         assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].edit.edits[0].new_text, ": int");
+        assert_eq!(actions[0].edit.edits[0].edits[0].new_text, ": int");
     }
 
     #[test]
     fn signature_help_resolves_engine_method() {
         let src = "extends Node\nfunc f():\n\tadd_child()\n";
         let offset = u32::try_from(src.find("add_child(").unwrap() + "add_child(".len()).unwrap();
-        let help = signature_help(src, offset).expect("signature");
+        let (db, ft) = db_ft(src);
+        let help = signature_help(&db, ft, offset).expect("signature");
         assert!(help.signatures[0].label.starts_with("add_child("));
         assert!(!help.signatures[0].params.is_empty());
     }

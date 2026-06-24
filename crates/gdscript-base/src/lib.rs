@@ -272,13 +272,93 @@ pub struct TextEdit {
     pub new_text: String,
 }
 
-/// A set of edits to apply. Phase 2 is single-file, so every edit targets `file`.
+/// The edits to apply to one file (non-overlapping; the client sorts and applies them).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceChange {
+pub struct FileEdit {
     /// The file the edits apply to.
     pub file: FileId,
-    /// The edits (non-overlapping; the client sorts and applies them).
+    /// The edits within that file.
     pub edits: Vec<TextEdit>,
+}
+
+/// A set of edits across one or more files (a cross-file rename, a quick-fix). Phase 3's rename
+/// spans files, so this is multi-file; a single-file change is just one [`FileEdit`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceChange {
+    /// The per-file edits.
+    pub edits: Vec<FileEdit>,
+}
+
+impl SourceChange {
+    /// A change that touches a single file.
+    #[must_use]
+    pub fn single(file: FileId, edits: Vec<TextEdit>) -> Self {
+        Self {
+            edits: vec![FileEdit { file, edits }],
+        }
+    }
+}
+
+/// A (file, range) pair — the atom of cross-file navigation results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRange {
+    /// The file the range lives in.
+    pub file: FileId,
+    /// The byte range.
+    pub range: TextRange,
+}
+
+/// Why a token is a reference (rust-analyzer's `ReferenceCategory`, trimmed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReferenceKind {
+    /// The symbol's declaration site.
+    Declaration,
+    /// A read (the default — any non-write use).
+    Read,
+    /// A write (the symbol on the left of an assignment).
+    Write,
+}
+
+/// One reference to a symbol (find-references result), including its declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reference {
+    /// The file the reference is in.
+    pub file: FileId,
+    /// The identifier-token range.
+    pub range: TextRange,
+    /// What kind of reference it is.
+    pub kind: ReferenceKind,
+}
+
+/// Why a [rename](crate) was refused — the "correct or it refuses" contract. Never a partial edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenameError {
+    /// The new name is not a single valid GDScript identifier (or is a keyword).
+    InvalidIdentifier {
+        /// The rejected name.
+        new_name: String,
+    },
+    /// The target is an engine/builtin symbol, or could not be resolved — not ours to rename.
+    NotRenamable {
+        /// Why.
+        reason: String,
+    },
+    /// The new name already exists in an affected scope.
+    WouldCollide {
+        /// Where the colliding symbol is.
+        at: FileRange,
+        /// The colliding name.
+        with: String,
+    },
+    /// The symbol is also reachable via a surface this analyzer cannot safely rewrite (a `.tscn`
+    /// `[connection]`/string call for a method/signal, the `project.godot` `[autoload]` key). We
+    /// refuse rather than leave a stale reference behind.
+    CrossesUnsupportedBoundary {
+        /// What boundary.
+        what: String,
+    },
 }
 
 /// A code action / quick-fix: a titled, optionally-kinded [`SourceChange`].
