@@ -289,8 +289,15 @@ pub enum Expr {
         /// The constant-folded path string (unquoted), when the argument is a string literal.
         path: Option<SmolStr>,
     },
-    /// `$Path` / `%Unique` — always `Object(Node)` in Phase 2 (only `as` narrows it).
-    GetNode,
+    /// `$Path` / `%Unique` / `get_node("…")` — a node-path access. In Phase 2 this was always
+    /// `Object(Node)`; Phase-4 M1 resolves the literal path against the owning scene to the node's
+    /// concrete type. A computed `get_node(var)` keeps `path: None` (stays `Node`, never warns).
+    GetNode {
+        /// The literal node path (`"Panel/VBox/Button"`, or a `%Unique` name), or `None` if computed.
+        path: Option<SmolStr>,
+        /// `true` for the `%Unique` form (resolve via `unique_name_in_owner`); `false` for `$Path`.
+        unique: bool,
+    },
     /// `(inner)`.
     Paren(ExprId),
 }
@@ -595,11 +602,19 @@ impl Lowerer {
                 }
             }
             K::CallExpr => {
-                let callee = self.lower_first_expr(node);
-                let args = cst::first_child(node, |k| k == K::ArgList)
-                    .map(|al| self.lower_exprs(&al))
-                    .unwrap_or_default();
-                Expr::Call { callee, args }
+                // `get_node("literal")` / `get_node_or_null("literal")` types like `$literal`.
+                if let Some(path) = get_node_call_path(node) {
+                    Expr::GetNode {
+                        path: Some(path),
+                        unique: false,
+                    }
+                } else {
+                    let callee = self.lower_first_expr(node);
+                    let args = cst::first_child(node, |k| k == K::ArgList)
+                        .map(|al| self.lower_exprs(&al))
+                        .unwrap_or_default();
+                    Expr::Call { callee, args }
+                }
             }
             K::IndexExpr => {
                 let exprs = cst::child_exprs(node);
@@ -676,7 +691,10 @@ impl Lowerer {
                 let arg = arg_node.map(|e| self.lower_expr(&e));
                 Expr::Preload { arg, path }
             }
-            K::GetNodeExpr | K::UniqueNodeExpr => Expr::GetNode,
+            K::GetNodeExpr | K::UniqueNodeExpr => Expr::GetNode {
+                path: node_path_text(node),
+                unique: node.kind() == K::UniqueNodeExpr,
+            },
             _ => Expr::Missing,
         };
         self.alloc_expr(expr, range)
@@ -888,6 +906,42 @@ fn field_member(node: &GdNode) -> Option<(SmolStr, TextRange)> {
     let nameref = cst::children_of(node, SyntaxKind::NameRef).pop()?;
     let tok = cst::first_token(&nameref)?;
     Some((SmolStr::new(tok.text()), cst::token_range(&tok)))
+}
+
+/// The literal path of a `get_node("…")` / `get_node_or_null("…")` call (a **bare** call = implicit
+/// `self.get_node`), or `None` if it isn't such a call or the argument is computed (the latter stays
+/// a normal call → `Node`). Lets the call lower to a [`Expr::GetNode`] so it types like `$path`.
+fn get_node_call_path(node: &GdNode) -> Option<SmolStr> {
+    let callee = cst::first_child_expr(node)?;
+    if callee.kind() != SyntaxKind::NameRef {
+        return None; // `obj.get_node(...)` / `self.get_node(...)` — not the bare implicit-self form
+    }
+    let name = cst::first_token(&callee)?;
+    if !matches!(name.text(), "get_node" | "get_node_or_null") {
+        return None;
+    }
+    let arg = cst::first_child(node, |k| k == SyntaxKind::ArgList)
+        .and_then(|al| cst::first_child_expr(&al))?;
+    if arg.kind() != SyntaxKind::Literal {
+        return None; // computed `get_node(var)` — stays a normal call (→ Node)
+    }
+    let s = cst::child_token_text(&arg, SyntaxKind::String)?;
+    Some(SmolStr::new(s.trim_matches(['"', '\''])))
+}
+
+/// The literal node path from a `$Path`/`%Unique` (`GetNodeExpr`/`UniqueNodeExpr`) node: a dequoted
+/// `$"a/b"` string, or the `/`-joined `Ident` segments of `$a/b`. `None` if it carries no path.
+fn node_path_text(node: &GdNode) -> Option<SmolStr> {
+    if let Some(s) = cst::child_token_text(node, SyntaxKind::String) {
+        return Some(SmolStr::new(s.trim_matches(['"', '\''])));
+    }
+    let segs: Vec<String> = node
+        .children_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .filter(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| t.text().to_owned())
+        .collect();
+    (!segs.is_empty()).then(|| SmolStr::new(segs.join("/")))
 }
 
 #[cfg(test)]

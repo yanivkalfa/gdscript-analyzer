@@ -18,6 +18,7 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 use gdscript_base::FileId;
+use gdscript_scene::{NodeIdx, SceneModel};
 
 use crate::infer::FileInference;
 use crate::item_tree::{ItemTree, Member};
@@ -239,6 +240,119 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
     // into the inheritance chain; an engine `Object` ends it at the API table.
     let base = crate::resolve::resolve_base(db, api, &tree);
     Arc::new(ScriptClass { members, base })
+}
+
+// ---- M1: scenes (.tscn/.tres) ------------------------------------------------------------
+
+/// Whether a `res://` path is a *text* scene/resource we parse (`.tscn`/`.tres`). Binary
+/// `.scn`/`.res` are detected-and-degraded by the parser, but we don't waste a parse on a `.gd`.
+fn is_scene_path(path: &str) -> bool {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    ext.eq_ignore_ascii_case("tscn") || ext.eq_ignore_ascii_case("tres")
+}
+
+/// The parsed [`SceneModel`] for `file` (M1) — memoized; recomputes only when the file text
+/// changes. A non-scene file (a `.gd`, or no `res://` path) yields an empty model (so the query is
+/// total). The pure `gdscript_scene::parse_scene` is the cache body; this just wraps + gates it.
+#[salsa::tracked]
+pub fn scene_model(db: &dyn Db, file: FileText) -> Arc<SceneModel> {
+    let is_scene = file.res_path(db).as_deref().is_some_and(is_scene_path);
+    if is_scene {
+        Arc::new(gdscript_scene::parse_scene(file.text(db)))
+    } else {
+        Arc::new(gdscript_scene::parse_scene(""))
+    }
+}
+
+/// Where a script (`.gd`) is attached in a scene: the owning scene file + the node carrying the
+/// `script = ExtResource(...)`. `$Path` in that script resolves relative to this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneAttach {
+    /// The owning scene's file.
+    pub scene: FileId,
+    /// The node the script attaches to (the `$`-path base).
+    pub node: NodeIdx,
+    /// Whether the script attaches to **more than one** scene (the first kept here). When `true`,
+    /// a `$Path` valid in another scene must not be flagged `INVALID_NODE_PATH` (no false positive).
+    pub ambiguous: bool,
+}
+
+/// The project-wide **script → owning scene** index (M1): each `.gd`'s `res://` path → the (first)
+/// scene + node that attaches it. Built by scanning every scene's `ext_resources` for a
+/// `type="Script"` reference. Keyed on the [`SourceRoot`] file-set + each scene file's text (via
+/// [`scene_model`]); a `.gd` **body** edit never touches a `.tscn` text, so this **backdates across
+/// `.gd` keystrokes** — the firewall (a scene edit correctly invalidates it). A duplicate (one
+/// script in many scenes) keeps the first by `FileId` order (the slice's single-scene policy).
+#[salsa::tracked]
+pub fn script_scene_index(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolStr, SceneAttach>> {
+    let mut map: FxHashMap<SmolStr, SceneAttach> = FxHashMap::default();
+    for &file in root.files(db) {
+        if !file.res_path(db).as_deref().is_some_and(is_scene_path) {
+            continue;
+        }
+        let model = scene_model(db, file);
+        let scene = file.file_id(db);
+        for (i, node) in model.nodes.iter().enumerate() {
+            let Some(script_id) = node.script.as_ref() else {
+                continue;
+            };
+            let Some(path) = model
+                .ext_resources
+                .get(script_id)
+                .and_then(|e| e.path.clone())
+            else {
+                continue;
+            };
+            let node = NodeIdx(u32::try_from(i).unwrap_or(u32::MAX));
+            match map.get_mut(&path) {
+                // already attached by an earlier scene → ambiguous (keep the first).
+                Some(existing) => existing.ambiguous = true,
+                None => {
+                    map.insert(
+                        path,
+                        SceneAttach {
+                            scene,
+                            node,
+                            ambiguous: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Arc::new(map)
+}
+
+/// The owning-scene context for the script in `file` (M1): the scene's [`FileId`], the parsed
+/// scene, and the attach node, so `$Path`/`%Unique`/`get_node("…")` can resolve (and go-to-def can
+/// jump into the `.tscn`). `None` when the project has no scene attaching this script (the
+/// overwhelmingly common single-file / dynamic-UI case → node paths stay `Node`).
+#[must_use]
+pub fn scene_context(db: &dyn Db, file: FileText) -> Option<SceneContext> {
+    let res_path = file.res_path(db)?;
+    let root = db.source_root()?;
+    let attach = *script_scene_index(db, root).get(res_path.as_str())?;
+    let scene_file = db.file_text(attach.scene)?;
+    Some(SceneContext {
+        scene: attach.scene,
+        model: scene_model(db, scene_file),
+        attach: attach.node,
+        ambiguous: attach.ambiguous,
+    })
+}
+
+/// The resolved owning-scene context for a script — the scene file, its model, the attach node, and
+/// whether the attachment is ambiguous (multi-scene). Returned by [`scene_context`].
+#[derive(Debug, Clone)]
+pub struct SceneContext {
+    /// The owning scene's file.
+    pub scene: FileId,
+    /// The parsed scene model.
+    pub model: Arc<SceneModel>,
+    /// The node the script attaches to (the `$`-path base).
+    pub attach: NodeIdx,
+    /// Whether the script attaches to multiple scenes (suppresses `INVALID_NODE_PATH`).
+    pub ambiguous: bool,
 }
 
 #[cfg(test)]
@@ -1039,5 +1153,319 @@ mod tests {
             "expected both own_m() calls to type as String (narrow-down + widen-only), got {strings}",
         );
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    // ---- M1: scene-aware node-path typing ($Path / %Unique) -------------------------------
+
+    /// A db with file 0 = a scene and file 1 = its attached script, both with res:// paths.
+    fn scene_db(scene_text: &str, gd_text: &str) -> RootDatabase {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), scene_text, Durability::LOW);
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(FileId(1), gd_text, Durability::LOW);
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.sync_source_root();
+        db
+    }
+
+    fn binding_labels(db: &RootDatabase) -> Vec<String> {
+        let api = db.engine().unwrap();
+        let fi = analyze_file(db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            fi.diagnostics.is_empty(),
+            "unexpected diags: {:?}",
+            fi.diagnostics
+        );
+        fi.units
+            .iter()
+            .flat_map(|u| &u.result.bindings)
+            .filter_map(|b| b.ty.label(api))
+            .collect()
+    }
+
+    const SCENE: &str = "[gd_scene format=3]\n\
+        [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+        [node name=\"Root\" type=\"Control\"]\n\
+        script = ExtResource(\"1\")\n\
+        [node name=\"Panel\" type=\"Panel\" parent=\".\"]\n\
+        [node name=\"Box\" type=\"VBoxContainer\" parent=\"Panel\"]\n\
+        [node name=\"Btn\" type=\"Button\" parent=\"Panel/Box\"]\n\
+        unique_name_in_owner = true\n";
+
+    #[test]
+    fn dollar_path_types_to_the_concrete_node() {
+        // `$Panel/Box/Btn` → Button (not bare Node) — the killer feature, zero annotations.
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar b := $Panel/Box/Btn\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "$Panel/Box/Btn should type as Button",
+        );
+    }
+
+    #[test]
+    fn unique_name_path_types_to_the_concrete_node() {
+        // `%Btn` resolves via unique_name_in_owner → Button.
+        let db = scene_db(SCENE, "extends Control\nfunc _ready():\n\tvar b := %Btn\n");
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "%Btn should type as Button"
+        );
+    }
+
+    #[test]
+    fn onready_var_from_a_node_path_is_typed() {
+        // `@onready var x := $Path` types `x` from the resolved node at the decl site. (`:=` is the
+        // typed form; plain `=` stays `Variant` per Godot's gradual typing — Phase-2 rule.)
+        let db = scene_db(
+            SCENE,
+            "extends Control\n@onready var btn := $Panel/Box/Btn\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "@onready var := $Path should type to Button",
+        );
+    }
+
+    #[test]
+    fn get_node_string_literal_types_like_dollar() {
+        // `get_node("Panel/Box/Btn")` (string literal) types identically to `$Panel/Box/Btn`.
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar b := get_node(\"Panel/Box/Btn\")\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "get_node(\"...\") should type as Button",
+        );
+    }
+
+    #[test]
+    fn attached_script_refines_the_node_type() {
+        // A node `type="Button"` + `script=Fancy.gd (class_name Fancy)` → `$That` is `Fancy`, so
+        // `$That.fancy()` resolves to its cross-file return type (proving the script refine).
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"Script\" path=\"res://fancy.gd\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"That\" type=\"Button\" parent=\".\"]\n\
+             script = ExtResource(\"2\")\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar n := $That.fancy()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_file_text(
+            FileId(2),
+            "class_name Fancy\nextends Button\nfunc fancy() -> int:\n\treturn 1\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://fancy.gd");
+        db.sync_source_root();
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "int"),
+            "$That.fancy() should resolve via the attached script Fancy",
+        );
+    }
+
+    #[test]
+    fn computed_or_unresolvable_node_path_stays_node_without_warning() {
+        // A computed `get_node(var)` and a `$Nope` with no owning scene both stay `Node` — never a
+        // false node-path warning.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(1),
+            "extends Node\nfunc f(p):\n\tvar a := get_node(p)\n\tvar b := $Nope\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://lone.gd");
+        db.sync_source_root();
+        let fi = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            fi.diagnostics.is_empty(),
+            "no false node-path warnings: {:?}",
+            fi.diagnostics
+        );
+    }
+
+    // ---- M2: INVALID_NODE_PATH (the no-false-positive contract) ----------------------------
+
+    fn has_invalid_node_path(db: &RootDatabase) -> bool {
+        let fi = analyze_file(db, db.file_text(FileId(1)).unwrap());
+        fi.diagnostics
+            .iter()
+            .any(|d| d.code == crate::infer::INVALID_NODE_PATH)
+    }
+
+    #[test]
+    fn invalid_node_path_warns_when_genuinely_absent_in_a_single_owning_scene() {
+        let db = scene_db(SCENE, "extends Control\nfunc _ready():\n\tvar b := $Nope\n");
+        assert!(
+            has_invalid_node_path(&db),
+            "$Nope is absent in the one owning scene → warn"
+        );
+    }
+
+    #[test]
+    fn escape_and_absolute_paths_never_warn() {
+        // `..` and absolute `/root/…` escape the scene slice — silent, never INVALID_NODE_PATH.
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar a := $\"../Sibling\"\n\tvar c := $\"/root/Global\"\n",
+        );
+        assert!(!has_invalid_node_path(&db), "escape paths must not warn");
+    }
+
+    #[test]
+    fn path_descending_into_an_instanced_subscene_never_warns() {
+        // Root > Player(instance=…). `$Player/Gun` misses below an instance we don't recurse into —
+        // silent (the node may well exist inside the sub-scene).
+        let db = scene_db(
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://player.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Player\" parent=\".\" instance=ExtResource(\"2\")]\n",
+            "extends Control\nfunc _ready():\n\tvar g := $Player/Gun\n",
+        );
+        assert!(
+            !has_invalid_node_path(&db),
+            "into-instance miss must not warn"
+        );
+    }
+
+    #[test]
+    fn ambiguous_multi_scene_attachment_suppresses_the_invalid_warning() {
+        // main.gd attaches to BOTH a.tscn (child Alpha) and b.tscn (child Beta). `$Beta` is absent in
+        // a.tscn (kept first) but present in b.tscn → ambiguous → no false INVALID_NODE_PATH.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Alpha\" type=\"Button\" parent=\".\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://a.tscn");
+        db.set_file_text(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Beta\" type=\"Button\" parent=\".\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://b.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar b := $Beta\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.sync_source_root();
+        assert!(
+            !has_invalid_node_path(&db),
+            "ambiguous multi-scene attachment must not warn"
+        );
+    }
+
+    // ---- M3: instanced sub-scene recursion ------------------------------------------------
+
+    #[test]
+    fn instanced_node_recurses_into_the_subscene_root_script() {
+        // main.tscn: Root(script=main.gd) > Enemy(instance=enemy.tscn). enemy.tscn's root carries
+        // script=enemy.gd (class_name Enemy, `hp() -> int`). `$Enemy.hp()` must recurse into the
+        // sub-scene root, refine to the Enemy script, and resolve the cross-file method → `int`
+        // (proving the instance recursion + script refine; a bare `Node` would have no `hp()`).
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://enemy.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Enemy\" parent=\".\" instance=ExtResource(\"2\")]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar e := $Enemy.hp()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_file_text(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://enemy.gd\" id=\"1\"]\n\
+             [node name=\"Enemy\" type=\"Button\"]\n\
+             script = ExtResource(\"1\")\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://enemy.tscn");
+        db.set_file_text(
+            FileId(3),
+            "class_name Enemy\nextends Button\nfunc hp() -> int:\n\treturn 1\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(3), "res://enemy.gd");
+        db.sync_source_root();
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "int"),
+            "$Enemy.hp() should recurse into the instanced sub-scene root's script Enemy",
+        );
+    }
+
+    // ---- Phase-4 hunt fixes: `%`-segment paths (no false INVALID_NODE_PATH) ----------------
+
+    #[test]
+    fn unique_name_subpath_resolves_to_the_child_without_warning() {
+        // `%Box/Btn`: resolve the unique `%Box`, then walk `/Btn` to its Button child — idiomatic
+        // Godot. Must type as Button and NOT raise INVALID_NODE_PATH (the bare-map lookup of the
+        // whole joined "Box/Btn" used to miss → false warning).
+        let db = scene_db(
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Box\" type=\"VBoxContainer\" parent=\".\"]\n\
+             unique_name_in_owner = true\n\
+             [node name=\"Btn\" type=\"Button\" parent=\"Box\"]\n",
+            "extends Control\nfunc _ready():\n\tvar b := %Box/Btn\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "%Box/Btn → Button (and no false INVALID_NODE_PATH)",
+        );
+    }
+
+    #[test]
+    fn percent_prefixed_string_paths_resolve_as_unique_without_warning() {
+        // `get_node("%Btn")` and `$"%Btn"` are unique-name lookups (the `%` prefix lives inside the
+        // string), NOT a child literally named "%Btn". Must type as Button with no INVALID_NODE_PATH.
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar a := get_node(\"%Btn\")\n\tvar b := $\"%Btn\"\n",
+        );
+        let labels = binding_labels(&db);
+        assert!(
+            labels.iter().filter(|l| *l == "Button").count() >= 2,
+            "both %Btn string forms should resolve to Button: {labels:?}",
+        );
     }
 }

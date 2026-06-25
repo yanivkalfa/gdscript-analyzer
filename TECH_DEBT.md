@@ -6,6 +6,129 @@ later.
 
 ---
 
+## Phase 4 — Scene awareness (in progress)
+
+Driven by `plans/PHASE-4-SCENE-AWARENESS.md` + the fact-checked `plans/PHASE-4-M0-PLAYBOOK.md`.
+
+### M0 — the `gdscript-scene` `.tscn`/`.tres` parser — **DONE**
+A pure, wasm-clean, never-panic `parse_scene(&str) -> SceneModel` (node tree + ext/sub resources +
+byte spans + `SceneProblem`s). Grounded in a primary-source research pass (Godot
+`resource_format_text.cpp`/`variant_parser.cpp` + real corpora); the 12 load-bearing corrections
+(C1–C12) are folded into the impl and tests. Validated: clippy `-D`, wasm32, 16 tests (the C1–C12
+matrix + a vendored real-file corpus), and **524/524 godot-demo-projects scenes parse clean
+(8666 nodes), 0 problems, 0 panics**. Records (does **not** resolve) the typing inputs:
+`decl_type` / `script` / `instance` / `instance_is_inherited_root` / `instance_placeholder` /
+`unique_name_in_owner` / `script_class`.
+
+**M0 known limitations / deferrals (to M1+):**
+- [ ] **Type resolution is M1.** M0 only records `type=`/`script=`/`instance=`; mapping to a `Ty`
+      (native class / `class_name` registry / attached-script refine) is `gdscript-hir` M1.
+- [ ] **Instanced sub-scene recursion → M1+ (hard tail).** An instanced node records `instance`
+      (an `ExtId`); following it into the sub-scene's root type needs the cross-file VFS/project graph.
+- [ ] **Project-wide `script→scene` reverse index + salsa caching → M1.** M0's `node_with_script`
+      answers the *per-scene* half only; the cross-project map and the `scene_model(db, FileId)`
+      tracked query live in `gdscript-db`/`gdscript-hir`.
+- [ ] **`uid://` resolution → M1+.** M0 records `uid`; resolving a uid-only `ext_resource` to a path
+      needs the project UID map. M0 prefers `path=` when present.
+- [ ] **Inline `script = SubResource("…")` records no attachment.** An inline GDScript sub-resource
+      has no external path; M0 sets `script = None` (M1 types the node by its declared `type=`). Rare.
+- [ ] **`name_span` includes the surrounding quotes** (the `name="…"` value span). Fine for coarse
+      go-to-def; trim if a precise highlight is needed.
+- [ ] **A literal `/` inside a node name** would break `/`-segmented path matching (Godot disallows
+      it at edit time; a hand-edited file could violate it). Treated as opaque segments.
+- [ ] **No in-repo full corpus.** 5 representative real fixtures are vendored under
+      `crates/gdscript-scene/tests/corpus/`; the broad robustness run is ad hoc via
+      `cargo run -p gdscript-scene --example scene_corpus -- <dir>` (not in CI).
+
+### M0 adversarial bug hunt (5-finder → 3-vote verify) — fixed + deferred
+The post-M0 hunt (9 confirmed, 6 rejected; never-panic + UTF-8 safety signed off) fixed:
+- [x] **`..`/absolute (`/root/…`) parent paths false-flagged `DanglingParent`.** Spec §5/§7 say these
+      degrade silently. `walk_path` now returns a 3-state `Walk { Resolved | Escaped | Missed }`;
+      only a genuine `Missed` is a candidate dangling. (Found 4× independently.)
+- [x] **`instance_is_inherited_root` set on spurious extra roots** in a `MultipleRoots` scene — now
+      gated on being THE chosen root.
+- [x] **Duplicate sibling names: `by_path`/`resolve_path` now first-wins** (`or_insert`), matching
+      `unique_nodes`; `children_of` still lists both.
+
+Deferred (low / cosmetic / engine-impossible):
+- [ ] **`unescape` drops `\uXXXX`/`\UXXXXXX`/`\b`/`\f`** → a name with such an escape mis-decodes
+      (e.g. `A` → `u0041`). Cosmetic *and consistent* (applied to both `name=` and `parent=`, so
+      path matching still works); display/go-to-def only. Rare. Extend `unescape` if it surfaces.
+- [ ] **Cascading dangling:** a node parented to a sibling whose own parent dangled is itself
+      flagged. Secondary effect; rare. Track an "upstream-dangling" set to suppress the secondary.
+- [ ] **A node literally named `"."`** makes `by_path["."]` that `resolve_path` can't return —
+      engine-impossible input; **wontfix**.
+
+### M1 — scene-aware node-path typing — **DONE**
+`$Path` / `%Unique` / `@onready var x := $Path` / `get_node("literal")` resolve to the node's concrete
+type (the 90% slice): an attached script's own `class_name` (most specific) wins, else the declared
+`type=` (native class or `class_name` registry). Computed `get_node(var)`, an unresolvable path, or
+no owning scene all degrade to `Object(Node)` with **no false warning** (the engine floor). Wiring:
+salsa `scene_model(db, FileText)` + the firewalled project-wide `script_scene_index(db, root)` (a
+`.gd` body edit never invalidates it); `scene_context(db, file)` recovers the owning scene + attach
+node (via `self_ty` = the file's own `ScriptRef`, no extra `FileId` threading). `.tscn` is ingested
+through the normal `apply_change` path (a `FileText` with a `.tscn` `res://` path). Hover/inlay show
+the resolved type automatically. Validated: `xtask ci` green + 7 new typing tests + a public-API
+end-to-end inlay test.
+
+**M1 deferrals (→ M2+):**
+- [ ] **1-script-many-scenes = first scene wins** for *typing*. `script_scene_index` keeps the first
+      attaching scene (now also flagging the attachment `ambiguous`, which M2 uses to suppress false
+      `INVALID_NODE_PATH`); the common-base union *typing* policy (Playbook §6.3) is later.
+- [ ] **`.tscn`-autoload sharpening still seam.** A `*`-autoload pointing at a `.tscn` could now read
+      the scene root's type (the machinery exists); wired later.
+
+### M2 — scene-aware diagnostics & navigation — **DONE**
+Built on M1's resolution: **go-to-definition** on a node-path jumps into the owning `.tscn`'s
+`[node …]` line (`def::node_path_target` → a `NavTarget` at the node's `name=` span); the
+**`INVALID_NODE_PATH`** warning fires on a genuinely-absent in-scene node; **node-path completion**
+offers a `$`-path prefix's child node names (typed by their `type=`). The `INVALID_NODE_PATH`
+**no-false-positive contract** (4 locked tests): warns only when the path genuinely misses *and* the
+script attaches to exactly one scene — silent on `..`/absolute escapes, misses that descend into an
+instanced sub-scene, and ambiguous multi-scene attachments (`SceneModel::classify_path_from` returns
+the 3-state `NodePathResolution`; `SceneAttach::ambiguous` guards the multi-scene case).
+
+### M3 — instanced sub-scene recursion — **DONE**
+An instanced node (`instance=ExtResource("sub.tscn")`, no own `type=`/script) now types as the
+**instanced sub-scene's ROOT** node, resolved recursively, so the root's own script / `type=` /
+nested instance all flow through (`$Enemy` → `enemy.tscn`'s root class, e.g. `$Enemy.hp()` resolves
+the cross-file method). `infer::instance_root_ty` follows the ext-resource path through
+`res_path_registry` → `scene_model`, depth-bounded (≤16) against an instancing cycle.
+
+### M1–M3 adversarial bug hunt (5-finder → 3-vote, 3 lenses) — fixed
+The post-M3 hunt confirmed **3 distinct false-positive bugs** (all `INVALID_NODE_PATH` / completion
+violations; `rejected: []`), each verified end-to-end and now fixed + regression-tested:
+- [x] **`%Name/Child` subpath false-warned.** `classify_unique`/`resolve_unique` did a single
+      bare-map lookup of the whole joined path (`"Box/Btn"`), missing → false `INVALID_NODE_PATH`,
+      though `%Box/Btn` (resolve the unique node, then walk `/Btn`) is idiomatic Godot.
+- [x] **`$"%Name"` / `get_node("%Name")` string forms false-warned.** The `%` lived *inside* the
+      string (`unique:false`), so it was looked up as a child literally named `"%Name"` → miss →
+      false warning.
+- [x] **Node-path completion hijacked inside string literals/comments.** `dollar_path_prefix` is a
+      pure byte scan; a `$x/` inside `"…"` or `#…` would offer scene node names.
+
+The fix unifies the first two: the path walk (`resolve_path_from` / `classify_path_from`) is now
+**`%`-segment-aware** — a `%X` segment resolves scene-wide via `unique_nodes` (the `step_segment`
+helper), so leading **and** mid-path `%` work everywhere; `resolve_unique`/`classify_unique` mark the
+sigil form's head segment and delegate. The completion fix guards on the `ast::token_at` kind
+(`String`/trivia → bail). The bare `$Panel/` completion still works (`Dollar`/`Ident`/`Slash`
+tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is lost.
+
+**M2/M3 deferrals (→ later):**
+- [ ] **Paths *into* an instance stay `Node`.** `$Enemy` is now typed (the instance root), but
+      `$Enemy/Sprite` (a node *inside* the sub-scene) still degrades to `Node` (`IntoInstance` — no
+      false warn). Resolving across the scene boundary into the sub-scene's own tree is the remaining
+      tail; the node-type case (the headline) is done.
+- [ ] **`self.get_node("…")` (explicit-self / `obj.get_node`) not intercepted** — only bare
+      `get_node("…")` (implicit self) and `$`/`%`. Explicit/foreign forms stay a normal call → `Node`.
+- [ ] **`%Unique` completion deferred.** `$`-path completion is done; `%`-name completion is held
+      because disambiguating `%Name` (unique node) from `a %b` (modulo) needs token context, not the
+      backward byte scan. Typing/goto/diagnostic for `%` all work — only its *completion* is pending.
+- [ ] **Scene-aware rename → Phase 6.** Renaming a node in a `.tscn` and updating `$Path`s (or vice
+      versa) is deferred per the plan; M2 ships the read-side features (type/goto/complete/diagnose).
+
+---
+
 ## Repo / ops state
 
 - **Branch protection:** `dev` and `master` are governed by the **"Protect dev + master"**
