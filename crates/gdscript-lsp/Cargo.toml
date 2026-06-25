@@ -8,8 +8,25 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# A library (the testable server core) + a thin stdio binary that drives it — the rust-analyzer
+# split, so the event loop can be exercised over in-memory channels with no subprocess.
+[lib]
+name = "gdscript_lsp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gdscript-lsp"
+path = "src/main.rs"
+
 [dependencies]
 gdscript-ide = { workspace = true }
+gdscript-base = { workspace = true }
+lsp-server = { workspace = true }
+lsp-types = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
 
 [lints]
 workspace = true
