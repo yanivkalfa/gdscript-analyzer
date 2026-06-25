@@ -433,6 +433,52 @@ fn node_has_ancestor_or_self(node: &GdNode, kind: SyntaxKind) -> bool {
     false
 }
 
+// ---- M2: node-path navigation (go-to-definition into the `.tscn`) -------------------------
+
+/// A `$Path`/`%Unique`/`get_node("…")` resolved to its scene-node declaration — for go-to-definition
+/// **into the owning `.tscn`** (the `[node …]` line). The inverse of M1's node-path typing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePathTarget {
+    /// The owning scene's file.
+    pub scene: FileId,
+    /// The resolved node's name.
+    pub node_name: SmolStr,
+    /// Byte span of the whole `[node …]` header line.
+    pub header_span: TextRange,
+    /// Byte span of the `name="…"` value (the finer focus).
+    pub name_span: TextRange,
+}
+
+/// If the cursor sits on a node-path expression (`$Path`/`%Unique`/`get_node("…")`) that resolves
+/// against the owning scene, the target node's declaration in the `.tscn`. `None` otherwise.
+#[must_use]
+pub fn node_path_target(db: &dyn Db, pos: FilePosition) -> Option<NodePathTarget> {
+    let ft = db.file_text(pos.file)?;
+    let fi = crate::queries::analyze_file(db, ft);
+    let unit = fi.unit_at(pos.offset)?;
+    let eid = unit.body.source_map.expr_at_offset(pos.offset)?;
+    let crate::body::Expr::GetNode {
+        path: Some(path),
+        unique,
+    } = unit.body.expr(eid)
+    else {
+        return None;
+    };
+    let ctx = crate::queries::scene_context(db, ft)?;
+    let idx = if *unique {
+        ctx.model.resolve_unique(path)
+    } else {
+        ctx.model.resolve_path_from(ctx.attach, path)
+    }?;
+    let node = ctx.model.node(idx)?;
+    Some(NodePathTarget {
+        scene: ctx.scene,
+        node_name: node.name.clone(),
+        header_span: node.header_span,
+        name_span: node.name_span,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

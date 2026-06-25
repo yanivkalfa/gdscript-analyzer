@@ -540,6 +540,7 @@ dependencies = [
  "gdscript-api",
  "gdscript-base",
  "gdscript-db",
+ "gdscript-scene",
  "gdscript-syntax",
  "rustc-hash",
  "salsa",
@@ -575,6 +576,8 @@ name = "gdscript-scene"
 version = "0.1.0"
 dependencies = [
  "gdscript-base",
+ "rustc-hash",
+ "smol_str",
 ]
 
 [[package]]
