@@ -1,8 +1,11 @@
-name: docs
+name: pages
 
-# mdBook guide (Phase 0, Workstream F.1). Build + `mdbook test` (validates Rust
-# samples) + linkcheck on every PR; build AND deploy to GitHub Pages on push to
-# master via the official Pages flow (OIDC, no gh-pages branch).
+# GitHub Pages — ONE site, TWO sources (Phase 5 GA):
+#   /            → the mdBook guide (docs/)
+#   /playground/ → the wasm playground (playground/index.html + the wasm-pack pkg + engine blob)
+# Build + validate on every PR; assemble a single `_site/` and deploy on push to master (official
+# Pages flow, OIDC, no gh-pages branch). A repo has ONE Pages site, so the build job assembles both
+# into one directory and uploads it once.
 on:
   pull_request:
   push:
@@ -12,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: docs-${{ github.ref }}
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,25 +27,50 @@ jobs:
       - name: Install mdbook + mdbook-linkcheck
         uses: taiki-e/install-action@v2
         with:
-          # Pinned: mdbook 0.5 changed its RenderContext and breaks
-          # mdbook-linkcheck 0.7.7 ("missing field `sections`"). 0.4.40 is a 0.4.x
-          # that linkcheck 0.7.7 supports. Revisit when linkcheck gains 0.5 support.
+          # Pinned: mdbook 0.5 breaks mdbook-linkcheck 0.7.7; 0.4.40 is supported.
           tool: mdbook@0.4.40,mdbook-linkcheck@0.7.7
       - name: mdbook test
         run: mdbook test docs
       - name: mdbook build
-        run: mdbook build docs
-      - name: Upload Pages artifact
-        # Only needed for the deploy job (push to master).
+        run: mdbook build docs # → docs/book
+
+      # ---- the playground (deploy path only — the wasm build is heavy; ci.yml already builds it on PRs) ----
+      - name: Install Rust + wasm target
         if: github.event_name == 'push'
-        uses: actions/upload-pages-artifact@v5
+        uses: dtolnay/rust-toolchain@stable
         with:
-          path: docs/book
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name == 'push'
+      - name: Install wasm-pack
+        if: github.event_name == 'push'
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.15.0"
+      - name: Build the wasm playground package
+        if: github.event_name == 'push'
+        # `--out-dir` is CRATE-relative (crate_path.join), so `../../playground/pkg` → repo-root
+        # `playground/pkg` (the assemble step copies repo-root `playground/`).
+        run: wasm-pack build --target web --release --out-dir ../../playground/pkg --out-name gdscript bindings/wasm
+
+      - name: Assemble the Pages site (docs at /, playground at /playground/)
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p _site/playground/data
+          cp -r docs/book/. _site/                                  # mdBook → /
+          cp -r playground/. _site/playground/                      # index.html + pkg → /playground/
+          cp crates/gdscript-api/src/engine_api.bin _site/playground/data/extension_api.bin  # engine model
+          touch _site/.nojekyll                                     # ship underscore dirs (pkg/, _*)
+      - name: Upload Pages artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+          include-hidden-files: true # else .nojekyll (a dotfile) is dropped — Pages then 404s pkg/
 
   deploy:
     name: deploy (GitHub Pages)
     needs: build
-    # Deploy only on push to master; PRs build (above) but do not deploy.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -53,7 +81,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Configure Pages
-        uses: actions/configure-pages@v6
+        uses: actions/configure-pages@v5
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5

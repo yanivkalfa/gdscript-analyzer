@@ -11,14 +11,37 @@
 # All crates share one version and release together.
 allow_dirty        = false        # never release from a dirty tree
 changelog_update   = true         # regenerate CHANGELOG.md from commits
-git_release_enable = true         # create the GitHub Release for the tag
+# Release ownership is SPLIT with `dist` (avoids two tools racing on the GitHub Release):
+#   release-plz pushes the tag (which triggers release-napi/wasm/dist — needs the PAT), and
+#   `dist` (release.yml) creates the GitHub Release + uploads the CLI/LSP binaries.
+git_tag_enable     = true         # release-plz pushes `v<version>` (drives the whole release)
+git_release_enable = false        # dist owns the GitHub Release, not release-plz
 semver_check       = true         # run cargo-semver-checks before bumping
 pr_branch_prefix   = "release-plz/"
 
-# Keep the npm-only / non-published crates out of the crates.io release.
-# (gdscript-ffi, gdscript-lsp, gdscript-cli, and the bindings carry
-# `publish = false` in their own Cargo.toml until Phase 5; release-plz honours
-# that, so no per-package override is needed here in Phase 0.)
+# The npm-/binary-distributed crates publish via their own pipelines (release-napi/wasm, dist), not
+# crates.io. `publish = false` in their Cargo.toml already stops the crates.io push; `release = false`
+# here also keeps them out of release-plz's release/tag bookkeeping. (gdscript-session is the internal
+# core bundled into the bindings — never published anywhere.)
+[[package]]
+name    = "gdscript-session"
+release = false
+
+[[package]]
+name    = "gdscript-ffi"
+release = false
+
+[[package]]
+name    = "gdscript-wasm"
+release = false
+
+[[package]]
+name    = "gdscript-cli"
+release = false
+
+[[package]]
+name    = "gdscript-lsp"
+release = false
 
 # ---------------------------------------------------------------------------
 # 0.x bump policy (the canonical mapping from plans §D.2):

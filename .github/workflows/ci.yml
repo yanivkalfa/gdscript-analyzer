@@ -153,7 +153,8 @@ jobs:
         with:
           tool: wasm-pack
       - name: build browser package
-        run: wasm-pack build --target web --out-dir playground/pkg --out-name gdscript bindings/wasm
+        # `--out-dir` is crate-relative → `../../playground/pkg` lands at repo-root `playground/pkg`.
+        run: wasm-pack build --target web --out-dir ../../playground/pkg --out-name gdscript bindings/wasm
 
   coverage:
     name: coverage
