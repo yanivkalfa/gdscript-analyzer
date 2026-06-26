@@ -4,18 +4,23 @@ name: release-napi
 #
 # Fires when release-plz pushes a `v<version>` tag (which requires release-plz to push with a
 # PAT/App token — the default GITHUB_TOKEN does NOT trigger downstream workflows). Also
-# `workflow_dispatch` for manual runs (build-only; publish is gated on a tag).
+# `workflow_dispatch`: build-only by default, or `publish: true` to re-publish core as a recovery
+# route when a tag run failed after a fix landed (see the publish job's `if`).
 #
 # Modeled on the official napi-rs/package-template CI (@napi-rs/cli v3). Per-target build:
 #   native (mac/win)          : napi build --platform --release --target <triple>
 #   linux aarch64 gnu (cross) : … --use-napi-cross
-#   wasm                      : … --target wasm32-wasip1-threads
 # The matrix MUST match `bindings/node/package.json`'s `napi.targets` (drives `napi prepublish`).
-# (musl/zigbuild, armv7, win-arm64 are deferred to a follow-up once this flow is proven.)
+# (wasm32-wasip1-threads, musl/zigbuild, armv7, win-arm64 are deferred to a follow-up once proven.)
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Re-publish @gdscript-analyzer/core to npm. Use to recover a release whose tag run failed AFTER the fix is on the selected branch; builds at that branch's package.json version. Leave false for a build-only check."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,9 +56,11 @@ jobs:
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             build: npm run build -- --target aarch64-unknown-linux-gnu --use-napi-cross
-          - host: ubuntu-latest
-            target: wasm32-wasip1-threads
-            build: npm run build -- --target wasm32-wasip1-threads
+          # wasm32-wasip1-threads is intentionally OMITTED from this first GA: it needs the emnapi
+          # runtime packages + WASI glue uploads + a WASI-SDK link step, none of which are proven. The
+          # 5 native targets cover the Node consumers (incl. the guitkx editor extension); the BROWSER
+          # need is served by the separate wasm-bindgen package @gdscript-analyzer/wasm. Re-add wasm
+          # here AND in bindings/node/package.json napi.targets (in lockstep) once it's proven green.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -75,18 +82,32 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.settings.target }}
-          # `@actions/glob` has NO brace expansion — list patterns on separate lines.
+          path: bindings/node/*.node # native targets emit one .node each (wasm target dropped for this GA)
+          if-no-files-found: error
+      # `napi build` ALSO emits the JS loader (index.js) + types (index.d.ts) — but they are gitignored,
+      # so the publish job's fresh checkout does NOT have them, and the publish job never runs `napi
+      # build`. Without these the MAIN @gdscript-analyzer/core tarball ships `main: index.js`/`types:
+      # index.d.ts` pointing at missing files -> `require()` throws MODULE_NOT_FOUND. They are identical
+      # across targets, so upload them ONCE (from the linux row) and the publish job restores them.
+      - name: Upload the JS loader + types (publish restores these into the package root)
+        if: matrix.settings.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: napi-js-loader
           path: |
-            bindings/node/*.node
-            bindings/node/*.wasm
+            bindings/node/index.js
+            bindings/node/index.d.ts
           if-no-files-found: error
 
   publish:
     name: publish @gdscript-analyzer/core
     needs: build
     runs-on: ubuntu-latest
-    # Publish only on a release tag (build-only on workflow_dispatch).
-    if: startsWith(github.ref, 'refs/tags/')
+    # Publish on a release tag, OR on a manual workflow_dispatch with `publish: true`. The dispatch path
+    # is the RECOVERY route: when a tag run fails after a fix lands, re-publish core at the branch's
+    # version WITHOUT re-firing the wasm/dist tag workflows (which would collide with already-published
+    # versions). github.ref is a branch on dispatch, so the tag check is false there — hence the `||`.
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish
     permissions:
       contents: read
       id-token: write # OIDC for npm provenance
@@ -104,6 +125,12 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: bindings/node/artifacts
+      # Restore the gitignored loader+types that the build job uploaded (see the build job's upload step).
+      # Must happen before `npm run artifacts`/publish so the main package tarball contains them.
+      - name: Restore the JS loader + types into the package root
+        run: |
+          cp artifacts/napi-js-loader/index.js index.js
+          cp artifacts/napi-js-loader/index.d.ts index.d.ts
       - name: Move artifacts into per-platform packages
         run: npm run artifacts
       - name: Publish (provenance + prepublishOnly patches optionalDependencies)
