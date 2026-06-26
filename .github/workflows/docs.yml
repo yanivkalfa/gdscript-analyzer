@@ -49,7 +49,9 @@ jobs:
           version: "v0.15.0"
       - name: Build the wasm playground package
         if: github.event_name == 'push'
-        run: wasm-pack build --target web --release --out-dir playground/pkg --out-name gdscript bindings/wasm
+        # `--out-dir` is CRATE-relative (crate_path.join), so `../../playground/pkg` → repo-root
+        # `playground/pkg` (the assemble step copies repo-root `playground/`).
+        run: wasm-pack build --target web --release --out-dir ../../playground/pkg --out-name gdscript bindings/wasm
 
       - name: Assemble the Pages site (docs at /, playground at /playground/)
         if: github.event_name == 'push'

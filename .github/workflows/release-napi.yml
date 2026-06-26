@@ -30,8 +30,8 @@ defaults:
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.host }}
+    name: build (${{ matrix.settings.target }})
+    runs-on: ${{ matrix.settings.host }}
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +75,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.settings.target }}
-          path: bindings/node/*.{node,wasm}
+          # `@actions/glob` has NO brace expansion — list patterns on separate lines.
+          path: |
+            bindings/node/*.node
+            bindings/node/*.wasm
           if-no-files-found: error
 
   publish:
@@ -108,5 +111,4 @@ jobs:
           npm config set provenance true
           npm publish --access public
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

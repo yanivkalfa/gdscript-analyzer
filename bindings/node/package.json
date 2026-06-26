@@ -16,7 +16,7 @@
   "types": "index.d.ts",
   "engines": { "node": ">=20" },
   "scripts": {
-    "artifacts": "napi artifacts --output-dir .",
+    "artifacts": "napi artifacts",
     "build": "napi build --platform --release --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
     "build:debug": "napi build --platform --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
     "prepublishOnly": "napi prepublish -t npm",
