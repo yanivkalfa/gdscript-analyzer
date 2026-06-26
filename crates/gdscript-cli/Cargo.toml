@@ -8,12 +8,30 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# A library (the testable command/engine/report core) + a thin binary that parses args and exits.
+[lib]
+name = "gdscript_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gdscript"
 path = "src/main.rs"
 
 [dependencies]
 gdscript-ide = { workspace = true }
+gdscript-base = { workspace = true }
+clap = { workspace = true }
+rayon = { workspace = true }
+ignore = { workspace = true }
+anstream = { workspace = true }
+anstyle = { workspace = true }
+annotate-snippets = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

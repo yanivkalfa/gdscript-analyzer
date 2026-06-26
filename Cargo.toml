@@ -93,6 +93,17 @@ console_error_panic_hook = "0.1"
 # `cc`, so it can't target wasm32. See Playbook §1 / §WS5.
 tree-sitter = "0.26"
 tree-sitter-gdscript = "6.1"
+# Phase 5 — the `gdscript` CLI (`gdscript-cli`, native-only). A filesystem + presentation shell over
+# `gdscript-ide`: clap v4 command tree, the `ignore` crate for .gitignore-aware traversal, `rayon`
+# to fan out `diagnostics(file)` over cloned `Analysis` snapshots, `annotate-snippets` for
+# rustc-style human output, `anstream` for NO_COLOR/non-tty-aware color. See
+# plans/PHASE-5-CLI-PLAYBOOK.md.
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+ignore = "0.4"
+anstream = "0.6"
+anstyle = "1"
+annotate-snippets = "0.12"
 # dev/test
 expect-test = "1.5" # rust-analyzer's golden mechanism (UPDATE_EXPECT=1 to bless)
 proptest = "1.11" # local panic-free robustness harness (in-process; gnu-clean)
