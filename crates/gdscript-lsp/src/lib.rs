@@ -94,6 +94,8 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         }),
         document_symbol_provider: Some(OneOf::Left(true)),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        // M2.
+        inlay_hint_provider: Some(OneOf::Left(true)),
         ..Default::default()
     }
 }
@@ -196,6 +198,7 @@ impl GlobalState {
             "textDocument/signatureHelp" => self.spawn_pos(req, handlers::signature_help),
             "textDocument/documentSymbol" => self.spawn_file(req, handlers::document_symbols),
             "textDocument/foldingRange" => self.spawn_file(req, handlers::folding_ranges),
+            "textDocument/inlayHint" => self.spawn_file(req, handlers::inlay_hints),
             other => self.send(Response::new_err(
                 req.id,
                 METHOD_NOT_FOUND,
@@ -701,6 +704,60 @@ mod tests {
         );
         let resp = next_response(&client);
         assert_eq!(resp.error.map(|e| e.code), Some(METHOD_NOT_FOUND));
+
+        send_req(&client, 9, "shutdown", ());
+        let _ = next_response(&client);
+        send_note(&client, "exit", ());
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn inlay_hints_over_the_public_api() {
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || run(&server));
+        send_req(&client, 1, "initialize", InitializeParams::default());
+        let init = next_response(&client);
+        let init: InitializeResult = serde_json::from_value(init.result.unwrap()).unwrap();
+        assert!(
+            init.capabilities.inlay_hint_provider.is_some(),
+            "inlayHint advertised"
+        );
+        send_note(&client, "initialized", InitializedParams {});
+
+        let doc_uri = uri("file:///main.gd");
+        send_note(
+            &client,
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "gdscript".to_owned(),
+                    version: 1,
+                    text: "func f():\n\tvar x := 1\n".to_owned(), // `x` gets a `: int` hint
+                },
+            },
+        );
+        let _ = next_diagnostics(&client);
+
+        send_req(
+            &client,
+            2,
+            "textDocument/inlayHint",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri.as_str() },
+                "range": { "start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 0} },
+            }),
+        );
+        let resp = next_response(&client);
+        assert!(resp.error.is_none(), "inlayHint errored: {resp:?}");
+        let hints: Vec<lsp_types::InlayHint> =
+            serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(
+            hints.iter().any(
+                |h| matches!(&h.label, lsp_types::InlayHintLabel::String(s) if s.contains("int"))
+            ),
+            "expected a `: int` inlay hint: {hints:?}",
+        );
 
         send_req(&client, 9, "shutdown", ());
         let _ = next_response(&client);

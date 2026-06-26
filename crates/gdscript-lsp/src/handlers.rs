@@ -73,3 +73,12 @@ pub fn folding_ranges(a: &Analysis, ctx: &DocCtx) -> Cancellable<Vec<lsp::Foldin
         .map(|f| convert::folding_range_to_lsp(&ctx.line_index, &ctx.text, f, ctx.encoding))
         .collect())
 }
+
+/// `textDocument/inlayHint` — all hints for the file. (The LSP request carries a visible range; we
+/// return the whole file's hints and let the client filter — they're cheap.)
+pub fn inlay_hints(a: &Analysis, ctx: &DocCtx) -> Cancellable<Vec<lsp::InlayHint>> {
+    Ok(a.inlay_hints(ctx.file)?
+        .iter()
+        .map(|h| convert::inlay_hint_to_lsp(&ctx.line_index, &ctx.text, h, ctx.encoding))
+        .collect())
+}

@@ -4,7 +4,7 @@
 
 use gdscript_base::{
     CompletionItem, CompletionKind, Diagnostic, DocumentSymbol, FoldKind, FoldRange, HoverResult,
-    Severity, SignatureHelp, SymbolKind, TextRange,
+    InlayHint, InlayHintKind, Severity, SignatureHelp, SymbolKind, TextRange,
 };
 use lsp_types as lsp;
 
@@ -234,6 +234,29 @@ pub fn folding_range_to_lsp(
         end_character: Some(end.character),
         kind,
         collapsed_text: None,
+    }
+}
+
+/// An [`InlayHint`] → an LSP [`InlayHint`](lsp::InlayHint) (rendered at its byte offset → position).
+#[must_use]
+pub fn inlay_hint_to_lsp(
+    li: &LineIndex,
+    text: &str,
+    hint: &InlayHint,
+    enc: PositionEncoding,
+) -> lsp::InlayHint {
+    lsp::InlayHint {
+        position: li.position(text, hint.offset, enc),
+        label: lsp::InlayHintLabel::String(hint.label.clone()),
+        kind: Some(match hint.kind {
+            InlayHintKind::Type => lsp::InlayHintKind::TYPE,
+            InlayHintKind::Parameter => lsp::InlayHintKind::PARAMETER,
+        }),
+        text_edits: None,
+        tooltip: None,
+        padding_left: None,
+        padding_right: None,
+        data: None,
     }
 }
 
