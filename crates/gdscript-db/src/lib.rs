@@ -90,6 +90,19 @@ pub struct ProjectConfig {
     pub project_godot_text: Arc<str>,
 }
 
+/// A generation counter that makes the otherwise-untracked runtime engine model **invalidate**
+/// correctly. The engine model is a leaked `&'static` side handle (not a salsa input), so a query
+/// memoized while it was still absent (`engine() == None`, on `wasm32` before `set_engine_api`)
+/// would otherwise return that stale empty result forever. Every `engine()` read records a
+/// dependency on this input; `set_engine_api` bumps it, recomputing those queries. The *value* is
+/// irrelevant — only that setting it advances the revision. Used on `wasm32` only (native has the
+/// bundled model from the start, so it never changes — no generation tracking, no overhead).
+#[salsa::input]
+pub struct EngineGeneration {
+    /// An opaque counter (only its revision matters).
+    pub generation: u32,
+}
+
 /// The `FileId → FileText` side table. `Arc`-backed so a cheap clone shares the same map —
 /// needed to mutate an input (`&mut dyn Db`) without simultaneously borrowing `self.files`.
 #[derive(Debug, Default, Clone)]
@@ -176,9 +189,13 @@ pub struct RootDatabase {
     /// A runtime-injected engine model. `None` falls back to the bundled blob on native and to "no
     /// engine model" on `wasm32` (where nothing is embedded). The wasm binding fetches the blob and
     /// installs it here via [`RootDatabase::set_engine_api`] (Playbook §4.4). Held outside salsa (a
-    /// process-lifetime `&'static`, leaked once) and **set before the first query** — it is not a
-    /// salsa input, so changing it after a read would not invalidate (the load-once contract).
+    /// process-lifetime `&'static`, leaked once).
     engine: Option<&'static EngineApi>,
+    /// `wasm32`-only: the [`EngineGeneration`] input that makes a *later* `set_engine_api` invalidate
+    /// queries memoized while the model was still absent (so the order "query, then load the engine"
+    /// is correct, not just "load, then query"). Lazily created on the first structural change.
+    #[cfg(target_arch = "wasm32")]
+    engine_gen: Option<EngineGeneration>,
 }
 
 // `salsa::Storage` is not `Debug`, but the public `AnalysisHost`/`Analysis` that will own a
@@ -240,6 +257,29 @@ impl RootDatabase {
     pub fn set_engine_api(&mut self, api: EngineApi) {
         if self.engine.is_none() {
             self.engine = Some(Box::leak(Box::new(api)));
+            // wasm: advance the generation so any query memoized while the model was absent (the
+            // "query before load" order) recomputes. Native never reaches here through the bindings,
+            // and its bundled model is present from the start, so it needs no generation tracking.
+            #[cfg(target_arch = "wasm32")]
+            self.bump_engine_generation();
+        }
+    }
+
+    /// wasm-only: create-or-advance the [`EngineGeneration`] input (see its docs). Creating it the
+    /// first time is harmless; advancing it invalidates every query that read `engine()`.
+    #[cfg(target_arch = "wasm32")]
+    fn bump_engine_generation(&mut self) {
+        if let Some(eg) = self.engine_gen {
+            let next = eg.generation(self).wrapping_add(1);
+            eg.set_generation(self)
+                .with_durability(Durability::MEDIUM)
+                .to(next);
+        } else {
+            self.engine_gen = Some(
+                EngineGeneration::builder(0)
+                    .durability(Durability::MEDIUM)
+                    .new(self),
+            );
         }
     }
 
@@ -248,6 +288,18 @@ impl RootDatabase {
     /// MEDIUM-durability project input (and everything derived from it) stays stable across
     /// keystrokes.
     pub fn sync_source_root(&mut self) {
+        // wasm: ensure the engine generation exists before the first query runs, so every query's
+        // `engine()` read records a dependency on it — otherwise a `set_engine_api` afterwards could
+        // not invalidate a query that ran before the input existed. (The first structural change
+        // always precedes the first query, since the Session early-returns for unknown URIs.)
+        #[cfg(target_arch = "wasm32")]
+        if self.engine_gen.is_none() {
+            self.engine_gen = Some(
+                EngineGeneration::builder(0)
+                    .durability(Durability::MEDIUM)
+                    .new(self),
+            );
+        }
         let files = self.files.all();
         if let Some(root) = self.root {
             root.set_files(self)
@@ -275,6 +327,12 @@ impl Db for RootDatabase {
     // `None` (until the binding installs a fetched blob). clippy sees one target per build.
     #[allow(clippy::unnecessary_wraps)]
     fn engine(&self) -> Option<&'static EngineApi> {
+        // wasm: record a dependency on the generation so a later `set_engine_api` invalidates this
+        // read. (Native skips this entirely — the bundled model is constant, so zero overhead.)
+        #[cfg(target_arch = "wasm32")]
+        if let Some(eg) = self.engine_gen {
+            let _ = eg.generation(self);
+        }
         if let Some(api) = self.engine {
             return Some(api);
         }

@@ -106,9 +106,10 @@ impl Session {
 
     /// Install a runtime-fetched engine model (the wasm path: a `fetch`ed `extension_api` blob).
     /// Returns `false` if the bytes fail to decode. Native builds use the bundled model and need not
-    /// call this; the **wasm** binding fetches the blob and installs it here before its first query
-    /// (without it, completion/hover for engine classes like `Button`/`Control` are unavailable on
-    /// wasm — the embedded blob is native-only). Load once, before querying.
+    /// call this; the **wasm** binding fetches the blob and installs it (without it, completion/hover
+    /// for engine classes like `Button`/`Control` are unavailable on wasm — the embedded blob is
+    /// native-only). First install wins; installing it **after** queries have run recomputes them
+    /// (the wasm engine-generation invalidation), so an async load after opening a document is safe.
     pub fn load_engine_api(&mut self, bytes: &[u8]) -> bool {
         self.host.set_engine_api(bytes)
     }
