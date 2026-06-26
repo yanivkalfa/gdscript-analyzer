@@ -143,6 +143,42 @@ fn is_resource_path(p: &str) -> bool {
     p.starts_with("res://") || p.starts_with("user://")
 }
 
+/// Anchor a `preload`/`extends` resource path to an absolute `res://`/`user://` path the way Godot
+/// does (`reduce_preload`: `script_path.get_base_dir().path_join(p).simplify_path()`): an already-
+/// absolute path passes through unchanged; a RELATIVE path is joined to `importing`'s directory and
+/// simplified (`.`/`..` collapsed). `None` only when the path is relative and `importing` carries no
+/// resource anchor — the conservative seam (never a false resolution).
+#[must_use]
+pub fn anchor_res_path(importing: Option<&str>, raw: &str) -> Option<SmolStr> {
+    if is_resource_path(raw) {
+        return Some(SmolStr::new(raw));
+    }
+    let (scheme, rest) = importing?.split_once("://")?;
+    let dir = rest.rsplit_once('/').map_or("", |(d, _)| d);
+    let joined = if dir.is_empty() {
+        format!("{scheme}://{raw}")
+    } else {
+        format!("{scheme}://{dir}/{raw}")
+    };
+    Some(SmolStr::new(simplify_resource_path(&joined)))
+}
+
+/// Collapse `.`/`..`/empty segments in a `scheme://…` resource path (Godot's `simplify_path`).
+fn simplify_resource_path(path: &str) -> String {
+    let (scheme, rest) = path.split_once("://").unwrap_or(("res", path));
+    let mut out: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    format!("{scheme}://{}", out.join("/"))
+}
+
 /// Resolve a `res://` resource path to the declaring file's [`Ty::ScriptRef`] via the project
 /// [`res_path_registry`](crate::queries::res_path_registry), or the seam ([`Ty::Unknown`]) when
 /// no project is loaded or the path maps to no known file (a dangling `preload` — imprecise, but
@@ -296,7 +332,7 @@ fn builtin(api: &EngineApi, name: &str) -> Ty {
 /// resolves to `Object(id)`; a script-path / dotted / unknown base goes through the seam to
 /// `Unknown`. With no `extends`, a script implicitly extends `RefCounted`.
 #[must_use]
-pub fn resolve_base(db: &dyn Db, api: &EngineApi, tree: &ItemTree) -> Ty {
+pub fn resolve_base(db: &dyn Db, api: &EngineApi, tree: &ItemTree, anchor: Option<&str>) -> Ty {
     match &tree.extends {
         None => api
             .class_by_name("RefCounted")
@@ -305,9 +341,14 @@ pub fn resolve_base(db: &dyn Db, api: &EngineApi, tree: &ItemTree) -> Ty {
             || resolve_external(db, &ExternalRef::ClassName(n.clone())),
             Ty::Object,
         ),
-        Some(ExtendsRef::Path(p) | ExtendsRef::ScriptPath(p)) => {
-            resolve_external(db, &ExternalRef::ExtendsPath(p.clone()))
-        }
+        // A string-path base (`extends "res://x.gd"` / `extends "sibling.gd"`): anchor a relative
+        // path to the importing file's directory (Godot `get_base_dir().path_join()`), then resolve.
+        Some(ExtendsRef::ScriptPath(p)) => match anchor_res_path(anchor, p) {
+            Some(abs) => resolve_external(db, &ExternalRef::ExtendsPath(abs)),
+            None => Ty::Unknown,
+        },
+        // A dotted base (`extends A.B`) is a namespaced name, not a path — the seam.
+        Some(ExtendsRef::Path(p)) => resolve_external(db, &ExternalRef::ExtendsPath(p.clone())),
     }
 }
 
@@ -344,7 +385,7 @@ pub struct ClassScope<'a> {
 impl<'a> ClassScope<'a> {
     /// Build the scope for `tree` against the engine model.
     #[must_use]
-    pub fn new(db: &dyn Db, api: &EngineApi, tree: &'a ItemTree) -> Self {
+    pub fn new(db: &dyn Db, api: &EngineApi, tree: &'a ItemTree, anchor: Option<&str>) -> Self {
         let mut members = FxHashMap::default();
         for (i, m) in tree.members.iter().enumerate() {
             match m {
@@ -363,7 +404,7 @@ impl<'a> ClassScope<'a> {
                 }
             }
         }
-        let base = resolve_base(db, api, tree);
+        let base = resolve_base(db, api, tree, anchor);
         Self {
             tree,
             self_ty: base.clone(),
@@ -517,18 +558,60 @@ mod tests {
     fn base_resolution() {
         let extends_node = item_tree(&parse("extends Node2D\n").syntax_node());
         assert_eq!(
-            resolve_base(&db(), api(), &extends_node),
+            resolve_base(&db(), api(), &extends_node, None),
             Ty::Object(api().class_by_name("Node2D").unwrap())
         );
         // No extends → implicit RefCounted.
         let no_extends = item_tree(&parse("var x = 1\n").syntax_node());
         assert_eq!(
-            resolve_base(&db(), api(), &no_extends),
+            resolve_base(&db(), api(), &no_extends, None),
             Ty::Object(api().class_by_name("RefCounted").unwrap())
         );
-        // Script-path base → seam.
+        // Script-path base with no project loaded → seam.
         let script_base = item_tree(&parse("extends \"res://b.gd\"\n").syntax_node());
-        assert_eq!(resolve_base(&db(), api(), &script_base), Ty::Unknown);
+        assert_eq!(resolve_base(&db(), api(), &script_base, None), Ty::Unknown);
+    }
+
+    #[test]
+    fn anchor_res_path_absolute_passes_through() {
+        assert_eq!(
+            anchor_res_path(Some("res://a/b.gd"), "res://x.gd").as_deref(),
+            Some("res://x.gd")
+        );
+        assert_eq!(
+            anchor_res_path(None, "user://x.gd").as_deref(),
+            Some("user://x.gd")
+        );
+    }
+
+    #[test]
+    fn anchor_res_path_relative_anchors_to_importing_dir() {
+        let from = Some("res://entities/player.gd");
+        // sibling
+        assert_eq!(
+            anchor_res_path(from, "enemy.gd").as_deref(),
+            Some("res://entities/enemy.gd")
+        );
+        // parent traversal (`..`) collapses
+        assert_eq!(
+            anchor_res_path(from, "../core/hooks.gd").as_deref(),
+            Some("res://core/hooks.gd")
+        );
+        // explicit current-dir (`./`)
+        assert_eq!(
+            anchor_res_path(from, "./util.gd").as_deref(),
+            Some("res://entities/util.gd")
+        );
+        // an importer at the project root
+        assert_eq!(
+            anchor_res_path(Some("res://main.gd"), "util.gd").as_deref(),
+            Some("res://util.gd")
+        );
+    }
+
+    #[test]
+    fn anchor_res_path_relative_without_anchor_is_seam() {
+        assert_eq!(anchor_res_path(None, "sibling.gd"), None);
     }
 
     #[test]
@@ -539,7 +622,7 @@ mod tests {
             )
             .syntax_node(),
         );
-        let scope = ClassScope::new(&db(), api(), &tree);
+        let scope = ClassScope::new(&db(), api(), &tree, None);
         assert!(matches!(scope.lookup("hp"), Some(ClassItem::Member(_))));
         assert!(matches!(scope.lookup("attack"), Some(ClassItem::Member(_))));
         // Anonymous-enum variants flatten into the class scope as int consts.

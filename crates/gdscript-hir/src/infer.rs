@@ -227,11 +227,13 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
     // `self` is the script's OWN class (a self-`ScriptRef`), not just its engine base — so member
     // access on an aliased `self` resolves the file's own members (see `ClassScope::self_ty`).
     let self_ref = Ty::ScriptRef(ScriptRefId(file_id.0));
+    // The file's own `res://` path, for anchoring relative `preload`/`extends` to its directory.
+    let res_path = db.file_text(file_id).and_then(|ft| ft.res_path(db));
 
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
     {
-        let mut class = ClassScope::new(db, api, &tree);
+        let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
         class.self_ty = self_ref.clone();
         for m in &tree.members {
             let (ptr, range) = match m {
@@ -251,7 +253,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
 
     // Pass 2 — functions, against a scope carrying the seeded field types.
     {
-        let mut class = ClassScope::new(db, api, &tree);
+        let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
         class.member_types = member_types;
         class.self_ty = self_ref.clone();
         for m in &tree.members {
@@ -680,9 +682,15 @@ impl Cx<'_> {
                 // usual `ScriptRef` walk). A non-constant argument (`preload(var)`) — which Godot
                 // itself rejects — stays the seam, never a false diagnostic.
                 match path {
-                    Some(p) => {
-                        resolve::resolve_external(self.db, &resolve::ExternalRef::Preload(p))
-                    }
+                    // Anchor a relative `preload("sibling.gd")` to the importing file's directory
+                    // before resolving (Godot anchors relative resource paths); absolute paths pass
+                    // through, and a relative path with no anchor stays the seam.
+                    Some(p) => match resolve::anchor_res_path(self.self_res_path().as_deref(), &p) {
+                        Some(abs) => {
+                            resolve::resolve_external(self.db, &resolve::ExternalRef::Preload(abs))
+                        }
+                        None => Ty::Unknown,
+                    },
                     None => Ty::Unknown,
                 }
             }
@@ -768,6 +776,15 @@ impl Cx<'_> {
         };
         let ft = self.db.file_text(FileId(sref.0))?;
         crate::queries::scene_context(self.db, ft)
+    }
+
+    /// The importing file's own `res://` path (from `self_ty`), for anchoring relative
+    /// `preload`/`extends` paths to its directory. `None` when the file has no resource path.
+    fn self_res_path(&self) -> Option<SmolStr> {
+        let Ty::ScriptRef(sref) = &self.self_ty else {
+            return None;
+        };
+        self.db.file_text(FileId(sref.0))?.res_path(self.db)
     }
 
     /// The concrete `Ty` of a scene node, by precedence: an attached script's own class (most
@@ -1629,7 +1646,7 @@ mod tests {
         let db = gdscript_db::RootDatabase::default();
         let root = parse(src).syntax_node();
         let tree = item_tree(&root);
-        let class = ClassScope::new(&db, api, &tree);
+        let class = ClassScope::new(&db, api, &tree, None);
         let func = gdscript_syntax::ast::descendants(&root)
             .into_iter()
             .find(|n| n.kind() == SyntaxKind::FuncDecl)

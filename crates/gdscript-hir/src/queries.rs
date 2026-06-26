@@ -238,7 +238,7 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
     }
     // The resolved `extends` base — a user `ScriptRef` (another class_name / "res://…") walks
     // into the inheritance chain; an engine `Object` ends it at the API table.
-    let base = crate::resolve::resolve_base(db, api, &tree);
+    let base = crate::resolve::resolve_base(db, api, &tree, file.res_path(db).as_deref());
     Arc::new(ScriptClass { members, base })
 }
 
@@ -809,6 +809,50 @@ mod tests {
         assert_eq!(
             unit.result.bindings[3].ty.label(api).as_deref(),
             Some("int")
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn relative_extends_path_anchors_to_importing_dir() {
+        let mut db = RootDatabase::default();
+        // base.gd under entities/, reachable only by path (no class_name).
+        set_with_path(
+            &mut db,
+            0,
+            "res://entities/base.gd",
+            "extends Node\nfunc base_method() -> int:\n\treturn 1\n",
+        );
+        // derived.gd in the SAME dir uses a RELATIVE `extends "base.gd"` (anchored to entities/).
+        set_with_path(
+            &mut db,
+            1,
+            "res://entities/derived.gd",
+            "class_name Derived\nextends \"base.gd\"\nfunc own() -> String:\n\treturn \"x\"\n",
+        );
+        set_with_path(
+            &mut db,
+            2,
+            "res://main.gd",
+            "func use_it():\n\tvar d: Derived\n\tvar a := d.own()\n\tvar b := d.base_method()\n",
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| u.result.bindings.len() >= 3)
+            .expect("use_it unit with 3 bindings (d, a, b)");
+        // bindings: [0]=`d: Derived`, [1]=own() (own member), [2]=base_method() (relative-extends base).
+        assert_eq!(
+            unit.result.bindings[1].ty.label(api).as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            unit.result.bindings[2].ty.label(api).as_deref(),
+            Some("int"),
+            "base_method() must resolve through the relative `extends \"base.gd\"`"
         );
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
     }
