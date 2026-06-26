@@ -20,7 +20,7 @@
 
 use gdscript_base::{FileId, FilePosition};
 use gdscript_ide::{AnalysisHost, Change};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 /// A live, URI-keyed analysis session: one [`AnalysisHost`] kept alive across edits (so salsa's
@@ -29,6 +29,9 @@ use serde::Serialize;
 pub struct Session {
     host: AnalysisHost,
     uris: FxHashMap<String, FileId>,
+    /// Files whose `res://` path has already been recorded — so it is set exactly once, the first
+    /// time one is provided, regardless of whether the file was first seen via `open` or `change`.
+    with_path: FxHashSet<FileId>,
     next_id: u32,
 }
 
@@ -47,15 +50,19 @@ impl Session {
 
     // ---- document lifecycle (mutating) -------------------------------------------------------
 
-    /// Open or replace a document by `uri`. On the **first** open of a `uri`, its `res_path`
-    /// (`res://…`) is recorded — set it once so cross-file `preload` / `extends` / autoload
-    /// resolution lights up; it is stable across edits (re-sending it would needlessly invalidate
-    /// the resource-path registry, so subsequent opens/changes leave it untouched).
+    /// Open or replace a document by `uri`. Its `res_path` (`res://…`) is recorded the **first time
+    /// one is provided** for the file — set once so cross-file `preload` / `extends` / autoload
+    /// resolution lights up, and never re-sent (which would needlessly invalidate the resource-path
+    /// registry). Crucially this is tracked per `FileId`, **not** by whether the `uri` was new, so a
+    /// `change()` before the first path-bearing `open()` no longer swallows the path (a file
+    /// interned by an early `change()` still records the `res://` path on its next `open`).
     pub fn open(&mut self, uri: &str, text: &str, res_path: Option<&str>) {
-        let (id, is_new) = self.intern(uri);
+        let (id, _) = self.intern(uri);
         let mut change = Change::new();
         change.change_file(id, text);
-        if is_new && let Some(p) = res_path {
+        if let Some(p) = res_path
+            && self.with_path.insert(id)
+        {
             change.set_file_path(id, p.to_owned());
         }
         self.host.apply_change(change);
@@ -70,14 +77,23 @@ impl Session {
         self.host.apply_change(change);
     }
 
-    /// Close (remove) a document by `uri`. A later re-open assigns a fresh [`FileId`]. No-op for an
-    /// unknown `uri`.
+    /// Close (remove) a document by `uri`. A later re-open assigns a fresh [`FileId`] (and re-records
+    /// its `res://` path). No-op for an unknown `uri`.
     pub fn close(&mut self, uri: &str) {
         if let Some(id) = self.uris.remove(uri) {
+            self.with_path.remove(&id);
             let mut change = Change::new();
             change.remove_file(id);
             self.host.apply_change(change);
         }
+    }
+
+    /// Whether `uri` is currently open. Lets a client distinguish "file not tracked" from a genuine
+    /// empty result, since the array queries return `"[]"` and the option queries `null` for **both**
+    /// an unknown `uri` and an open-but-empty one.
+    #[must_use]
+    pub fn is_open(&self, uri: &str) -> bool {
+        self.uris.contains_key(uri)
     }
 
     /// Set the project's `project.godot` text (enables `[autoload]` singleton resolution). Set on
@@ -229,18 +245,18 @@ impl Session {
         }
     }
 
-    /// Rename the symbol at a byte `offset` in `uri` to `new_name`. Returns a JSON object string:
-    /// `{"ok": <SourceChange>}` on success or `{"error": <RenameError>}` on a refusal — never a
-    /// partial edit. `{"error": …}`-shaped `null` for an unknown `uri`.
+    /// Rename the symbol at a byte `offset` in `uri` to `new_name`. **Always an envelope** (never
+    /// bare `null`), never a partial edit: `{"ok": <SourceChange>}` on success, or
+    /// `{"error": <RenameError | reason-string>}` on a refusal, an unknown `uri`, or cancellation.
     #[must_use]
     pub fn rename(&self, uri: &str, offset: u32, new_name: &str) -> String {
         let Some(pos) = self.pos(uri, offset) else {
-            return "null".to_owned();
+            return json(&serde_json::json!({ "error": "document not open" }), "null");
         };
         match self.host.analysis().rename(pos, new_name) {
             Ok(Ok(change)) => json(&serde_json::json!({ "ok": change }), "null"),
             Ok(Err(err)) => json(&serde_json::json!({ "error": err }), "null"),
-            Err(_) => "null".to_owned(),
+            Err(_) => json(&serde_json::json!({ "error": "cancelled" }), "null"),
         }
     }
 
@@ -425,5 +441,44 @@ mod tests {
         s.open("u", "func b():\n\tpass\n", None);
         let syms = parse(&s.document_symbols("u"));
         assert_eq!(syms[0]["name"], "b");
+    }
+
+    #[test]
+    fn change_before_open_still_records_res_path() {
+        // Hunt #1: a `change()` that interns a uri before the first path-bearing `open()` must NOT
+        // swallow the `res://` path — else cross-file resolution silently breaks.
+        let mut s = Session::new();
+        let markup = "class_name Markup\nfunc parse() -> int:\n\treturn 1\n";
+        s.change("file:///markup.gd", markup); // interns markup.gd with NO path
+        s.open("file:///markup.gd", markup, Some("res://markup.gd")); // path must be recorded now
+        s.open(
+            "file:///main.gd",
+            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n",
+            Some("res://main.gd"),
+        );
+        assert!(
+            s.inlay_hints("file:///main.gd").contains("int"),
+            "the res:// path must survive a change()-before-open(); cross-file preload should type `n` as int",
+        );
+    }
+
+    #[test]
+    fn rename_unknown_uri_returns_error_envelope() {
+        // Hunt #2: never bare `null` — always `{"ok"}|{"error"}`.
+        let s = Session::new();
+        let out = parse(&s.rename("nope", 0, "x"));
+        assert!(out.get("error").is_some(), "{out}");
+        assert!(out.get("ok").is_none());
+    }
+
+    #[test]
+    fn is_open_distinguishes_tracked_files() {
+        // Hunt #3/#4: a client can tell "not tracked" from a genuine empty result.
+        let mut s = Session::new();
+        assert!(!s.is_open("u"));
+        s.open("u", "func f():\n\tpass\n", None);
+        assert!(s.is_open("u"));
+        s.close("u");
+        assert!(!s.is_open("u"));
     }
 }

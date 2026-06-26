@@ -73,6 +73,14 @@ impl AnalysisHandle {
         self.session.set_project_config(&text);
     }
 
+    /// Whether `uri` is currently open. Lets a client distinguish "file not tracked" from a genuine
+    /// empty result (the array queries return `[]` and the `null`-returning queries `null` for both).
+    #[napi]
+    #[must_use]
+    pub fn is_open(&self, uri: String) -> bool {
+        self.session.is_open(&uri)
+    }
+
     // ---- queries (JSON strings of `gdscript-base` POD) ----
 
     /// Parse + type diagnostics for `uri`, as a JSON array string.
