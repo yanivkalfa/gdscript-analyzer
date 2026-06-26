@@ -22,6 +22,11 @@
 Thumbs.db
 *.log
 
+# Ad-hoc CI/release logs pasted at the repo root while debugging (never committed)
+/Error
+/ReleaseErrors
+/ReleasePrErrors
+
 # Committed (NOT ignored), listed here as a reminder:
 #   Cargo.lock                      (workspace has binaries)
 #   vendor/godot/**                 (the vendored engine API data)
