@@ -1064,6 +1064,49 @@ mod tests {
     }
 
     #[test]
+    fn star_autoload_scene_resolves_via_script_class_shortcut() {
+        // A `*`-autoload `.tscn` whose root has NO `script=` ext_resource but carries the header
+        // `script_class="…"` shortcut resolves through the class_name registry (the recorded
+        // shortcut, without a script ext_resource). Autoload name `Audio` ≠ class_name `MusicPlayer`
+        // so the resolution can ONLY go via the scene's script_class shortcut.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name MusicPlayer\nfunc volume() -> int:\n\treturn 5\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://music.gd");
+        db.set_file_text(
+            FileId(1),
+            "[gd_scene format=3 script_class=\"MusicPlayer\"]\n[node name=\"Root\" type=\"Node\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://music.tscn");
+        db.set_file_text(
+            FileId(2),
+            "func f():\n\tvar v := Audio.volume()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://main.gd");
+        db.set_project_config("[autoload]\nAudio=\"*res://music.tscn\"\n");
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("f unit");
+        assert_eq!(
+            unit.result.bindings[0].ty.label(api).as_deref(),
+            Some("int"),
+            "Audio.volume() should resolve via the scene's script_class= shortcut",
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
     fn star_autoload_gdscript_resolves_as_global_and_members() {
         let mut db = RootDatabase::default();
         // `game.gd` has NO class_name — the autoload resolves it by PATH (not the class registry).

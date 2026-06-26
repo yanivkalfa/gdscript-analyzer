@@ -106,18 +106,34 @@ fn resolve_scene_autoload(db: &dyn Db, scene_path: &str) -> Ty {
         return Ty::Unknown;
     };
     let scene = crate::queries::scene_model(db, ft);
-    let Some(root_node) = scene.root.and_then(|idx| scene.node(idx)) else {
-        return Ty::Unknown;
-    };
-    let Some(script_path) = root_node
-        .script
-        .as_ref()
+    // 1. An attached script on the root (`script=ExtResource`) — the most specific (a `.tscn`).
+    if let Some(script_path) = scene
+        .root
+        .and_then(|idx| scene.node(idx))
+        .and_then(|root_node| root_node.script.as_ref())
         .and_then(|id| scene.ext_resources.get(id))
         .and_then(|ext| ext.path.as_deref())
-    else {
-        return Ty::Unknown; // the root has no attached script
-    };
-    resolve_res_path(db, script_path)
+    {
+        let ty = resolve_res_path(db, script_path);
+        if !ty.is_uninformative() {
+            return ty;
+        }
+    }
+    // 2. The `.tscn` header `script_class="…"` shortcut, or a `.tres`'s own `resource_type` — the
+    //    resource's `class_name`, recorded without resolving the script file (so a script-less root
+    //    that still carries its class_name resolves). Resolve it through the project class_name
+    //    registry. (Typing a root by its native `type=` alone would need the engine API, which this
+    //    seam doesn't carry — a follow-up; resolving the recorded class_name is the common case.)
+    for class_name in [scene.script_class.as_ref(), scene.resource_type.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let ty = resolve_external(db, &ExternalRef::ClassName(class_name.clone()));
+        if !ty.is_uninformative() {
+            return ty;
+        }
+    }
+    Ty::Unknown
 }
 
 /// Whether a resource path is a Godot scene/resource (`.tscn`/`.tres`).
