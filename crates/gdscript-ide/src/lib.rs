@@ -28,6 +28,7 @@ use salsa::Durability;
 mod features;
 mod navigation;
 mod semantic;
+mod semantic_tokens;
 
 /// Run a read query, turning a salsa cancellation (a concurrent `apply_change` invalidated the
 /// snapshot) into `Err(Cancelled)`. The closure is `AssertUnwindSafe` because the database
@@ -189,6 +190,21 @@ impl Analysis {
             self.db
                 .file_text(file)
                 .map(|ft| features::document_symbols(&self.db, ft))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Semantic-highlighting tokens: each meaningful token classified by its contextual role
+    /// (declarations, types, parameters, members, calls, literals, comments) — richer than a
+    /// grammar. In source order.
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn semantic_tokens(&self, file: FileId) -> Cancellable<Vec<gdscript_base::SemanticToken>> {
+        catch(|| {
+            self.db
+                .file_text(file)
+                .map(|ft| semantic_tokens::semantic_tokens(&self.db, ft))
                 .unwrap_or_default()
         })
     }

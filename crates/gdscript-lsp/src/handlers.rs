@@ -82,3 +82,22 @@ pub fn inlay_hints(a: &Analysis, ctx: &DocCtx) -> Cancellable<Vec<lsp::InlayHint
         .map(|h| convert::inlay_hint_to_lsp(&ctx.line_index, &ctx.text, h, ctx.encoding))
         .collect())
 }
+
+/// `textDocument/semanticTokens/full` — the whole file's tokens, 5-int relative-encoded.
+pub fn semantic_tokens(
+    a: &Analysis,
+    ctx: &DocCtx,
+) -> Cancellable<Option<lsp::SemanticTokensResult>> {
+    let data = convert::encode_semantic_tokens(
+        &ctx.line_index,
+        &ctx.text,
+        &a.semantic_tokens(ctx.file)?,
+        ctx.encoding,
+    );
+    Ok(Some(lsp::SemanticTokensResult::Tokens(
+        lsp::SemanticTokens {
+            result_id: None,
+            data,
+        },
+    )))
+}

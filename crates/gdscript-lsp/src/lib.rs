@@ -13,7 +13,9 @@
 //! incremental text sync + the URI↔`FileId` [`vfs`] + push diagnostics.
 //! **M1 (read features):** hover, completion, signature help, document symbols, folding ranges —
 //! each snapshotted and run on a worker thread ([`handlers`]); a concurrent edit unwinds the salsa
-//! query to `Cancelled`, mapped to LSP `ContentModified`. Semantic tokens + inlay hints are M2.
+//! query to `Cancelled`, mapped to LSP `ContentModified`.
+//! **M2:** semantic tokens (the 5-int relative encoding + legend) and inlay hints. Navigation +
+//! rename are M3.
 
 pub mod convert;
 pub mod line_index;
@@ -30,6 +32,7 @@ use lsp_types::{
     CompletionOptions, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, FoldingRangeProviderCapability, HoverProviderCapability,
     InitializeParams, InitializeResult, OneOf, PositionEncodingKind, PublishDiagnosticsParams,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
     ServerCapabilities, ServerInfo, SignatureHelpOptions, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentPositionParams, TextDocumentSyncCapability,
     TextDocumentSyncKind, Uri,
@@ -96,6 +99,14 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         // M2.
         inlay_hint_provider: Some(OneOf::Left(true)),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: convert::semantic_tokens_legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: Some(false),
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     }
 }
@@ -199,6 +210,9 @@ impl GlobalState {
             "textDocument/documentSymbol" => self.spawn_file(req, handlers::document_symbols),
             "textDocument/foldingRange" => self.spawn_file(req, handlers::folding_ranges),
             "textDocument/inlayHint" => self.spawn_file(req, handlers::inlay_hints),
+            "textDocument/semanticTokens/full" => {
+                self.spawn_file(req, handlers::semantic_tokens);
+            }
             other => self.send(Response::new_err(
                 req.id,
                 METHOD_NOT_FOUND,
@@ -757,6 +771,60 @@ mod tests {
                 |h| matches!(&h.label, lsp_types::InlayHintLabel::String(s) if s.contains("int"))
             ),
             "expected a `: int` inlay hint: {hints:?}",
+        );
+
+        send_req(&client, 9, "shutdown", ());
+        let _ = next_response(&client);
+        send_note(&client, "exit", ());
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn semantic_tokens_over_the_public_api() {
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || run(&server));
+        send_req(&client, 1, "initialize", InitializeParams::default());
+        let init = next_response(&client);
+        let init: InitializeResult = serde_json::from_value(init.result.unwrap()).unwrap();
+        assert!(
+            init.capabilities.semantic_tokens_provider.is_some(),
+            "semanticTokens advertised"
+        );
+        send_note(&client, "initialized", InitializedParams {});
+
+        let doc_uri = uri("file:///main.gd");
+        send_note(
+            &client,
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "gdscript".to_owned(),
+                    version: 1,
+                    text: "func greet() -> int:\n\treturn 1\n".to_owned(),
+                },
+            },
+        );
+        let _ = next_diagnostics(&client);
+
+        send_req(
+            &client,
+            2,
+            "textDocument/semanticTokens/full",
+            serde_json::json!({ "textDocument": { "uri": doc_uri.as_str() } }),
+        );
+        let resp = next_response(&client);
+        assert!(resp.error.is_none(), "semanticTokens errored: {resp:?}");
+        let result: lsp_types::SemanticTokensResult =
+            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let lsp_types::SemanticTokensResult::Tokens(t) = result else {
+            panic!("expected full semantic tokens");
+        };
+        // `func`/`greet`/`int`/… → at least the 5-int records for greet + int.
+        assert!(
+            t.data.len() >= 2,
+            "expected encoded tokens, got {:?}",
+            t.data
         );
 
         send_req(&client, 9, "shutdown", ());

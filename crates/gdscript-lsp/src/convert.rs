@@ -4,7 +4,8 @@
 
 use gdscript_base::{
     CompletionItem, CompletionKind, Diagnostic, DocumentSymbol, FoldKind, FoldRange, HoverResult,
-    InlayHint, InlayHintKind, Severity, SignatureHelp, SymbolKind, TextRange,
+    InlayHint, InlayHintKind, SemanticToken, SemanticTokenType as PodTokenType, Severity,
+    SignatureHelp, SymbolKind, TextRange,
 };
 use lsp_types as lsp;
 
@@ -258,6 +259,107 @@ pub fn inlay_hint_to_lsp(
         padding_right: None,
         data: None,
     }
+}
+
+// ---- semantic tokens (M2) --------------------------------------------------------------------
+
+/// The legend's token-type names, in the index order [`token_type_index`] returns. (Index 13 =
+/// `event` for a signal; index 14 = `variable` for a `const`, distinguished by the `readonly`
+/// modifier — there is no standard `constant` type.)
+const LEGEND_TYPES: [&str; 15] = [
+    "function",
+    "method",
+    "variable",
+    "parameter",
+    "property",
+    "class",
+    "enum",
+    "enumMember",
+    "type",
+    "decorator",
+    "number",
+    "string",
+    "comment",
+    "event",
+    "variable",
+];
+
+/// The legend's modifier names, in bit order — matching `gdscript_base::semantic_token_modifier`
+/// (bit 0 = declaration, …), so a token's `modifiers` bitset is forwarded verbatim.
+const LEGEND_MODIFIERS: [&str; 4] = ["declaration", "readonly", "static", "defaultLibrary"];
+
+/// The legend the client needs to decode our semantic tokens. Must stay in sync with
+/// [`token_type_index`] and the modifier bit constants.
+#[must_use]
+pub fn semantic_tokens_legend() -> lsp::SemanticTokensLegend {
+    lsp::SemanticTokensLegend {
+        token_types: LEGEND_TYPES
+            .iter()
+            .map(|s| lsp::SemanticTokenType::new(s))
+            .collect(),
+        token_modifiers: LEGEND_MODIFIERS
+            .iter()
+            .map(|s| lsp::SemanticTokenModifier::new(s))
+            .collect(),
+    }
+}
+
+/// A POD token type → its index in [`LEGEND_TYPES`].
+fn token_type_index(ty: PodTokenType) -> u32 {
+    match ty {
+        PodTokenType::Function => 0,
+        PodTokenType::Method => 1,
+        PodTokenType::Variable => 2,
+        PodTokenType::Parameter => 3,
+        PodTokenType::Property => 4,
+        PodTokenType::Class => 5,
+        PodTokenType::Enum => 6,
+        PodTokenType::EnumMember => 7,
+        PodTokenType::Type => 8,
+        PodTokenType::Decorator => 9,
+        PodTokenType::Number => 10,
+        PodTokenType::String => 11,
+        PodTokenType::Comment => 12,
+        PodTokenType::Signal => 13,
+        PodTokenType::Constant => 14,
+    }
+}
+
+/// Encode source-ordered POD tokens into the LSP **5-integer relative** form (Δline, Δstart, length,
+/// typeIndex, modifierBitset). A token that spans lines is skipped (LSP tokens are single-line —
+/// multi-line splitting is a follow-up); zero-length tokens are dropped.
+#[must_use]
+pub fn encode_semantic_tokens(
+    li: &LineIndex,
+    text: &str,
+    tokens: &[SemanticToken],
+    enc: PositionEncoding,
+) -> Vec<lsp::SemanticToken> {
+    let mut data = Vec::with_capacity(tokens.len());
+    let (mut prev_line, mut prev_start) = (0u32, 0u32);
+    for tok in tokens {
+        let start = li.position(text, tok.range.start, enc);
+        let end = li.position(text, tok.range.end, enc);
+        if start.line != end.line || end.character <= start.character {
+            continue; // multi-line or empty — skip
+        }
+        let delta_line = start.line - prev_line;
+        let delta_start = if delta_line == 0 {
+            start.character - prev_start
+        } else {
+            start.character
+        };
+        data.push(lsp::SemanticToken {
+            delta_line,
+            delta_start,
+            length: end.character - start.character,
+            token_type: token_type_index(tok.token_type),
+            token_modifiers_bitset: tok.modifiers,
+        });
+        prev_line = start.line;
+        prev_start = start.character;
+    }
+    data
 }
 
 #[cfg(test)]
