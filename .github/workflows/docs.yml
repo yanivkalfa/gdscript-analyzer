@@ -57,7 +57,9 @@ jobs:
         if: github.event_name == 'push'
         run: |
           mkdir -p _site/playground/data
-          cp -r docs/book/. _site/                                  # mdBook → /
+          # mdbook-linkcheck is a backend, so the HTML renderer writes to docs/book/html/ (not
+          # docs/book/). Copy THAT into the site root, else `/` 404s.
+          cp -r docs/book/html/. _site/                             # mdBook → /
           cp -r playground/. _site/playground/                      # index.html + pkg → /playground/
           cp crates/gdscript-api/src/engine_api.bin _site/playground/data/extension_api.bin  # engine model
           touch _site/.nojekyll                                     # ship underscore dirs (pkg/, _*)
