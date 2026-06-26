@@ -1,0 +1,16 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist' — packages + uploads the CLI (`gdscript`) and LSP (`gdscript-lsp`) binaries on
+# the `v<version>` tag release-plz pushes. The two crates opt in via `[package.metadata.dist] dist =
+# true` (their `publish = false` otherwise hides them from dist). dist OWNS the GitHub Release
+# (release-plz sets `git_release_enable = false`). See plans/PHASE-5-CLIENTS-AND-DISTRIBUTION.md §5.
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# Curl-able install scripts for the two binaries (Homebrew/MSI can be added later).
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

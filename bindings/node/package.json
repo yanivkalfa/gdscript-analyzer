@@ -16,11 +16,14 @@
   "types": "index.d.ts",
   "engines": { "node": ">=20" },
   "scripts": {
+    "artifacts": "napi artifacts --output-dir .",
     "build": "napi build --platform --release --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
     "build:debug": "napi build --platform --manifest-path ../../crates/gdscript-ffi/Cargo.toml --output-dir .",
+    "prepublishOnly": "napi prepublish -t npm",
+    "version": "napi version",
     "demo": "node hello.mjs"
   },
-  "devDependencies": { "@napi-rs/cli": "^3.0.0" },
+  "devDependencies": { "@napi-rs/cli": "^3.2.0" },
   "private": false,
   "publishConfig": { "access": "public", "provenance": true },
   "files": ["index.js", "index.d.ts"],
@@ -31,12 +34,8 @@
       "x86_64-apple-darwin",
       "aarch64-apple-darwin",
       "x86_64-pc-windows-msvc",
-      "aarch64-pc-windows-msvc",
       "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-gnu",
-      "aarch64-unknown-linux-musl",
-      "armv7-unknown-linux-gnueabihf",
       "wasm32-wasip1-threads"
     ]
   }
