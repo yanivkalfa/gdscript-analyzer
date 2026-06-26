@@ -1,0 +1,28 @@
+# Pre-commit hooks for the `gdscript` CLI (Playbook §WS3 / §7) — the same binary serves CI and
+# local pre-commit, like gdtoolkit / Ruff.
+#
+# Requires the `gdscript` binary on PATH. Install it via the cargo-dist release installer
+# (shell/PowerShell one-liner from the GitHub Release), `cargo binstall gdscript-cli`, or
+# `cargo install --path crates/gdscript-cli` from a checkout. (`language: system` runs the
+# already-installed binary — no per-commit build; consumers reference this repo + rev in their
+# own `.pre-commit-config.yaml`.)
+- id: gdscript-check
+  name: gdscript check
+  description: GDScript parse + type diagnostics (no editor, no Godot).
+  entry: gdscript check
+  language: system
+  types_or: [file]
+  files: '\.gd$'
+  require_serial: false
+- id: gdscript-lint
+  name: gdscript lint
+  description: GDScript warning/lint subset (non-error severities).
+  entry: gdscript lint
+  language: system
+  files: '\.gd$'
+- id: gdscript-format
+  name: gdscript format --check
+  description: Verify GDScript formatting (the real formatter lands in Phase 6).
+  entry: gdscript format --check
+  language: system
+  files: '\.gd$'
