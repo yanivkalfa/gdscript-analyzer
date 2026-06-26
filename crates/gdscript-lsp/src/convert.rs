@@ -395,4 +395,40 @@ mod tests {
             "clamped to the only parameter"
         );
     }
+
+    fn tok(start: u32, end: u32, ty: PodTokenType, modifiers: u32) -> SemanticToken {
+        SemanticToken {
+            range: TextRange::new(start, end),
+            token_type: ty,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn semantic_token_encoding_is_relative() {
+        let text = "ab\ncde\n";
+        let li = LineIndex::new(text);
+        let toks = [
+            tok(0, 2, PodTokenType::Variable, 1), // "ab"  → line 0, col 0, len 2, type 2, mod 1
+            tok(3, 6, PodTokenType::Function, 0), // "cde" → line 1, col 0, len 3, type 0, mod 0
+        ];
+        let data = encode_semantic_tokens(&li, text, &toks, PositionEncoding::Utf16);
+        assert_eq!(data.len(), 2);
+        let d0 = &data[0];
+        assert_eq!((d0.delta_line, d0.delta_start, d0.length), (0, 0, 2));
+        assert_eq!((d0.token_type, d0.token_modifiers_bitset), (2, 1));
+        let d1 = &data[1];
+        // new line → delta_line 1, delta_start resets to the absolute column (0).
+        assert_eq!((d1.delta_line, d1.delta_start, d1.length), (1, 0, 3));
+        assert_eq!((d1.token_type, d1.token_modifiers_bitset), (0, 0));
+    }
+
+    #[test]
+    fn multi_line_token_is_skipped() {
+        // A token spanning lines can't be expressed (LSP tokens are single-line) — drop it.
+        let text = "\"\"\"multi\nline\"\"\"\n";
+        let li = LineIndex::new(text);
+        let toks = [tok(0, 15, PodTokenType::String, 0)];
+        assert!(encode_semantic_tokens(&li, text, &toks, PositionEncoding::Utf16).is_empty());
+    }
 }
