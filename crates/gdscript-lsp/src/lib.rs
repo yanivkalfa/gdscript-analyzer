@@ -14,8 +14,11 @@
 //! **M1 (read features):** hover, completion, signature help, document symbols, folding ranges —
 //! each snapshotted and run on a worker thread ([`handlers`]); a concurrent edit unwinds the salsa
 //! query to `Cancelled`, mapped to LSP `ContentModified`.
-//! **M2:** semantic tokens (the 5-int relative encoding + legend) and inlay hints. Navigation +
-//! rename are M3.
+//! **M2:** semantic tokens (the 5-int relative encoding + legend) and inlay hints.
+//! **M3:** navigation (definition, references, workspace symbols) and refactor (rename +
+//! prepareRename, code actions) — cross-file results map through a [`NavCtx`](handlers::NavCtx)
+//! snapshot of the open documents; a rename/quick-fix touching an un-opened file is refused
+//! (all-or-nothing).
 
 pub mod convert;
 pub mod line_index;
@@ -29,13 +32,14 @@ use gdscript_base::Cancellable;
 use gdscript_ide::{Analysis, AnalysisHost, Change};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    CompletionOptions, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, FoldingRangeProviderCapability, HoverProviderCapability,
-    InitializeParams, InitializeResult, OneOf, PositionEncodingKind, PublishDiagnosticsParams,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SignatureHelpOptions, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri, WorkspaceSymbolParams,
+    CodeActionParams, CodeActionProviderCapability, CompletionOptions, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, FoldingRangeProviderCapability,
+    HoverProviderCapability, InitializeParams, InitializeResult, OneOf, PositionEncodingKind,
+    PublishDiagnosticsParams, RenameOptions, RenameParams, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    SignatureHelpOptions, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    WorkspaceSymbolParams,
 };
 
 use crate::convert::diagnostic_to_lsp;
@@ -53,6 +57,8 @@ pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
 /// LSP error code for a request received after `shutdown`.
 pub const INVALID_REQUEST: i32 = -32600;
+/// LSP error code for a request that failed for a known reason (e.g. a rename was refused).
+pub const REQUEST_FAILED: i32 = -32803;
 
 /// Choose the position encoding: prefer UTF-8 (our native byte columns), then UTF-32, else the
 /// mandatory UTF-16 fallback — driven by what the client advertised in `general.positionEncodings`.
@@ -107,10 +113,15 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 ..Default::default()
             },
         )),
-        // M3 navigation.
+        // M3 navigation + refactor.
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+        })),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         ..Default::default()
     }
 }
@@ -220,6 +231,9 @@ impl GlobalState {
             "textDocument/definition" => self.spawn_nav_pos(req, handlers::goto_definition),
             "textDocument/references" => self.spawn_nav_pos(req, handlers::references),
             "workspace/symbol" => self.spawn_nav_query(req, handlers::workspace_symbols),
+            "textDocument/prepareRename" => self.spawn_pos(req, handlers::prepare_rename),
+            "textDocument/rename" => self.handle_rename(req),
+            "textDocument/codeAction" => self.handle_code_actions(req),
             other => self.send(Response::new_err(
                 req.id,
                 METHOD_NOT_FOUND,
@@ -377,6 +391,66 @@ impl GlobalState {
         };
         let nav = self.nav_ctx();
         self.spawn(id, move |a| handler(a, &nav, &params.query));
+    }
+
+    /// Run a **fallible** read on the pool: the handler's inner `Err((code, message))` becomes an LSP
+    /// error response (e.g. a refused rename); `Ok(value)` → an ok response. `Cancelled`/panic map as
+    /// in [`Self::spawn`].
+    fn spawn_fallible<F, R>(&self, id: RequestId, compute: F)
+    where
+        F: FnOnce(&Analysis) -> Cancellable<Result<R, (i32, String)>> + Send + 'static,
+        R: serde::Serialize,
+    {
+        let analysis = self.host.analysis();
+        let tx = self.task_tx.clone();
+        std::thread::spawn(move || {
+            let computed =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute(&analysis)));
+            let resp = match computed {
+                Ok(Ok(Ok(value))) => Response::new_ok(id, value),
+                Ok(Ok(Err((code, message)))) => Response::new_err(id, code, message),
+                Ok(Err(_cancelled)) => {
+                    Response::new_err(id, CONTENT_MODIFIED, "content modified".to_owned())
+                }
+                Err(_panic) => Response::new_err(id, INTERNAL_ERROR, "internal error".to_owned()),
+            };
+            let _ = tx.send(Message::Response(resp));
+        });
+    }
+
+    /// Dispatch `textDocument/rename` (cross-file edit → a `WorkspaceEdit`, or a refusal error).
+    fn handle_rename(&self, req: Request) {
+        let id = req.id.clone();
+        let params: RenameParams = match serde_json::from_value(req.params) {
+            Ok(p) => p,
+            Err(e) => return self.send(Response::new_err(id, INVALID_PARAMS, e.to_string())),
+        };
+        let pos = params.text_document_position;
+        let Some(ctx) = self.doc_ctx(&pos.text_document.uri) else {
+            return self.respond_null(id);
+        };
+        let offset = ctx.line_index.offset(&ctx.text, pos.position, ctx.encoding);
+        let (nav, file, new_name) = (self.nav_ctx(), ctx.file, params.new_name);
+        self.spawn_fallible(id, move |a| {
+            handlers::rename(a, &nav, file, offset, &new_name)
+        });
+    }
+
+    /// Dispatch `textDocument/codeAction` (the quick-fixes at the selection start).
+    fn handle_code_actions(&self, req: Request) {
+        let id = req.id.clone();
+        let params: CodeActionParams = match serde_json::from_value(req.params) {
+            Ok(p) => p,
+            Err(e) => return self.send(Response::new_err(id, INVALID_PARAMS, e.to_string())),
+        };
+        let Some(ctx) = self.doc_ctx(&params.text_document.uri) else {
+            return self.respond_null(id);
+        };
+        let offset = ctx
+            .line_index
+            .offset(&ctx.text, params.range.start, ctx.encoding);
+        let (nav, file) = (self.nav_ctx(), ctx.file);
+        self.spawn(id, move |a| handlers::code_actions(a, &nav, file, offset));
     }
 
     fn on_notification(&mut self, conn: &Connection, note: &Notification) -> Result<()> {
@@ -967,6 +1041,63 @@ mod tests {
         assert!(resp.error.is_none(), "references errored: {resp:?}");
         let refs: Vec<lsp_types::Location> = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert!(refs.len() >= 2, "expected decl + use references: {refs:?}");
+
+        send_req(&client, 9, "shutdown", ());
+        let _ = next_response(&client);
+        send_note(&client, "exit", ());
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "lsp_types::Uri key — interior cache is hash-stable"
+    )]
+    fn rename_over_the_public_api() {
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || run(&server));
+        send_req(&client, 1, "initialize", InitializeParams::default());
+        let init = next_response(&client);
+        let init: InitializeResult = serde_json::from_value(init.result.unwrap()).unwrap();
+        assert!(
+            init.capabilities.rename_provider.is_some(),
+            "rename advertised"
+        );
+        send_note(&client, "initialized", InitializedParams {});
+
+        let doc_uri = uri("file:///main.gd");
+        send_note(
+            &client,
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "gdscript".to_owned(),
+                    version: 1,
+                    text: "func f():\n\tvar total := 1\n\treturn total\n".to_owned(),
+                },
+            },
+        );
+        let _ = next_diagnostics(&client);
+
+        // rename `total` (declared at line 1, col 5) → `sum`.
+        send_req(
+            &client,
+            2,
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri.as_str() },
+                "position": { "line": 1, "character": 5 },
+                "newName": "sum",
+            }),
+        );
+        let resp = next_response(&client);
+        assert!(resp.error.is_none(), "rename errored: {resp:?}");
+        let edit: lsp_types::WorkspaceEdit = serde_json::from_value(resp.result.unwrap()).unwrap();
+        let changes = edit.changes.expect("changes map");
+        let edits = changes.get(&doc_uri).expect("edits for the doc");
+        assert!(edits.len() >= 2, "decl + use both renamed: {edits:?}");
+        assert!(edits.iter().all(|e| e.new_text == "sum"), "{edits:?}");
 
         send_req(&client, 9, "shutdown", ());
         let _ = next_response(&client);

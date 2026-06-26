@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gdscript_base::{Cancellable, FileId, FilePosition, TextRange};
+use gdscript_base::{Cancellable, FileId, FilePosition, RenameError, SourceChange, TextRange};
 use gdscript_ide::Analysis;
 use lsp_types as lsp;
 use lsp_types::Uri;
@@ -187,4 +187,113 @@ pub fn workspace_symbols(
         })
         .collect();
     Ok(Some(symbols))
+}
+
+impl NavCtx {
+    /// A POD [`SourceChange`] → an LSP [`WorkspaceEdit`](lsp::WorkspaceEdit), or `None` if any edited
+    /// file isn't open — a rename/quick-fix must be **all-or-nothing**, so we'd rather refuse than
+    /// emit a partial edit that leaves a stale reference behind (full project scanning is a
+    /// follow-up).
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "lsp_types::Uri's interior cache never affects Hash/Eq"
+    )]
+    fn workspace_edit(&self, change: &SourceChange) -> Option<lsp::WorkspaceEdit> {
+        let mut changes = HashMap::new();
+        for fe in &change.edits {
+            let doc = self.docs.get(&fe.file)?;
+            let edits = fe
+                .edits
+                .iter()
+                .map(|e| lsp::TextEdit {
+                    range: convert::range_to_lsp(
+                        &doc.line_index,
+                        &doc.text,
+                        e.range,
+                        self.encoding,
+                    ),
+                    new_text: e.new_text.clone(),
+                })
+                .collect();
+            changes.insert(doc.uri.clone(), edits);
+        }
+        Some(lsp::WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        })
+    }
+}
+
+/// A human-readable reason a rename was refused (for the LSP error message).
+fn rename_error_message(error: &RenameError) -> String {
+    match error {
+        RenameError::InvalidIdentifier { new_name } => {
+            format!("`{new_name}` is not a valid GDScript identifier")
+        }
+        RenameError::NotRenamable { reason } => format!("cannot rename: {reason}"),
+        RenameError::WouldCollide { with, .. } => {
+            format!("a symbol named `{with}` already exists in scope")
+        }
+        RenameError::CrossesUnsupportedBoundary { what } => {
+            format!("rename would cross an unsupported boundary ({what})")
+        }
+    }
+}
+
+/// `textDocument/rename` → a `WorkspaceEdit`, or `Err((code, message))` if refused (an invalid name,
+/// a collision, an engine symbol, an unsupported boundary, or an edit reaching an un-opened file).
+pub fn rename(
+    a: &Analysis,
+    nav: &NavCtx,
+    file: FileId,
+    offset: u32,
+    new_name: &str,
+) -> Cancellable<Result<lsp::WorkspaceEdit, (i32, String)>> {
+    Ok(match a.rename(FilePosition { file, offset }, new_name)? {
+        Ok(change) => nav.workspace_edit(&change).ok_or_else(|| {
+            (
+                crate::REQUEST_FAILED,
+                "rename affects files not open in the editor — open them and retry".to_owned(),
+            )
+        }),
+        Err(error) => Err((crate::REQUEST_FAILED, rename_error_message(&error))),
+    })
+}
+
+/// `textDocument/prepareRename` → the range of the symbol under the cursor if it's renameable (uses
+/// find-references, which is non-empty only for user symbols), else `None`.
+pub fn prepare_rename(
+    a: &Analysis,
+    ctx: &DocCtx,
+    offset: u32,
+) -> Cancellable<Option<lsp::PrepareRenameResponse>> {
+    let range = a
+        .find_references(ctx.at(offset))?
+        .iter()
+        .find(|r| r.file == ctx.file && r.range.start <= offset && offset <= r.range.end)
+        .map(|r| convert::range_to_lsp(&ctx.line_index, &ctx.text, r.range, ctx.encoding));
+    Ok(range.map(lsp::PrepareRenameResponse::Range))
+}
+
+/// `textDocument/codeAction` → the quick-fixes at the position (those whose edit stays within open
+/// files).
+pub fn code_actions(
+    a: &Analysis,
+    nav: &NavCtx,
+    file: FileId,
+    offset: u32,
+) -> Cancellable<Option<Vec<lsp::CodeActionOrCommand>>> {
+    let actions = a
+        .code_actions(FilePosition { file, offset })?
+        .iter()
+        .filter_map(|ca| {
+            Some(lsp::CodeActionOrCommand::CodeAction(lsp::CodeAction {
+                title: ca.title.clone(),
+                kind: ca.kind.clone().map(lsp::CodeActionKind::from),
+                edit: Some(nav.workspace_edit(&ca.edit)?),
+                ..Default::default()
+            }))
+        })
+        .collect();
+    Ok(Some(actions))
 }
