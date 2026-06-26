@@ -24,28 +24,28 @@ pr_branch_prefix   = "release-plz/"
 changelog_config   = "cliff.toml"
 
 # The npm-/binary-distributed crates publish via their own pipelines (release-napi/wasm, dist), not
-# crates.io. `publish = false` in their Cargo.toml already stops the crates.io push; `release = false`
-# here also keeps them out of release-plz's release/tag bookkeeping. (gdscript-session is the internal
-# core bundled into the bindings — never published anywhere.)
+# crates.io. They carry `publish = false` in their Cargo.toml; release-plz REQUIRES its config to
+# agree (it errors if the config's `publish` disagrees with Cargo.toml), so we mirror `publish =
+# false` here. (gdscript-session is the internal core bundled into the bindings — never published.)
 [[package]]
 name    = "gdscript-session"
-release = false
+publish = false
 
 [[package]]
 name    = "gdscript-ffi"
-release = false
+publish = false
 
 [[package]]
 name    = "gdscript-wasm"
-release = false
+publish = false
 
 [[package]]
 name    = "gdscript-cli"
-release = false
+publish = false
 
 [[package]]
 name    = "gdscript-lsp"
-release = false
+publish = false
 
 # ---------------------------------------------------------------------------
 # 0.x bump policy (the canonical mapping from plans §D.2):
