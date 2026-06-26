@@ -18,6 +18,10 @@ git_tag_enable     = true         # release-plz pushes `v<version>` (drives the 
 git_release_enable = false        # dist owns the GitHub Release, not release-plz
 semver_check       = true         # run cargo-semver-checks before bumping
 pr_branch_prefix   = "release-plz/"
+# Delegate changelog formatting to the git-cliff config (the correct key is
+# `changelog_config` here — NOT a `path` under a `[changelog]` table, which holds inline
+# git-cliff fields and rejects `path`).
+changelog_config   = "cliff.toml"
 
 # The npm-/binary-distributed crates publish via their own pipelines (release-napi/wasm, dist), not
 # crates.io. `publish = false` in their Cargo.toml already stops the crates.io push; `release = false`
@@ -64,8 +68,3 @@ release = false
 # This block is intentionally documented rather than enforced so that the
 # behaviour is captured even though the default already matches.
 # ---------------------------------------------------------------------------
-
-[changelog]
-# Delegate all changelog formatting (Keep-a-Changelog groupings, commit
-# parsers, header) to cliff.toml so git-cliff and release-plz agree.
-path = "cliff.toml"
