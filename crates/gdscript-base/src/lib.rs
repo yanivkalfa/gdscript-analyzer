@@ -263,6 +263,69 @@ pub struct InlayHint {
     pub kind: InlayHintKind,
 }
 
+/// The semantic role of a [`SemanticToken`] — a GDScript-named subset of the LSP standard token
+/// types. Richer than a TextMate grammar: it distinguishes a type from a variable, a parameter from
+/// a local, a member from a global, a declaration from a use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SemanticTokenType {
+    /// A free function / a function call.
+    Function,
+    /// A method (a function that is a class member).
+    Method,
+    /// A local variable / `var`.
+    Variable,
+    /// A function parameter.
+    Parameter,
+    /// A member field accessed via `.`.
+    Property,
+    /// A `class` / `class_name`.
+    Class,
+    /// An `enum`.
+    Enum,
+    /// An enum variant.
+    EnumMember,
+    /// A type name (in a `: T`, `as T`, `is T`, `extends T`, `-> T` position).
+    Type,
+    /// An annotation, e.g. `@export`.
+    Decorator,
+    /// A numeric literal.
+    Number,
+    /// A string literal (incl. `StringName` / `NodePath`).
+    String,
+    /// A comment.
+    Comment,
+    /// A `signal`.
+    Signal,
+    /// A `const`.
+    Constant,
+}
+
+/// Bit flags for [`SemanticToken::modifiers`] (the LSP standard modifier subset we emit).
+pub mod semantic_token_modifier {
+    /// The token is the *declaration* of the symbol (vs. a use).
+    pub const DECLARATION: u32 = 1 << 0;
+    /// A read-only binding (`const`).
+    pub const READONLY: u32 = 1 << 1;
+    /// A `static` member.
+    pub const STATIC: u32 = 1 << 2;
+    /// An engine / built-in symbol (not user code).
+    pub const DEFAULT_LIBRARY: u32 = 1 << 3;
+}
+
+/// A semantic-highlighting token: a source range classified by its contextual/resolved role. Drives
+/// `textDocument/semanticTokens` — intelligence a grammar can't produce. Modifiers are a bitset of
+/// [`semantic_token_modifier`] flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticToken {
+    /// The token's byte range.
+    pub range: TextRange,
+    /// What the token denotes.
+    pub token_type: SemanticTokenType,
+    /// A bitset of [`semantic_token_modifier`] flags.
+    pub modifiers: u32,
+}
+
 /// A single text edit: replace `range` with `new_text`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextEdit {
