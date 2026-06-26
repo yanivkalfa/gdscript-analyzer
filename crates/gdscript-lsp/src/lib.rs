@@ -46,6 +46,10 @@ pub const CONTENT_MODIFIED: i32 = -32801;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 /// LSP error code for malformed request params.
 pub const INVALID_PARAMS: i32 = -32602;
+/// LSP error code for an internal failure (e.g. a query panicked) — the request still gets a reply.
+pub const INTERNAL_ERROR: i32 = -32603;
+/// LSP error code for a request received after `shutdown`.
+pub const INVALID_REQUEST: i32 = -32600;
 
 /// Choose the position encoding: prefer UTF-8 (our native byte columns), then UTF-32, else the
 /// mandatory UTF-16 fallback — driven by what the client advertised in `general.positionEncodings`.
@@ -64,7 +68,7 @@ pub fn negotiate_encoding(params: &InitializeParams) -> PositionEncoding {
 }
 
 /// The capabilities we advertise. **Data-driven by what's wired**: the negotiated position encoding
-/// + incremental text sync (M0; diagnostics are pushed, needing no capability) and the M1 read
+/// and incremental text sync (M0; diagnostics are pushed, needing no capability), plus the M1 read
 /// features. Later features (semantic tokens, inlay hints, rename, …) join as their milestones land.
 #[must_use]
 pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
@@ -121,29 +125,46 @@ pub fn run(connection: &Connection) -> Result<()> {
 fn main_loop(conn: &Connection, encoding: PositionEncoding) -> Result<()> {
     let (task_tx, task_rx) = crossbeam_channel::unbounded::<Message>();
     let mut state = GlobalState::new(encoding, task_tx);
+    // `shutdown` is acked manually (not via `Connection::handle_shutdown`, which blocks) so the loop
+    // keeps draining in-flight read responses to the client until `exit` — never leaving a read
+    // request unanswered (the client would otherwise hang).
+    let mut shutting_down = false;
     loop {
         crossbeam_channel::select! {
             recv(conn.receiver) -> msg => {
-                let Ok(msg) = msg else { break }; // client disconnected
+                let Ok(msg) = msg else { return Ok(()) }; // client disconnected — nothing to flush to
                 match msg {
                     Message::Request(req) => {
-                        if conn.handle_shutdown(&req)? {
+                        if req.method == "shutdown" {
+                            conn.sender.send(Message::Response(Response::new_ok(req.id, ())))?;
+                            shutting_down = true;
+                        } else if shutting_down {
+                            // Per spec, requests after `shutdown` are rejected.
+                            conn.sender.send(Message::Response(Response::new_err(
+                                req.id,
+                                INVALID_REQUEST,
+                                "server is shutting down".to_owned(),
+                            )))?;
+                        } else {
+                            state.handle_request(req);
+                        }
+                    }
+                    Message::Notification(note) => {
+                        if note.method == "exit" {
                             return Ok(());
                         }
-                        state.handle_request(req);
+                        state.on_notification(conn, &note)?;
                     }
-                    Message::Notification(note) => state.on_notification(conn, &note)?,
                     Message::Response(_) => {}
                 }
             }
             recv(task_rx) -> done => {
                 if let Ok(msg) = done {
-                    conn.sender.send(msg)?; // a finished read's Response → the client
+                    conn.sender.send(msg)?; // a finished read's Response → the client (incl. during shutdown→exit)
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// The single mutable owner of server state (main-thread only): the analysis host, the document
@@ -249,11 +270,17 @@ impl GlobalState {
         let analysis = self.host.analysis();
         let tx = self.task_tx.clone();
         std::thread::spawn(move || {
-            let resp = match compute(&analysis) {
-                Ok(value) => Response::new_ok(id, value),
-                Err(_cancelled) => {
+            // Catch a query panic (a real bug — `Cancelled` is an `Err`, not a panic) so the client
+            // always gets a reply instead of hanging forever on this request id. Salsa uses
+            // non-poisoning locks, so discarding the panicked snapshot leaves the host intact.
+            let computed =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute(&analysis)));
+            let resp = match computed {
+                Ok(Ok(value)) => Response::new_ok(id, value),
+                Ok(Err(_cancelled)) => {
                     Response::new_err(id, CONTENT_MODIFIED, "content modified".to_owned())
                 }
+                Err(_panic) => Response::new_err(id, INTERNAL_ERROR, "internal error".to_owned()),
             };
             let _ = tx.send(Message::Response(resp));
         });
@@ -271,14 +298,22 @@ impl GlobalState {
     fn on_notification(&mut self, conn: &Connection, note: &Notification) -> Result<()> {
         match note.method.as_str() {
             "textDocument/didOpen" => {
-                let p: DidOpenTextDocumentParams = serde_json::from_value(note.params.clone())?;
+                let Ok(p) =
+                    serde_json::from_value::<DidOpenTextDocumentParams>(note.params.clone())
+                else {
+                    return Ok(()); // ignore a malformed notification (LSP: notifications get no reply)
+                };
                 let td = p.text_document;
                 let id = self.vfs.upsert(&td.uri, td.text, td.version);
                 self.commit(id);
                 self.publish_diagnostics(conn, id)?;
             }
             "textDocument/didChange" => {
-                let p: DidChangeTextDocumentParams = serde_json::from_value(note.params.clone())?;
+                let Ok(p) =
+                    serde_json::from_value::<DidChangeTextDocumentParams>(note.params.clone())
+                else {
+                    return Ok(());
+                };
                 let uri = p.text_document.uri;
                 // Ignore a `didChange` for an un-opened / already-closed document (a malformed
                 // client) — never rebuild text from an empty buffer.
@@ -291,7 +326,11 @@ impl GlobalState {
                 self.publish_diagnostics(conn, id)?;
             }
             "textDocument/didClose" => {
-                let p: DidCloseTextDocumentParams = serde_json::from_value(note.params.clone())?;
+                let Ok(p) =
+                    serde_json::from_value::<DidCloseTextDocumentParams>(note.params.clone())
+                else {
+                    return Ok(());
+                };
                 if let Some(id) = self.vfs.id(&p.text_document.uri) {
                     self.vfs.close(id);
                     clear_diagnostics(conn, p.text_document.uri)?;
@@ -664,6 +703,41 @@ mod tests {
         assert_eq!(resp.error.map(|e| e.code), Some(METHOD_NOT_FOUND));
 
         send_req(&client, 9, "shutdown", ());
+        let _ = next_response(&client);
+        send_note(&client, "exit", ());
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn malformed_notification_does_not_crash_the_server() {
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || run(&server));
+        send_req(&client, 1, "initialize", InitializeParams::default());
+        let _ = next_response(&client);
+        send_note(&client, "initialized", InitializedParams {});
+
+        // A garbage didOpen (missing textDocument) must be IGNORED, not crash the loop.
+        send_note(
+            &client,
+            "textDocument/didOpen",
+            serde_json::json!({ "garbage": true }),
+        );
+        // The server is still alive: a request for an unopened doc returns null (no hang/crash).
+        send_req(
+            &client,
+            2,
+            "textDocument/documentSymbol",
+            serde_json::json!({ "textDocument": { "uri": "file:///x.gd" } }),
+        );
+        let resp = next_response(&client);
+        assert!(resp.error.is_none(), "server should still answer: {resp:?}");
+        assert_eq!(
+            resp.result,
+            Some(serde_json::Value::Null),
+            "unopened doc → null"
+        );
+
+        send_req(&client, 3, "shutdown", ());
         let _ = next_response(&client);
         send_note(&client, "exit", ());
         server_thread.join().unwrap().unwrap();

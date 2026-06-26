@@ -151,10 +151,19 @@ pub fn signature_help_to_lsp(help: &SignatureHelp) -> lsp::SignatureHelp {
             active_parameter: None,
         })
         .collect();
+    // Clamp the active indices into range (defensive — a client that doesn't itself clamp would
+    // otherwise highlight nothing / panic on an out-of-bounds index).
+    let n_sigs = u32::try_from(help.signatures.len()).unwrap_or(u32::MAX);
+    let active_signature = help.active_signature.min(n_sigs.saturating_sub(1));
+    let n_params = help
+        .signatures
+        .get(active_signature as usize)
+        .map_or(0, |s| u32::try_from(s.params.len()).unwrap_or(u32::MAX));
+    let active_parameter = help.active_parameter.min(n_params.saturating_sub(1));
     lsp::SignatureHelp {
         signatures,
-        active_signature: Some(help.active_signature),
-        active_parameter: Some(help.active_parameter),
+        active_signature: Some(active_signature),
+        active_parameter: Some(active_parameter),
     }
 }
 
@@ -225,5 +234,40 @@ pub fn folding_range_to_lsp(
         end_character: Some(end.character),
         kind,
         collapsed_text: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gdscript_base::{ParamInfo, SignatureInfo};
+
+    #[test]
+    fn signature_help_clamps_out_of_bounds_indices() {
+        // The analyzer may report `active_*` past the ends (e.g. a vararg call); we must clamp so a
+        // client doesn't index out of bounds.
+        let help = SignatureHelp {
+            signatures: vec![SignatureInfo {
+                label: "f(a)".to_owned(),
+                doc: String::new(),
+                params: vec![ParamInfo {
+                    label: "a".to_owned(),
+                    doc: String::new(),
+                }],
+            }],
+            active_signature: 5,
+            active_parameter: 9,
+        };
+        let out = signature_help_to_lsp(&help);
+        assert_eq!(
+            out.active_signature,
+            Some(0),
+            "clamped to the only signature"
+        );
+        assert_eq!(
+            out.active_parameter,
+            Some(0),
+            "clamped to the only parameter"
+        );
     }
 }
