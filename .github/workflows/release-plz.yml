@@ -48,8 +48,11 @@ jobs:
         env:
           # PAT/App token so the pushed `v<version>` tag triggers release-napi/wasm/dist.
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          # No CARGO_REGISTRY_TOKEN: crates.io publish uses OIDC Trusted Publishing
-          # (id-token: write above; configure a trusted publisher per crate on crates.io).
+          # crates.io auth via an API token — the simplest path, and (unlike OIDC Trusted
+          # Publishing) it can do a crate's FIRST publish with no manual bootstrap. To upgrade to
+          # tokenless OIDC later: drop this, keep `id-token: write`, and add a trusted publisher per
+          # crate on crates.io (after the first publish).
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # Maintain the Release PR (version bump + changelog) on every push to master.
   release-pr:
