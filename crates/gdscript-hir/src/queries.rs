@@ -973,6 +973,53 @@ mod tests {
     // ---- M4: autoloads (project.godot [autoload]) + is/as widen-only narrowing --------------
 
     #[test]
+    fn star_autoload_scene_resolves_via_its_root_script() {
+        // A `*`-autoload pointing at a `.tscn` whose root has an attached script resolves to that
+        // script (the singleton-scene pattern) — `Music.volume()` → int, no false UNSAFE. This was
+        // deferred to Phase 4 (scene ingestion); now closed.
+        let mut db = RootDatabase::default();
+        // music.gd (no class_name — resolved by the scene root's script= path).
+        db.set_file_text(
+            FileId(0),
+            "func volume() -> int:\n\treturn 5\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://music.gd");
+        // music.tscn: a root Node with script=music.gd.
+        db.set_file_text(
+            FileId(1),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://music.gd\" id=\"1\"]\n\
+             [node name=\"Music\" type=\"Node\"]\n\
+             script = ExtResource(\"1\")\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://music.tscn");
+        db.set_file_text(
+            FileId(2),
+            "func f():\n\tvar v := Music.volume()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://main.gd");
+        db.set_project_config("[autoload]\nMusic=\"*res://music.tscn\"\n");
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("f unit");
+        assert_eq!(
+            unit.result.bindings[0].ty.label(api).as_deref(),
+            Some("int"),
+            "Music.volume() should resolve via the scene root's script",
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
     fn star_autoload_gdscript_resolves_as_global_and_members() {
         let mut db = RootDatabase::default();
         // `game.gd` has NO class_name — the autoload resolves it by PATH (not the class registry).
@@ -1239,6 +1286,20 @@ mod tests {
         assert!(
             binding_labels(&db).iter().any(|l| l == "Button"),
             "get_node(\"...\") should type as Button",
+        );
+    }
+
+    #[test]
+    fn self_get_node_string_literal_types_like_dollar() {
+        // `self.get_node("…")` (explicit self = the attach node) types like the bare form; a foreign
+        // receiver `obj.get_node("…")` stays a normal call → `Node` (can't resolve another node's path).
+        let db = scene_db(
+            SCENE,
+            "extends Control\nfunc _ready():\n\tvar b := self.get_node(\"Panel/Box/Btn\")\n",
+        );
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Button"),
+            "self.get_node(\"...\") should type as Button",
         );
     }
 

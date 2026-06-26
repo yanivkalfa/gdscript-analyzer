@@ -54,8 +54,8 @@ pub fn resolve_external(db: &dyn Db, r: &ExternalRef) -> Ty {
         // (`extends "sibling.gd"`, `extends A.B`) stays the seam — relative-path anchoring is a
         // documented follow-up (needs the importing file's dir; 0 occurrences in the corpus).
         ExternalRef::ExtendsPath(path) if is_resource_path(path) => resolve_res_path(db, path),
-        // M4: a `*`-flagged autoload singleton's bare name → its script `ScriptRef` (`.gd`) or
-        // `Object(Node)` (`.tscn`, scene-root sharpening deferred to Phase 4).
+        // M4: a `*`-flagged autoload singleton's bare name → its script `ScriptRef` — a `.gd`
+        // directly, or a `.tscn` via its root node's attached script (Phase-4 scene-root sharpening).
         ExternalRef::Autoload(name) => resolve_autoload(db, name),
         // `load(...)` is never routed here (it stays an opaque runtime call). Dotted `extends`
         // remains the seam.
@@ -82,9 +82,49 @@ fn resolve_autoload(db: &dyn Db, name: &str) -> Ty {
     };
     if is_gdscript_path(&path) {
         resolve_res_path(db, &path)
+    } else if is_scene_path(&path) {
+        resolve_scene_autoload(db, &path)
     } else {
         Ty::Unknown
     }
+}
+
+/// A `*`-autoload pointing at a scene (`.tscn`/`.tres`) resolves to its **root node's attached
+/// script** — the singleton-scene pattern (`Music="*res://music.tscn"` whose root has
+/// `script=music.gd`), so `Music.play()` checks against the real script (Phase-4 unblocked this; the
+/// scene model is now ingested). A root with no script, or an un-loaded scene, → the conservative
+/// seam. (Typing a script-less root by its native `type=` would need the engine API, which
+/// `resolve_external` doesn't carry — a follow-up; the attached-script case is the common one.)
+fn resolve_scene_autoload(db: &dyn Db, scene_path: &str) -> Ty {
+    let Some(root) = db.source_root() else {
+        return Ty::Unknown;
+    };
+    let Some(&scene_file) = crate::queries::res_path_registry(db, root).get(scene_path) else {
+        return Ty::Unknown; // the scene isn't loaded into the VFS
+    };
+    let Some(ft) = db.file_text(scene_file) else {
+        return Ty::Unknown;
+    };
+    let scene = crate::queries::scene_model(db, ft);
+    let Some(root_node) = scene.root.and_then(|idx| scene.node(idx)) else {
+        return Ty::Unknown;
+    };
+    let Some(script_path) = root_node
+        .script
+        .as_ref()
+        .and_then(|id| scene.ext_resources.get(id))
+        .and_then(|ext| ext.path.as_deref())
+    else {
+        return Ty::Unknown; // the root has no attached script
+    };
+    resolve_res_path(db, script_path)
+}
+
+/// Whether a resource path is a Godot scene/resource (`.tscn`/`.tres`).
+fn is_scene_path(p: &str) -> bool {
+    p.rsplit('.')
+        .next()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tscn") || ext.eq_ignore_ascii_case("tres"))
 }
 
 /// Whether a resource path is a GDScript file (the `.cs` C# case is out of scope → seam). Compare

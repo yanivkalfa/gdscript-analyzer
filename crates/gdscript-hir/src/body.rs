@@ -913,11 +913,21 @@ fn field_member(node: &GdNode) -> Option<(SmolStr, TextRange)> {
 /// a normal call → `Node`). Lets the call lower to a [`Expr::GetNode`] so it types like `$path`.
 fn get_node_call_path(node: &GdNode) -> Option<SmolStr> {
     let callee = cst::first_child_expr(node)?;
-    if callee.kind() != SyntaxKind::NameRef {
-        return None; // `obj.get_node(...)` / `self.get_node(...)` — not the bare implicit-self form
-    }
-    let name = cst::first_token(&callee)?;
-    if !matches!(name.text(), "get_node" | "get_node_or_null") {
+    // The callee must be `get_node`/`get_node_or_null`, either **bare** (implicit `self`) or
+    // **`self.<m>`** (explicit self = the same attach node). A *foreign* receiver
+    // (`obj.get_node(...)`) is left as a normal call — its path is relative to another node we can't
+    // resolve here.
+    let is_get_node = match callee.kind() {
+        SyntaxKind::NameRef => {
+            cst::first_token(&callee).is_some_and(|t| is_get_node_name(t.text()))
+        }
+        SyntaxKind::FieldExpr => {
+            is_self_receiver(&callee)
+                && field_member(&callee).is_some_and(|(name, _)| is_get_node_name(&name))
+        }
+        _ => false,
+    };
+    if !is_get_node {
         return None;
     }
     let arg = cst::first_child(node, |k| k == SyntaxKind::ArgList)
@@ -927,6 +937,21 @@ fn get_node_call_path(node: &GdNode) -> Option<SmolStr> {
     }
     let s = cst::child_token_text(&arg, SyntaxKind::String)?;
     Some(SmolStr::new(s.trim_matches(['"', '\''])))
+}
+
+fn is_get_node_name(name: &str) -> bool {
+    matches!(name, "get_node" | "get_node_or_null")
+}
+
+/// Whether a `FieldExpr`'s receiver is `self` (a `NameRef` carrying a `SelfKw` token).
+fn is_self_receiver(field_expr: &GdNode) -> bool {
+    cst::first_child_expr(field_expr).is_some_and(|recv| {
+        recv.kind() == SyntaxKind::NameRef
+            && recv
+                .children_with_tokens()
+                .filter_map(cstree::util::NodeOrToken::into_token)
+                .any(|t| t.kind() == SyntaxKind::SelfKw)
+    })
 }
 
 /// The literal node path from a `$Path`/`%Unique` (`GetNodeExpr`/`UniqueNodeExpr`) node: a dequoted
