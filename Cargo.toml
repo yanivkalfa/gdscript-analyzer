@@ -106,6 +106,15 @@ ignore = "0.4"
 anstream = "0.6"
 anstyle = "1"
 annotate-snippets = "0.12"
+# Phase 5 — the standalone LSP server (`gdscript-lsp`, native-only; never in the wasm32 core gate).
+# rust-analyzer's own low-level stack: `lsp-server` (stdio transport + a `Connection` = a pair of
+# crossbeam channels → trivial in-process test harness) + `lsp-types` (LSP 3.17 structs incl.
+# `PositionEncodingKind` negotiation) + a hand-rolled event loop. Deliberately NOT tower-lsp/async-lsp
+# — our engine is synchronous + cancellation-via-unwind (salsa), so an async runtime is pure
+# impedance. See plans/PHASE-5-LSP-PLAYBOOK.md §1.
+lsp-server = "0.7"
+lsp-types = "0.97"
+crossbeam-channel = "0.5"
 # dev/test
 expect-test = "1.5" # rust-analyzer's golden mechanism (UPDATE_EXPECT=1 to bless)
 proptest = "1.11" # local panic-free robustness harness (in-process; gnu-clean)
