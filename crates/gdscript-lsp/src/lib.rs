@@ -142,7 +142,9 @@ impl GlobalState {
             "textDocument/didChange" => {
                 let p: DidChangeTextDocumentParams = serde_json::from_value(note.params.clone())?;
                 let uri = p.text_document.uri;
-                let Some(id) = self.vfs.id(&uri) else {
+                // Ignore a `didChange` for an un-opened / already-closed document (a malformed
+                // client) — never rebuild text from an empty buffer.
+                let Some(id) = self.vfs.id(&uri).filter(|&id| self.vfs.doc(id).is_some()) else {
                     return Ok(());
                 };
                 let new_text = self.apply_content_changes(id, &p.content_changes);
@@ -187,8 +189,11 @@ impl GlobalState {
         let mut li = doc.line_index.clone();
         for change in changes {
             if let Some(range) = change.range {
-                let start = li.offset(&text, range.start, self.encoding) as usize;
-                let end = li.offset(&text, range.end, self.encoding) as usize;
+                let a = li.offset(&text, range.start, self.encoding) as usize;
+                let b = li.offset(&text, range.end, self.encoding) as usize;
+                // Tolerate a malformed reversed range (`start > end`) instead of panicking the
+                // server thread via `replace_range`. Both offsets are already char boundaries.
+                let (start, end) = (a.min(b), a.max(b));
                 text.replace_range(start..end, &change.text);
             } else {
                 text.clone_from(&change.text); // full-document replacement
@@ -369,6 +374,45 @@ mod tests {
         let _ = next_response(&client);
         send_note(&client, "exit", ());
         server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn reversed_range_didchange_is_tolerated_not_a_panic() {
+        // A malformed reversed range (`start > end`) must normalize, not crash the server thread
+        // via `String::replace_range`.
+        let mut state = GlobalState::new(PositionEncoding::Utf16);
+        let u = uri("file:///a.gd");
+        state.vfs.upsert(&u, "abcdef\n".to_owned(), 1);
+        let id = state.vfs.id(&u).unwrap();
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(lsp_types::Range::new(
+                lsp_types::Position::new(0, 5),
+                lsp_types::Position::new(0, 2),
+            )),
+            range_length: None,
+            text: "X".to_owned(),
+        }];
+        // start=5 > end=2 → normalized to (2,5): "cde" → "X" ⇒ "abXf\n".
+        assert_eq!(state.apply_content_changes(id, &changes), "abXf\n");
+    }
+
+    #[test]
+    fn didchange_for_a_closed_document_is_ignored() {
+        // After didClose the id stays interned but the overlay is gone; a stray didChange must not
+        // resurrect the doc from an empty buffer (the handler guards on `doc(id).is_some()`).
+        let mut state = GlobalState::new(PositionEncoding::Utf16);
+        let u = uri("file:///a.gd");
+        let id = state.vfs.upsert(&u, "extends Node\n".to_owned(), 1);
+        state.vfs.close(id);
+        assert_eq!(
+            state.vfs.id(&u),
+            Some(id),
+            "the id stays interned after close"
+        );
+        assert!(
+            state.vfs.doc(id).is_none(),
+            "the overlay is dropped, so the didChange guard (doc(id).is_some()) rejects it",
+        );
     }
 
     #[test]

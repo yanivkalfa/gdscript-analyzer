@@ -78,8 +78,10 @@ impl LineIndex {
             .saturating_sub(1);
         let line_start = self.line_starts[line];
         let line_text = &text[line_start as usize..];
-        let col_bytes = (offset - line_start) as usize;
-        let segment = &line_text[..col_bytes.min(line_text.len())];
+        // Floor to a UTF-8 char boundary so a (defensively) mis-aligned offset never panics the
+        // slice. Our internal offsets are always boundaries; this is no-panic insurance.
+        let col_bytes = floor_char_boundary(line_text, (offset - line_start) as usize);
+        let segment = &line_text[..col_bytes];
         let character: u32 = segment.chars().map(|c| enc.width(c)).sum();
         Position {
             line: u32::try_from(line).unwrap_or(u32::MAX),
@@ -107,6 +109,16 @@ impl LineIndex {
         }
         line_end // last line with no trailing '\n'
     }
+}
+
+/// The largest char boundary `<= i` in `s` (a stable stand-in for the unstable
+/// `str::floor_char_boundary`). `i` is first clamped to `s.len()`.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -185,6 +197,16 @@ mod tests {
         assert_eq!(li.offset(text, pos(0, 99), PositionEncoding::Utf16), 2); // the `\n` byte
         // a line past EOF clamps to document end.
         assert_eq!(li.offset(text, pos(99, 0), PositionEncoding::Utf16), li.len);
+    }
+
+    #[test]
+    fn mid_char_offset_floors_instead_of_panicking() {
+        // A (defensively) mis-aligned offset inside a 3-byte char must NOT panic the str slice; it
+        // floors to the char start. `된` occupies bytes 5,6,7.
+        let text = "x = \"된\"\n";
+        let li = LineIndex::new(text);
+        assert_eq!(li.position(text, 6, PositionEncoding::Utf16), pos(0, 5)); // mid-`된` → floored
+        assert_eq!(li.position(text, 7, PositionEncoding::Utf16), pos(0, 5)); // 3rd byte → floored
     }
 
     #[test]
