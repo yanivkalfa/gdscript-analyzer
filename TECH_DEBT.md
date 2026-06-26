@@ -75,8 +75,11 @@ end-to-end inlay test.
 - [ ] **1-script-many-scenes = first scene wins** for *typing*. `script_scene_index` keeps the first
       attaching scene (now also flagging the attachment `ambiguous`, which M2 uses to suppress false
       `INVALID_NODE_PATH`); the common-base union *typing* policy (Playbook §6.3) is later.
-- [ ] **`.tscn`-autoload sharpening still seam.** A `*`-autoload pointing at a `.tscn` could now read
-      the scene root's type (the machinery exists); wired later.
+- [x] **`.tscn`-autoload sharpening — DONE (post-LSP tech-debt pass).** A `*`-autoload pointing at a
+      `.tscn` now resolves to the scene root's **attached-script `ScriptRef`** (`resolve_scene_autoload`
+      in `resolve.rs`, reusing `scene_model` + `res_path_registry`), so `Music.play()` checks the real
+      script — no false `UNSAFE`. A script-less root (whose native `type=` would need the engine API
+      that `resolve_external` doesn't carry) stays the conservative seam.
 
 ### M2 — scene-aware diagnostics & navigation — **DONE**
 Built on M1's resolution: **go-to-definition** on a node-path jumps into the owning `.tscn`'s
@@ -119,8 +122,9 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       `$Enemy/Sprite` (a node *inside* the sub-scene) still degrades to `Node` (`IntoInstance` — no
       false warn). Resolving across the scene boundary into the sub-scene's own tree is the remaining
       tail; the node-type case (the headline) is done.
-- [ ] **`self.get_node("…")` (explicit-self / `obj.get_node`) not intercepted** — only bare
-      `get_node("…")` (implicit self) and `$`/`%`. Explicit/foreign forms stay a normal call → `Node`.
+- [x] **`self.get_node("…")` — DONE (post-LSP tech-debt pass).** Explicit `self.get_node("…")` now
+      types like the bare form (`self` = the attach node). A *foreign* `obj.get_node("…")` stays a
+      normal call → `Node` (correct — its path is relative to a node we can't resolve here).
 - [ ] **`%Unique` completion deferred.** `$`-path completion is done; `%`-name completion is held
       because disambiguating `%Name` (unique node) from `a %b` (modulo) needs token context, not the
       backward byte scan. Typing/goto/diagnostic for `%` all work — only its *completion* is pending.
@@ -188,12 +192,12 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       symbol, not just names visible in the enclosing scope. Acceptable for Tier 0;
       scope-awareness comes with the HIR.
 - [x] **Type inference / member completion / hover / inlay / signature help / code
-      actions — DONE in Phase 2.** Goto-def / find-refs / rename remain Phase 3 (need the
-      project graph); the `goto_definition` method still returns empty.
-- [ ] **No salsa / incremental reparse.** Whole-file reparse + re-infer on every query (a
-      plain VFS map). Adopt salsa at Phase 3 — every derived computation is already a pure
-      `(text) -> value` function so the swap is localized. (Warm single-file is ~1.4 ms, so
-      this is a scaling concern for large projects, not a single-file latency one.)
+      actions — DONE in Phase 2; goto-def / find-refs / rename / workspace symbols — DONE in
+      Phase 3 M5** (cross-file, resolve-don't-string-match; `goto_definition` returns real targets).
+- [x] **salsa / incremental reparse — DONE in Phase 3 M0.** The plain VFS map was replaced by a
+      salsa query graph (`FileText` inputs, tracked `parse`/`item_tree`/`analyze_file`, real
+      cancellation, the body-edit firewall). Every derived computation stayed a pure `(text) -> value`
+      function, so the swap was localized + byte-identical to Phase 2.
 
 ---
 
@@ -341,11 +345,10 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       bodies) is a perf follow-up if the large-project benchmark regresses.
 - [ ] **(M5) `ReferenceKind::Write` not derived.** find-refs tags `Declaration` vs `Read` only;
       assignment-LHS `Write` is a cheap follow-up off the lowered body.
-- [ ] **Scene (`.tscn`) autoloads resolve to the seam, not their scene-root type → Phase 4.** A
-      `*`-autoload pointing at a `.tscn` is `Unknown` (member access is unchecked, never a false warn).
-      Typing it as bare `Node` would *false-warn* on the root script's own members (`Music.play()`);
-      the real fix is Phase-4 scene parsing (read the root node's `class_name` script). `.cs` autoloads
-      likewise → seam (out of scope for a GDScript analyzer).
+- [x] **Scene (`.tscn`) autoloads → root script — DONE (post-LSP tech-debt pass).** A `*`-autoload
+      pointing at a `.tscn` now resolves to its root node's attached-script `ScriptRef` (Phase-4 scene
+      parsing unblocked it — `resolve_scene_autoload`), so `Music.play()` checks the real script. A
+      script-less root or a `.cs` autoload stays the seam (the latter out of scope).
 - [ ] **Non-`*` autoloads are not resolvable by name (nor via `get_node("/root/Name")`).** We seed
       globals only for `*`-singletons (matches the engine: no `*` ⇒ not a global constant). The
       `/root/Name` node-path access is Phase-4 scene/node work. No false positives, just imprecision.
