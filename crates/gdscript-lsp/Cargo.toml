@@ -30,3 +30,7 @@ anyhow = { workspace = true }
 
 [lints]
 workspace = true
+
+# Distribute the `gdscript-lsp` binary via `dist` (its `publish = false` otherwise hides it).
+[package.metadata.dist]
+dist = true

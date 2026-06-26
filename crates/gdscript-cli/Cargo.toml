@@ -35,3 +35,7 @@ serde_json = { workspace = true }
 
 [lints]
 workspace = true
+
+# Distribute the `gdscript` binary via `dist` (its `publish = false` otherwise hides it).
+[package.metadata.dist]
+dist = true

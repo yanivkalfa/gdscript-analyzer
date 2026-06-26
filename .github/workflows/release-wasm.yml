@@ -1,19 +1,15 @@
 name: release-wasm
 
-# wasm npm package build (Phase 0, Workstream C.3).
+# Build + publish the wasm-bindgen browser package `@gdscript-analyzer/wasm` (Phase 5 GA).
 #
-# PHASE-0 SKELETON. The wasm fallback crate (`gdscript-wasm` at bindings/wasm)
-# is a bare cdylib stub with NO wasm-bindgen wiring yet (Phase 1). So this is
-# `workflow_dispatch`-only and the build step is a plain
-# `cargo build -p gdscript-wasm --release` placeholder.
-#
-# The build route is decided in Phase 5 by measured bundle size:
-#   Route A (default): reuse the napi crate ->
-#       napi build --target wasm32-wasip1-threads
-#   Route B (fallback): wasm-pack build bindings/wasm --target web
-#       --profile wasm-release  (+ --target bundler / --target nodejs variants),
-#       then wasm-pack pack / publish.
+# Fires on the `v<version>` tag release-plz pushes (build-only on workflow_dispatch). Single
+# `--target web` package (the playground/ESM consumer); bundler/nodejs variants are a follow-up.
+# wasm-pack generates `pkg/package.json` from the crate (`gdscript-wasm`) — we rewrite the name to
+# the exact scoped `@gdscript-analyzer/wasm` and publish that with provenance (`npm publish`, NOT
+# `wasm-pack publish`, which has no --provenance/--access).
 on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch: {}
 
 permissions:
@@ -24,23 +20,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: build (wasm)
+  publish:
+    name: build + publish @gdscript-analyzer/wasm
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm provenance
     steps:
       - uses: actions/checkout@v7
-      - name: Install toolchain (+ wasm target)
+      - name: Install Rust + wasm target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      # PHASE-0 PLACEHOLDER: build the empty fallback crate. Phase 5 selects
-      # Route A (napi wasm) or Route B (wasm-pack) per measured bundle size.
-      - name: Build (placeholder — Route A/B decided in Phase 5)
-        run: cargo build -p gdscript-wasm --release
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
         with:
-          name: wasm-pkg
-          path: target/release/*gdscript_wasm*
-          if-no-files-found: ignore
+          version: "v0.15.0"
+      - name: Build the wasm package
+        run: wasm-pack build --target web --release --out-dir pkg bindings/wasm
+      - name: Rewrite to the scoped package name + publish config
+        run: |
+          cd bindings/wasm/pkg
+          npm pkg set name='@gdscript-analyzer/wasm'
+          npm pkg set publishConfig.access='public'
+          npm pkg set publishConfig.provenance=true --json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org" # writes .npmrc (required for provenance)
+      - name: Publish (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd bindings/wasm/pkg
+          npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
