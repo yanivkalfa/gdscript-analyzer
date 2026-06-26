@@ -12,12 +12,11 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-gdscript-ide = { workspace = true }
-gdscript-base = { workspace = true }
+# All logic lives in the pure-Rust, fully-tested `gdscript-session`; this crate is a thin
+# #[wasm_bindgen] delegator (mirrors the napi binding `gdscript-ffi`).
+gdscript-session = { workspace = true }
 wasm-bindgen = { workspace = true }
 console_error_panic_hook = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

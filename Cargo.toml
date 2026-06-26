@@ -16,6 +16,7 @@ default-members = [
     "crates/gdscript-hir",
     "crates/gdscript-ide",
     "crates/gdscript-scene",
+    "crates/gdscript-session",
     "crates/gdscript-lsp",
     "crates/gdscript-cli",
     "xtask",
@@ -43,6 +44,7 @@ gdscript-db = { path = "crates/gdscript-db", version = "0.1.0" }
 gdscript-hir = { path = "crates/gdscript-hir", version = "0.1.0" }
 gdscript-ide = { path = "crates/gdscript-ide", version = "0.1.0" }
 gdscript-scene = { path = "crates/gdscript-scene", version = "0.1.0" }
+gdscript-session = { path = "crates/gdscript-session", version = "0.1.0" }
 # Third-party (pinned centrally; actual use grows in later phases).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -93,6 +95,17 @@ console_error_panic_hook = "0.1"
 # `cc`, so it can't target wasm32. See Playbook §1 / §WS5.
 tree-sitter = "0.26"
 tree-sitter-gdscript = "6.1"
+# Phase 5 — the `gdscript` CLI (`gdscript-cli`, native-only). A filesystem + presentation shell over
+# `gdscript-ide`: clap v4 command tree, the `ignore` crate for .gitignore-aware traversal, `rayon`
+# to fan out `diagnostics(file)` over cloned `Analysis` snapshots, `annotate-snippets` for
+# rustc-style human output, `anstream` for NO_COLOR/non-tty-aware color. See
+# plans/PHASE-5-CLI-PLAYBOOK.md.
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+ignore = "0.4"
+anstream = "0.6"
+anstyle = "1"
+annotate-snippets = "0.12"
 # Phase 5 — the standalone LSP server (`gdscript-lsp`, native-only; never in the wasm32 core gate).
 # rust-analyzer's own low-level stack: `lsp-server` (stdio transport + a `Connection` = a pair of
 # crossbeam channels → trivial in-process test harness) + `lsp-types` (LSP 3.17 structs incl.
