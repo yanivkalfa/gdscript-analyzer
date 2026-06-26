@@ -644,12 +644,10 @@ dependencies = [
 name = "gdscript-ffi"
 version = "0.1.0"
 dependencies = [
- "gdscript-base",
- "gdscript-ide",
+ "gdscript-session",
  "napi",
  "napi-build",
  "napi-derive",
- "serde_json",
 ]
 
 [[package]]
@@ -698,6 +696,17 @@ dependencies = [
  "gdscript-base",
  "rustc-hash",
  "smol_str",
+]
+
+[[package]]
+name = "gdscript-session"
+version = "0.1.0"
+dependencies = [
+ "gdscript-base",
+ "gdscript-ide",
+ "rustc-hash",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

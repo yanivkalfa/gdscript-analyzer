@@ -16,6 +16,7 @@ default-members = [
     "crates/gdscript-hir",
     "crates/gdscript-ide",
     "crates/gdscript-scene",
+    "crates/gdscript-session",
     "crates/gdscript-lsp",
     "crates/gdscript-cli",
     "xtask",
@@ -43,6 +44,7 @@ gdscript-db = { path = "crates/gdscript-db", version = "0.1.0" }
 gdscript-hir = { path = "crates/gdscript-hir", version = "0.1.0" }
 gdscript-ide = { path = "crates/gdscript-ide", version = "0.1.0" }
 gdscript-scene = { path = "crates/gdscript-scene", version = "0.1.0" }
+gdscript-session = { path = "crates/gdscript-session", version = "0.1.0" }
 # Third-party (pinned centrally; actual use grows in later phases).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,0 +1,19 @@
+[package]
+name = "gdscript-session"
+description = "URI-keyed, JSON-returning session over gdscript-ide — the shared, pure-Rust core wrapped by the napi (gdscript-ffi) and wasm (gdscript-wasm) bindings."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+gdscript-ide = { workspace = true }
+gdscript-base = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustc-hash = { workspace = true }
+
+[lints]
+workspace = true
