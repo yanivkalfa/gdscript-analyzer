@@ -160,7 +160,11 @@ func _ready() -> void:
         }
       }
 
-      const escapeHtml = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+      // A function declaration (hoisted) — `analyze()` runs on load and reaches this via
+      // renderDiagnostics, so a `const` here would throw a temporal-dead-zone error.
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+      }
 
       // Live diagnostics (debounced); hover/completions on demand.
       let t = 0;
