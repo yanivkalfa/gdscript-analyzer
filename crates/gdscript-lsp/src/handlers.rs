@@ -267,10 +267,12 @@ pub fn prepare_rename(
     ctx: &DocCtx,
     offset: u32,
 ) -> Cancellable<Option<lsp::PrepareRenameResponse>> {
+    // `TextRange` is half-open `[start, end)`, so containment is `start <= offset < end` (matching
+    // def.rs/infer.rs) — a cursor at the exclusive end byte is not inside the token.
     let range = a
         .find_references(ctx.at(offset))?
         .iter()
-        .find(|r| r.file == ctx.file && r.range.start <= offset && offset <= r.range.end)
+        .find(|r| r.file == ctx.file && r.range.start <= offset && offset < r.range.end)
         .map(|r| convert::range_to_lsp(&ctx.line_index, &ctx.text, r.range, ctx.encoding));
     Ok(range.map(lsp::PrepareRenameResponse::Range))
 }

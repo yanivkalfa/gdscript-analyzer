@@ -1049,6 +1049,67 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rename_validates_the_cursor() {
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || run(&server));
+        send_req(&client, 1, "initialize", InitializeParams::default());
+        let _ = next_response(&client);
+        send_note(&client, "initialized", InitializedParams {});
+
+        let doc_uri = uri("file:///main.gd");
+        send_note(
+            &client,
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "gdscript".to_owned(),
+                    version: 1,
+                    text: "func f():\n\tvar total := 1\n\treturn total\n".to_owned(),
+                },
+            },
+        );
+        let _ = next_diagnostics(&client);
+        let u = doc_uri.as_str();
+
+        // inside `total` (line 1, char 7) → a renameable range.
+        send_req(
+            &client,
+            2,
+            "textDocument/prepareRename",
+            serde_json::json!({ "textDocument": { "uri": u }, "position": { "line": 1, "character": 7 } }),
+        );
+        let resp = next_response(&client);
+        assert!(resp.error.is_none(), "{resp:?}");
+        let inside: Option<lsp_types::PrepareRenameResponse> =
+            serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(
+            inside.is_some(),
+            "cursor inside `total` should be renameable"
+        );
+
+        // on the leading tab (line 1, char 0) → null (not a symbol).
+        send_req(
+            &client,
+            3,
+            "textDocument/prepareRename",
+            serde_json::json!({ "textDocument": { "uri": u }, "position": { "line": 1, "character": 0 } }),
+        );
+        let resp = next_response(&client);
+        assert!(resp.error.is_none(), "{resp:?}");
+        assert_eq!(
+            resp.result,
+            Some(serde_json::Value::Null),
+            "whitespace is not renameable"
+        );
+
+        send_req(&client, 9, "shutdown", ());
+        let _ = next_response(&client);
+        send_note(&client, "exit", ());
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
     #[allow(
         clippy::mutable_key_type,
         reason = "lsp_types::Uri key — interior cache is hash-stable"
