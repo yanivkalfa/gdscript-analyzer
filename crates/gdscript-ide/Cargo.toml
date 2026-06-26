@@ -3,6 +3,7 @@ name = "gdscript-ide"
 description = "The public AnalysisHost/Analysis API for gdscript-analyzer — engine-neutral, protocol-neutral (POD + byte offsets)."
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

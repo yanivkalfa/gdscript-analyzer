@@ -143,8 +143,14 @@ func _ready() -> void:
         if (!az) return;
         const off = utf16ToByte(code.value, code.selectionStart);
         const raw = az.hover(URI, off);
-        $("cursor").textContent = raw ? JSON.parse(raw).markdown ?? JSON.parse(raw).text ?? raw
-                                      : "(nothing typed at the cursor)";
+        if (!raw) { $("cursor").textContent = "(nothing typed at the cursor)"; return; }
+        // HoverResult is { ty_label, doc, range }. Show a clean "type — docs" line rather than the
+        // raw JSON; fall back to markdown/text (future shapes) and finally the JSON itself.
+        const h = JSON.parse(raw);
+        const parts = [];
+        if (h.ty_label) parts.push(h.ty_label);
+        if (h.doc) parts.push(h.doc);
+        $("cursor").textContent = parts.length ? parts.join("\n\n") : (h.markdown ?? h.text ?? raw);
       }
 
       function showCompletions() {

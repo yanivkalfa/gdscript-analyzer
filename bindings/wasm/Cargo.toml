@@ -1,11 +1,18 @@
 [package]
 name = "gdscript-wasm"
-description = "wasm-bindgen browser binding (documented fallback to the napi-rs wasm target) for gdscript-analyzer."
+description = "Run a full GDScript (Godot 4.x) static analyzer in the browser — diagnostics, type-aware hover, completion, symbols, navigation. The wasm-bindgen binding of gdscript-analyzer (Roslyn for Godot)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+readme = "README.md"
+# Published to npm as @gdscript-analyzer/wasm via `wasm-pack build` (NOT to crates.io). wasm-pack
+# copies this [package] metadata (description/keywords/homepage/license/README) into the generated
+# pkg/package.json; the release-wasm workflow then rewrites `name` to the scoped @gdscript-analyzer/wasm.
 publish = false
 
 [lib]

@@ -3,6 +3,7 @@ name = "gdscript-api"
 description = "The Godot engine model (classes, methods, signals, enums, …) generated from extension_api.json."
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
