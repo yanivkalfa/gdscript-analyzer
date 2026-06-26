@@ -12,9 +12,16 @@
 allow_dirty        = false        # never release from a dirty tree
 changelog_update   = true         # regenerate CHANGELOG.md from commits
 # Release ownership is SPLIT with `dist` (avoids two tools racing on the GitHub Release):
-#   release-plz pushes the tag (which triggers release-napi/wasm/dist — needs the PAT), and
-#   `dist` (release.yml) creates the GitHub Release + uploads the CLI/LSP binaries.
-git_tag_enable     = true         # release-plz pushes `v<version>` (drives the whole release)
+#   release-plz pushes ONE unified `v<version>` tag (which triggers release-napi/wasm/dist — needs
+#   the PAT), and `dist` (release.yml) creates the GitHub Release + uploads the CLI/LSP binaries.
+#
+# SINGLE-TAG SETUP (https://release-plz.dev/docs/extra/single-tag): by DEFAULT release-plz tags every
+# released crate (`gdscript-base-v0.1.0`, `gdscript-ide-v0.1.0`, …). Those per-crate tags do NOT match
+# the downstream workflows' `v[0-9]+.[0-9]+.[0-9]+*` trigger, so napi/wasm/dist never fire. Fix: turn
+# per-crate tags OFF workspace-wide, then enable a SINGLE tag named `v{{ version }}` on the top crate
+# `gdscript-ide` (published LAST, so the tag lands only after every dependency is on crates.io —
+# exactly when the bindings/binaries should publish). See the [[package]] block below.
+git_tag_enable     = false        # per-crate tags OFF; the single `v<version>` tag is enabled on gdscript-ide below
 git_release_enable = false        # dist owns the GitHub Release, not release-plz
 semver_check       = true         # run cargo-semver-checks before bumping
 pr_branch_prefix   = "release-plz/"
@@ -22,6 +29,15 @@ pr_branch_prefix   = "release-plz/"
 # `changelog_config` here — NOT a `path` under a `[changelog]` table, which holds inline
 # git-cliff fields and rejects `path`).
 changelog_config   = "cliff.toml"
+
+# The SINGLE shared release tag (the other half of the single-tag setup described above). release-plz
+# creates `v<version>` ONLY when it releases gdscript-ide — the top-level crate, published last — so
+# the tag is pushed after every dependency is on crates.io, which is precisely when release-napi,
+# release-wasm, and dist should fire. (git_release_enable stays inherited-false: dist owns the Release.)
+[[package]]
+name           = "gdscript-ide"
+git_tag_name   = "v{{ version }}"
+git_tag_enable = true
 
 # The npm-/binary-distributed crates publish via their own pipelines (release-napi/wasm, dist), not
 # crates.io. They carry `publish = false` in their Cargo.toml; release-plz REQUIRES its config to
