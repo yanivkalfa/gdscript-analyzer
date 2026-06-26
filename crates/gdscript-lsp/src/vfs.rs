@@ -83,4 +83,11 @@ impl Vfs {
     pub fn close(&mut self, id: FileId) {
         self.docs.remove(&id.0);
     }
+
+    /// Every open document with its `FileId` and URI (for building a navigation snapshot).
+    pub fn iter(&self) -> impl Iterator<Item = (FileId, &Uri, &Document)> + '_ {
+        self.docs.iter().filter_map(move |(&id, doc)| {
+            self.uris.get(id as usize).map(|uri| (FileId(id), uri, doc))
+        })
+    }
 }

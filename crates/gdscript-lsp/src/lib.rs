@@ -35,11 +35,11 @@ use lsp_types::{
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
     ServerCapabilities, ServerInfo, SignatureHelpOptions, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri,
+    TextDocumentSyncKind, Uri, WorkspaceSymbolParams,
 };
 
 use crate::convert::diagnostic_to_lsp;
-use crate::handlers::DocCtx;
+use crate::handlers::{DocCtx, NavCtx, NavDoc};
 use crate::line_index::{LineIndex, PositionEncoding};
 use crate::vfs::Vfs;
 
@@ -107,6 +107,10 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 ..Default::default()
             },
         )),
+        // M3 navigation.
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
         ..Default::default()
     }
 }
@@ -213,6 +217,9 @@ impl GlobalState {
             "textDocument/semanticTokens/full" => {
                 self.spawn_file(req, handlers::semantic_tokens);
             }
+            "textDocument/definition" => self.spawn_nav_pos(req, handlers::goto_definition),
+            "textDocument/references" => self.spawn_nav_pos(req, handlers::references),
+            "workspace/symbol" => self.spawn_nav_query(req, handlers::workspace_symbols),
             other => self.send(Response::new_err(
                 req.id,
                 METHOD_NOT_FOUND,
@@ -310,6 +317,66 @@ impl GlobalState {
             result: Some(serde_json::Value::Null),
             error: None,
         });
+    }
+
+    /// A navigation snapshot of every open document (so cross-file results map to URIs).
+    fn nav_ctx(&self) -> NavCtx {
+        let docs = self
+            .vfs
+            .iter()
+            .map(|(id, uri, doc)| {
+                (
+                    id,
+                    NavDoc {
+                        uri: uri.clone(),
+                        text: doc.text.clone(),
+                        line_index: doc.line_index.clone(),
+                    },
+                )
+            })
+            .collect();
+        NavCtx {
+            docs,
+            encoding: self.encoding,
+        }
+    }
+
+    /// Dispatch a position-based navigation read (`definition`/`references`) with the nav snapshot.
+    fn spawn_nav_pos<F, R>(&self, req: Request, handler: F)
+    where
+        F: FnOnce(&Analysis, &NavCtx, gdscript_base::FileId, u32) -> Cancellable<R>
+            + Send
+            + 'static,
+        R: serde::Serialize,
+    {
+        let id = req.id.clone();
+        let params: TextDocumentPositionParams = match serde_json::from_value(req.params) {
+            Ok(p) => p,
+            Err(e) => return self.send(Response::new_err(id, INVALID_PARAMS, e.to_string())),
+        };
+        let Some(ctx) = self.doc_ctx(&params.text_document.uri) else {
+            return self.respond_null(id);
+        };
+        let offset = ctx
+            .line_index
+            .offset(&ctx.text, params.position, ctx.encoding);
+        let (nav, file) = (self.nav_ctx(), ctx.file);
+        self.spawn(id, move |a| handler(a, &nav, file, offset));
+    }
+
+    /// Dispatch a query-based navigation read (`workspace/symbol`).
+    fn spawn_nav_query<F, R>(&self, req: Request, handler: F)
+    where
+        F: FnOnce(&Analysis, &NavCtx, &str) -> Cancellable<R> + Send + 'static,
+        R: serde::Serialize,
+    {
+        let id = req.id.clone();
+        let params: WorkspaceSymbolParams = match serde_json::from_value(req.params) {
+            Ok(p) => p,
+            Err(e) => return self.send(Response::new_err(id, INVALID_PARAMS, e.to_string())),
+        };
+        let nav = self.nav_ctx();
+        self.spawn(id, move |a| handler(a, &nav, &params.query));
     }
 
     fn on_notification(&mut self, conn: &Connection, note: &Notification) -> Result<()> {
@@ -826,6 +893,80 @@ mod tests {
             "expected encoded tokens, got {:?}",
             t.data
         );
+
+        send_req(&client, 9, "shutdown", ());
+        let _ = next_response(&client);
+        send_note(&client, "exit", ());
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn goto_definition_and_references_over_the_public_api() {
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || run(&server));
+        send_req(&client, 1, "initialize", InitializeParams::default());
+        let init = next_response(&client);
+        let init: InitializeResult = serde_json::from_value(init.result.unwrap()).unwrap();
+        assert!(
+            init.capabilities.definition_provider.is_some(),
+            "definition advertised"
+        );
+        assert!(
+            init.capabilities.references_provider.is_some(),
+            "references advertised"
+        );
+        send_note(&client, "initialized", InitializedParams {});
+
+        // `total` is declared on line 1 and used on line 2.
+        let doc_uri = uri("file:///main.gd");
+        let gd = "func f():\n\tvar total := 1\n\treturn total\n";
+        send_note(
+            &client,
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "gdscript".to_owned(),
+                    version: 1,
+                    text: gd.to_owned(),
+                },
+            },
+        );
+        let _ = next_diagnostics(&client);
+        let u = doc_uri.as_str();
+
+        // goto-definition from the use of `total` (line 2) → its declaration (line 1).
+        let use_col = "\treturn ".len(); // column of `total` on line 2
+        send_req(
+            &client,
+            2,
+            "textDocument/definition",
+            serde_json::json!({ "textDocument": { "uri": u }, "position": { "line": 2, "character": use_col } }),
+        );
+        let resp = next_response(&client);
+        assert!(resp.error.is_none(), "definition errored: {resp:?}");
+        let def: lsp_types::GotoDefinitionResponse =
+            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let lsp_types::GotoDefinitionResponse::Array(locs) = def else {
+            panic!("expected an array of locations");
+        };
+        assert!(
+            locs.iter()
+                .any(|l| l.uri == doc_uri && l.range.start.line == 1),
+            "definition should point at line 1: {locs:?}",
+        );
+
+        // find-references on `total` → at least the declaration + the use.
+        send_req(
+            &client,
+            3,
+            "textDocument/references",
+            serde_json::json!({ "textDocument": { "uri": u }, "position": { "line": 2, "character": use_col }, "context": { "includeDeclaration": true } }),
+        );
+        let resp = next_response(&client);
+        assert!(resp.error.is_none(), "references errored: {resp:?}");
+        let refs: Vec<lsp_types::Location> = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(refs.len() >= 2, "expected decl + use references: {refs:?}");
 
         send_req(&client, 9, "shutdown", ());
         let _ = next_response(&client);
