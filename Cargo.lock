@@ -728,10 +728,7 @@ name = "gdscript-wasm"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
- "gdscript-base",
- "gdscript-ide",
- "serde",
- "serde_json",
+ "gdscript-session",
  "wasm-bindgen",
 ]
 
