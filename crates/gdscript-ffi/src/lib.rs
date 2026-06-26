@@ -20,6 +20,9 @@
 // napi-derive expands to `unsafe extern "C"` glue; that is the crate's only `unsafe`. The binding
 // handle is an opaque JS object that needs no `Debug`.
 #![allow(unsafe_code, missing_debug_implementations)]
+// Exported binding methods take JS-mapped owned values (`String`/`Option<String>`) by the napi ABI;
+// the thin delegation only borrows them, so clippy's by-value lint is a false positive here.
+#![allow(clippy::needless_pass_by_value)]
 
 use gdscript_session::Session;
 use napi_derive::napi;

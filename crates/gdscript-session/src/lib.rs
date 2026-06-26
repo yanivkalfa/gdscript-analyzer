@@ -104,6 +104,15 @@ impl Session {
         self.host.apply_change(change);
     }
 
+    /// Install a runtime-fetched engine model (the wasm path: a `fetch`ed `extension_api` blob).
+    /// Returns `false` if the bytes fail to decode. Native builds use the bundled model and need not
+    /// call this; the **wasm** binding fetches the blob and installs it here before its first query
+    /// (without it, completion/hover for engine classes like `Button`/`Control` are unavailable on
+    /// wasm — the embedded blob is native-only). Load once, before querying.
+    pub fn load_engine_api(&mut self, bytes: &[u8]) -> bool {
+        self.host.set_engine_api(bytes)
+    }
+
     // ---- queries (returning JSON strings) ----------------------------------------------------
 
     /// Parse + type diagnostics for `uri`, as a JSON array string (`"[]"` for an unknown `uri`).
@@ -480,5 +489,16 @@ mod tests {
         assert!(s.is_open("u"));
         s.close("u");
         assert!(!s.is_open("u"));
+    }
+
+    #[test]
+    fn load_engine_api_rejects_garbage_without_breaking() {
+        // An invalid blob is rejected (false), never a panic, and the session keeps working (on
+        // native the bundled fallback remains). The valid-blob round-trip is the wasm path, covered
+        // by gdscript-api's from_bytes tests + the wasm CI build.
+        let mut s = Session::new();
+        s.open("u", "func f() -> int:\n\tvar x = 5 / 2\n\treturn x\n", None);
+        assert!(!s.load_engine_api(b"not a valid rkyv engine-api blob"));
+        assert_eq!(parse(&s.diagnostics("u"))[0]["code"], "INTEGER_DIVISION");
     }
 }

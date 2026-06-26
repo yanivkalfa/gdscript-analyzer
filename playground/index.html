@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gdscript-analyzer · playground</title>
+    <style>
+      :root { color-scheme: dark; --bg:#1e1e2e; --panel:#181825; --fg:#cdd6f4; --muted:#9399b2;
+              --err:#f38ba8; --warn:#f9e2af; --info:#89b4fa; --ok:#a6e3a1; --line:#313244; }
+      * { box-sizing: border-box; }
+      body { margin:0; font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+             background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column; }
+      header { padding:8px 14px; background:var(--panel); border-bottom:1px solid var(--line);
+               display:flex; align-items:center; gap:12px; }
+      header h1 { font-size:14px; margin:0; font-weight:600; }
+      header .status { color:var(--muted); font-size:12px; }
+      main { flex:1; display:grid; grid-template-columns:1fr 1fr; min-height:0; }
+      .pane { display:flex; flex-direction:column; min-height:0; border-right:1px solid var(--line); }
+      textarea { flex:1; resize:none; border:0; outline:0; padding:12px; background:var(--bg);
+                 color:var(--fg); font:inherit; tab-size:4; white-space:pre; }
+      .out { overflow:auto; padding:0; }
+      .out .section { padding:8px 12px; border-bottom:1px solid var(--line); }
+      .out h2 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+                margin:0 0 6px; }
+      .diag { cursor:pointer; padding:2px 0; }
+      .diag:hover { text-decoration:underline; }
+      .diag .loc { color:var(--muted); }
+      .sev-error { color:var(--err); } .sev-warning { color:var(--warn); }
+      .sev-info, .sev-hint { color:var(--info); }
+      .clean { color:var(--ok); }
+      .cursor-info { color:var(--muted); font-size:12px; white-space:pre-wrap; }
+      ul.completions { list-style:none; margin:6px 0 0; padding:0; max-height:30vh; overflow:auto; }
+      ul.completions li { padding:1px 0; }
+      ul.completions .detail { color:var(--muted); }
+      button { background:var(--line); color:var(--fg); border:0; border-radius:4px; padding:3px 8px;
+               cursor:pointer; font:inherit; font-size:12px; }
+      button:hover { background:#45475a; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>gdscript-analyzer</h1>
+      <span class="status" id="status">loading WASM…</span>
+      <span style="flex:1"></span>
+      <button id="hoverBtn" title="Type at the cursor">hover</button>
+      <button id="complBtn" title="Completions at the cursor">complete</button>
+    </header>
+    <main>
+      <div class="pane">
+        <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off">extends Node
+
+@export var speed: int = 5
+
+func _ready() -> void:
+	var half = speed / 2          # INTEGER_DIVISION warning
+	var label := $Label           # node path (needs a scene to resolve)
+	print(half, label)
+</textarea>
+      </div>
+      <div class="pane out" id="out">
+        <div class="section"><h2>Diagnostics</h2><div id="diags"></div></div>
+        <div class="section"><h2>Cursor</h2><div class="cursor-info" id="cursor">—</div></div>
+        <div class="section"><h2>Completions</h2><ul class="completions" id="compl"></ul></div>
+      </div>
+    </main>
+
+    <!-- The WASM glue is produced by `wasm-pack build --target web` into ./pkg/ (see README). -->
+    <script type="module">
+      // ---- byte (UTF-8) <-> UTF-16 conversion: the page owns this (the analyzer speaks UTF-8 byte
+      //      offsets; the textarea's selectionStart/value are UTF-16 code units). ----
+      const enc = new TextEncoder();
+      /** UTF-16 code-unit offset -> UTF-8 byte offset. */
+      const utf16ToByte = (text, u16) => enc.encode(text.slice(0, u16)).length;
+      /** UTF-8 byte offset -> UTF-16 code-unit offset (walks code points). */
+      function byteToUtf16(text, byteOff) {
+        let bytes = 0, u16 = 0;
+        for (const ch of text) {
+          if (bytes >= byteOff) break;
+          bytes += enc.encode(ch).length;
+          u16 += ch.length;
+        }
+        return u16;
+      }
+      /** UTF-8 byte offset -> 1-based {line, col} for display. */
+      function byteToLineCol(text, byteOff) {
+        const u16 = byteToUtf16(text, byteOff);
+        const prefix = text.slice(0, u16);
+        const nl = prefix.lastIndexOf("\n");
+        return { line: (prefix.match(/\n/g) || []).length + 1, col: u16 - nl };
+      }
+
+      const $ = (id) => document.getElementById(id);
+      const code = $("code"), status = $("status");
+      const URI = "inmemory://main.gd";
+
+      let az = null;
+      try {
+        const mod = await import("./pkg/gdscript.js");
+        await mod.default(); // init() — instantiates the .wasm
+        az = new mod.Analyzer();
+        // The engine model (extension_api) is NOT embedded in the wasm; fetch + install it so
+        // completion/hover for engine classes (Button/Control/…) work. Optional — parse/type
+        // diagnostics work without it.
+        try {
+          const r = await fetch("./data/extension_api.bin");
+          if (r.ok && az.loadEngineApi(new Uint8Array(await r.arrayBuffer()))) {
+            status.textContent = "ready (engine model loaded)";
+          } else {
+            status.textContent = "ready (no engine model — engine-class completions limited)";
+          }
+        } catch {
+          status.textContent = "ready (no engine model — engine-class completions limited)";
+        }
+        az.openDocument(URI, code.value, null);
+        analyze();
+      } catch (e) {
+        status.textContent = "failed to load WASM — run `wasm-pack build` (see README): " + e;
+        console.error(e);
+      }
+
+      function analyze() {
+        if (!az) return;
+        az.changeDocument(URI, code.value);
+        renderDiagnostics(JSON.parse(az.diagnostics(URI)));
+      }
+
+      function renderDiagnostics(diags) {
+        const box = $("diags");
+        if (!diags.length) { box.innerHTML = '<span class="clean">No issues found.</span>'; return; }
+        box.innerHTML = "";
+        for (const d of diags) {
+          const { line, col } = byteToLineCol(code.value, d.range.start);
+          const el = document.createElement("div");
+          el.className = "diag sev-" + d.severity;
+          el.innerHTML = `<span class="loc">${line}:${col}</span> [${d.code}] ${escapeHtml(d.message)}`;
+          el.onclick = () => { code.focus(); code.setSelectionRange(
+            byteToUtf16(code.value, d.range.start), byteToUtf16(code.value, d.range.end)); };
+          box.appendChild(el);
+        }
+      }
+
+      function showHover() {
+        if (!az) return;
+        const off = utf16ToByte(code.value, code.selectionStart);
+        const raw = az.hover(URI, off);
+        $("cursor").textContent = raw ? JSON.parse(raw).markdown ?? JSON.parse(raw).text ?? raw
+                                      : "(nothing typed at the cursor)";
+      }
+
+      function showCompletions() {
+        if (!az) return;
+        const off = utf16ToByte(code.value, code.selectionStart);
+        const items = JSON.parse(az.completions(URI, off));
+        const ul = $("compl");
+        ul.innerHTML = items.length ? "" : "<li class='detail'>(no completions)</li>";
+        for (const it of items.slice(0, 200)) {
+          const li = document.createElement("li");
+          li.innerHTML = `${escapeHtml(it.label)} <span class="detail">${escapeHtml(it.detail ?? it.kind ?? "")}</span>`;
+          ul.appendChild(li);
+        }
+      }
+
+      const escapeHtml = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+      // Live diagnostics (debounced); hover/completions on demand.
+      let t = 0;
+      code.addEventListener("input", () => { clearTimeout(t); t = setTimeout(analyze, 150); });
+      $("hoverBtn").onclick = showHover;
+      $("complBtn").onclick = showCompletions;
+    </script>
+  </body>
+</html>

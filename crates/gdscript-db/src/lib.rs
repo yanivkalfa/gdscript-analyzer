@@ -173,6 +173,12 @@ pub struct RootDatabase {
     /// The `project.godot` config input (lazily created on the first config push). Held outside
     /// salsa as a handle so `apply_change` can update it (M4 autoloads).
     config: Option<ProjectConfig>,
+    /// A runtime-injected engine model. `None` falls back to the bundled blob on native and to "no
+    /// engine model" on `wasm32` (where nothing is embedded). The wasm binding fetches the blob and
+    /// installs it here via [`RootDatabase::set_engine_api`] (Playbook §4.4). Held outside salsa (a
+    /// process-lifetime `&'static`, leaked once) and **set before the first query** — it is not a
+    /// salsa input, so changing it after a read would not invalidate (the load-once contract).
+    engine: Option<&'static EngineApi>,
 }
 
 // `salsa::Storage` is not `Debug`, but the public `AnalysisHost`/`Analysis` that will own a
@@ -225,6 +231,18 @@ impl RootDatabase {
         }
     }
 
+    /// Install a runtime-loaded engine model (the wasm path: a `fetch`ed `extension_api` blob
+    /// decoded via [`EngineApi::from_bytes`]). Leaked to `&'static` (one per session, process
+    /// lifetime). **Load-once before any query** — the engine model is not a salsa input, so a later
+    /// set would not invalidate cached reads; first-wins (a redundant install is ignored, so the
+    /// leak happens at most once). Native builds normally never call this (they fall back to the
+    /// bundled blob); it is the seam the wasm/wasip1 binding uses.
+    pub fn set_engine_api(&mut self, api: EngineApi) {
+        if self.engine.is_none() {
+            self.engine = Some(Box::leak(Box::new(api)));
+        }
+    }
+
     /// Rebuild the project file-set input from the current side table. Call this from
     /// `apply_change` **only when a file was added or removed** — never on a body edit — so the
     /// MEDIUM-durability project input (and everything derived from it) stays stable across
@@ -253,9 +271,13 @@ impl Db for RootDatabase {
         self.files.file_text(file)
     }
 
-    // The native arm is always `Some`; only the `wasm32` arm is `None`. clippy sees one target.
+    // A runtime-injected model wins; else native falls back to the bundled blob and wasm32 to
+    // `None` (until the binding installs a fetched blob). clippy sees one target per build.
     #[allow(clippy::unnecessary_wraps)]
     fn engine(&self) -> Option<&'static EngineApi> {
+        if let Some(api) = self.engine {
+            return Some(api);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             Some(gdscript_api::bundled())

@@ -131,6 +131,21 @@ impl AnalysisHost {
         }
     }
 
+    /// Install a runtime-fetched engine model — the **wasm path** (an `extension_api` blob the host
+    /// `fetch`ed and brotli-decoded, decoded here via `EngineApi::from_bytes`). Native builds use the
+    /// bundled model and normally never call this. Returns `false` (rather than panicking) if the
+    /// bytes fail to decode, leaving the model unset. **Load once, before the first query** — the
+    /// engine model is not a salsa input, so a later install would not invalidate cached reads.
+    pub fn set_engine_api(&mut self, bytes: &[u8]) -> bool {
+        match gdscript_api::EngineApi::from_bytes(bytes) {
+            Ok(api) => {
+                self.db.set_engine_api(api);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// A cheap, cloneable, `Send` snapshot for read queries (a cloned salsa database handle).
     #[must_use]
     pub fn analysis(&self) -> Analysis {
