@@ -39,6 +39,9 @@ pub const INTEGER_DIVISION: &str = "INTEGER_DIVISION";
 pub const UNSAFE_PROPERTY_ACCESS: &str = "UNSAFE_PROPERTY_ACCESS";
 /// A method missing on a statically-known base.
 pub const UNSAFE_METHOD_ACCESS: &str = "UNSAFE_METHOD_ACCESS";
+/// An argument whose static type needs an unsafe implicit cast (`Variant` / a downcast) into the
+/// resolved parameter type — Godot's per-argument value-prop warning.
+pub const UNSAFE_CALL_ARGUMENT: &str = "UNSAFE_CALL_ARGUMENT";
 /// A `$Path`/`%Unique`/`get_node("…")` whose literal path is genuinely absent in the owning scene
 /// (only raised when the script attaches to exactly one scene — never on an `..`/absolute path or a
 /// path that descends into an instanced sub-scene we don't see).
@@ -902,7 +905,7 @@ impl Cx<'_> {
         for &a in args {
             self.infer_expr(a, &Expectation::None);
         }
-        match self.body.expr(callee).clone() {
+        let ret = match self.body.expr(callee).clone() {
             Expr::Field {
                 receiver,
                 name,
@@ -922,7 +925,99 @@ impl Cx<'_> {
                 self.infer_expr(callee, &Expectation::None);
                 Ty::Unknown
             }
+        };
+        // UNSAFE_CALL_ARGUMENT (Phase-2 §5): args + receiver are now inferred (in `expr_ty`), so
+        // check each argument against the statically-resolved callee's parameter types.
+        self.check_call_args(callee, args);
+        ret
+    }
+
+    /// Raise `UNSAFE_CALL_ARGUMENT` for each argument whose static type needs an unsafe implicit
+    /// cast (`Variant` / a downcast) into the resolved parameter type — Godot's per-argument
+    /// value-prop warning. Only fires when the callee resolves to a concrete signature here; an
+    /// uninformative argument (the cross-file seam) is `Assign::Ok` and correctly silent, and an
+    /// untyped parameter accepts anything.
+    fn check_call_args(&mut self, callee: ExprId, args: &[ExprId]) {
+        let Some(params) = self.call_param_tys(callee) else {
+            return;
+        };
+        for (i, &arg) in args.iter().enumerate() {
+            let Some(param_ty) = params.get(i) else {
+                break; // a vararg tail or an arity mismatch — not an argument-type concern
+            };
+            if param_ty.is_uninformative() || param_ty.is_variant() {
+                continue; // an untyped parameter accepts anything safely
+            }
+            // A missing arg type defaults to the seam (never warns), not `Variant` (would warn).
+            let arg_ty = self.expr_ty.get(&arg).cloned().unwrap_or(Ty::Unknown);
+            if ty::is_assignable(self.api, &arg_ty, param_ty) == Assign::OkUnsafe {
+                let pl = param_ty.label(self.api).unwrap_or_else(|| "?".to_owned());
+                let al = arg_ty.label(self.api).unwrap_or_else(|| "?".to_owned());
+                self.emit(
+                    self.range_of(arg),
+                    Severity::Warning,
+                    UNSAFE_CALL_ARGUMENT,
+                    format!(
+                        "The argument {} requires a value of type \"{pl}\" but is passed \"{al}\", which is unsafe.",
+                        i + 1
+                    ),
+                );
+            }
         }
+    }
+
+    /// Parameter types of a statically-resolved callee, for [`Self::check_call_args`]. `None` when
+    /// the callee isn't concretely resolvable here (a cross-file script method — params aren't
+    /// modeled —, a builtin/utility, a `Callable` value): those raise no argument warning.
+    fn call_param_tys(&self, callee: ExprId) -> Option<Vec<Ty>> {
+        match self.body.expr(callee) {
+            Expr::Name(name) => self.name_call_param_tys(name),
+            Expr::Field { receiver, name, .. } => match self.expr_ty.get(receiver)? {
+                Ty::Object(class) => match self.api.lookup_member(*class, name)? {
+                    MemberRef::Method(sig) => Some(
+                        sig.params
+                            .iter()
+                            .map(|p| ty::resolve_tyref(self.api, &p.ty))
+                            .collect(),
+                    ),
+                    _ => None,
+                },
+                // ScriptRef / builtin / seam receivers: params not uniformly modeled — skip.
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Parameter types for a bare-name call (`foo(...)` / an inherited `method(...)`): an own `func`
+    /// first, then the `self` engine base's method. Utilities/builtins are skipped (looser, often
+    /// variadic typing — out of the conservative MVP slice).
+    fn name_call_param_tys(&self, name: &str) -> Option<Vec<Ty>> {
+        if let Some(item) = self.class.lookup(name)
+            && let Some(Member::Func(f)) = self.class.member(item)
+        {
+            return Some(
+                f.params
+                    .iter()
+                    .map(|p| {
+                        p.type_ref.as_deref().map_or(Ty::Variant, |t| {
+                            resolve::resolve_type_name(self.db, self.api, t)
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        if let Ty::Object(base) = self.class.base
+            && let Some(MemberRef::Method(sig)) = self.api.lookup_member(base, name)
+        {
+            return Some(
+                sig.params
+                    .iter()
+                    .map(|p| ty::resolve_tyref(self.api, &p.ty))
+                    .collect(),
+            );
+        }
+        None
     }
 
     /// Resolve a bare-name call (`foo(...)`): own method → utility/builtin fn → constructor.
@@ -1641,6 +1736,36 @@ mod tests {
             h.result.diagnostics.is_empty(),
             "{:?}",
             h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn unsafe_call_argument_on_variant_into_typed_param() {
+        // Passing an untyped (Variant) value to a typed own-method parameter needs an unsafe cast.
+        let h = infer_first_func("func f(p):\n\ttake(p)\nfunc take(n: Node2D):\n\tpass\n");
+        assert!(
+            codes(&h).contains(&UNSAFE_CALL_ARGUMENT),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn unsafe_call_argument_silent_on_safe_and_untyped() {
+        // A subtype arg (upcast) is safe; an untyped parameter accepts anything — neither warns.
+        let upcast =
+            infer_first_func("func f(n: Node2D):\n\ttake(n)\nfunc take(n: Node):\n\tpass\n");
+        assert!(
+            !codes(&upcast).contains(&UNSAFE_CALL_ARGUMENT),
+            "upcast is safe: {:?}",
+            upcast.result.diagnostics
+        );
+        let untyped =
+            infer_first_func("func f(p):\n\ttake(p)\nfunc take(n):\n\tpass\n");
+        assert!(
+            !codes(&untyped).contains(&UNSAFE_CALL_ARGUMENT),
+            "untyped param accepts anything: {:?}",
+            untyped.result.diagnostics
         );
     }
 

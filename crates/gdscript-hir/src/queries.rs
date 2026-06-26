@@ -1346,7 +1346,10 @@ mod tests {
         let mut db = RootDatabase::default();
         db.set_file_text(
             FileId(1),
-            "extends Node\nfunc f(p):\n\tvar a := get_node(p)\n\tvar b := $Nope\n",
+            // `p: NodePath` so the computed `get_node(p)` still exercises node-path resolution but
+            // without an (orthogonal, legitimate) UNSAFE_CALL_ARGUMENT on an untyped Variant arg —
+            // that warning has its own tests in `infer`.
+            "extends Node\nfunc f(p: NodePath):\n\tvar a := get_node(p)\n\tvar b := $Nope\n",
             Durability::LOW,
         );
         db.set_file_path(FileId(1), "res://lone.gd");
