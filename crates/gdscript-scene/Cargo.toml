@@ -3,6 +3,7 @@ name = "gdscript-scene"
 description = "A .tscn/.tres parser feeding node-path typing (the scene-aware killer feature) — gdscript-analyzer."
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
