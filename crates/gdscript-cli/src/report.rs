@@ -421,8 +421,38 @@ mod tests {
         let region = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
         assert_eq!(region["startLine"], 1);
         assert_eq!(region["startColumn"], 9); // 1-based
+        // `endLine` is INCLUSIVE (line of the end) — for a single-line diagnostic it equals
+        // `startLine`, matching clippy/ESLint SARIF + GitHub (NOT startLine+1). `endColumn` is the
+        // OASIS-exclusive column-following-the-region.
+        assert_eq!(region["endLine"], 1);
         assert_eq!(region["endColumn"], 14); // exclusive end (byte 13 → col 14)
         assert_eq!(v["runs"][0]["results"][0]["level"], "warning");
+    }
+
+    #[test]
+    fn multiline_diagnostic_uses_end_offset_line_not_plus_one() {
+        // A diagnostic spanning line 1 into line 2: bytes 0..5 over "ab\ncd\n" = "ab\ncd".
+        // end offset 5 is on line 2 (col 3) — so endLine=2, endColumn=3, NOT line+1=3.
+        let f = file("a.gd", "ab\ncd\n");
+        let gh = render(
+            Format::Github,
+            &f,
+            vec![diag(0, 5, Severity::Error, "E", "m")],
+        );
+        assert!(
+            gh.contains("line=1,endLine=2,col=1,endColumn=3,"),
+            "github multi-line region wrong: {gh}"
+        );
+        let sarif = render(
+            Format::Sarif,
+            &f,
+            vec![diag(0, 5, Severity::Error, "E", "m")],
+        );
+        let v: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        let region = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(region["startLine"], 1);
+        assert_eq!(region["endLine"], 2);
+        assert_eq!(region["endColumn"], 3);
     }
 
     #[test]

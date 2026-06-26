@@ -73,7 +73,12 @@ impl Project {
     /// host. `targets` may be files, directories, or `-` (stdin, read as a single anonymous file).
     #[must_use]
     pub fn load(targets: &[PathBuf]) -> Self {
-        let mut discovered: Vec<(PathBuf, Arc<str>, Option<String>)> = Vec::new();
+        // Each entry is `(display, res_path, text)`. The **display path is derived from the
+        // `res://` path** (the single source of truth) so the two never diverge: when a file
+        // resolves under the project root both are `Some`/relative; otherwise both fall back to the
+        // raw path together (Hunt #2/#3 — a prior split derivation could disagree if root vs file
+        // canonicalization differed).
+        let mut discovered: Vec<(String, Option<String>, Arc<str>)> = Vec::new();
         let mut errors = Vec::new();
         let mut seen = BTreeSet::new();
 
@@ -90,7 +95,7 @@ impl Project {
         if stdin_requested {
             let mut buf = String::new();
             match std::io::stdin().read_to_string(&mut buf) {
-                Ok(_) => discovered.push((PathBuf::from("<stdin>"), Arc::from(buf), None)),
+                Ok(_) => discovered.push(("<stdin>".to_owned(), None, Arc::from(buf))),
                 Err(e) => errors.push(LoadError {
                     display: "<stdin>".into(),
                     message: e.to_string(),
@@ -104,16 +109,19 @@ impl Project {
                 if !seen.insert(canon.clone()) {
                     continue; // dedup files reached via overlapping targets
                 }
+                let res_path = root.as_deref().and_then(|r| res_path_for(r, &canon));
+                let display = res_path
+                    .as_deref()
+                    .map_or_else(|| raw_display(&path), res_display);
                 match std::fs::read(&path) {
                     Ok(bytes) => {
                         // GDScript is UTF-8; decode lossily so a stray byte never aborts the run.
                         let text: Arc<str> =
                             Arc::from(String::from_utf8_lossy(&bytes).into_owned());
-                        let res_path = root.as_deref().and_then(|r| res_path_for(r, &canon));
-                        discovered.push((path, text, res_path));
+                        discovered.push((display, res_path, text));
                     }
                     Err(e) => errors.push(LoadError {
-                        display: display_path(root.as_deref(), &path),
+                        display,
                         message: e.to_string(),
                     }),
                 }
@@ -124,7 +132,7 @@ impl Project {
         let mut host = AnalysisHost::new();
         let mut change = Change::new();
         let mut files = Vec::with_capacity(discovered.len());
-        for (i, (path, text, res_path)) in discovered.into_iter().enumerate() {
+        for (i, (display, res_path, text)) in discovered.into_iter().enumerate() {
             let id = FileId(u32::try_from(i).unwrap_or(u32::MAX));
             change.change_file(id, Arc::clone(&text));
             if let Some(res) = &res_path {
@@ -132,7 +140,7 @@ impl Project {
             }
             files.push(SourceFile {
                 id,
-                display: display_path(root.as_deref(), &path),
+                display,
                 line_index: LineIndex::new(&text),
                 text,
             });
@@ -166,7 +174,15 @@ impl Project {
                 FileDiagnostics { file, diagnostics }
             })
             .collect();
-        out.sort_by(|a, b| a.file.display.cmp(&b.file.display));
+        // Sort by display path; break ties on `FileId` (discovery order) so output is fully
+        // deterministic even if two files share a display string (Hunt #4 — explicit, not relying
+        // on the stable-sort + ordered-collect invariant alone).
+        out.sort_by(|a, b| {
+            a.file
+                .display
+                .cmp(&b.file.display)
+                .then_with(|| a.file.id.0.cmp(&b.file.id.0))
+        });
         out
     }
 
@@ -181,7 +197,12 @@ impl Project {
                 symbols: analysis.document_symbols(file.id).unwrap_or_default(),
             })
             .collect();
-        out.sort_by(|a, b| a.file.display.cmp(&b.file.display));
+        out.sort_by(|a, b| {
+            a.file
+                .display
+                .cmp(&b.file.display)
+                .then_with(|| a.file.id.0.cmp(&b.file.id.0))
+        });
         out
     }
 }
@@ -245,19 +266,19 @@ fn res_path_for(root: &Path, file: &Path) -> Option<String> {
     Some(s)
 }
 
-/// A display path: project-relative (with `/` separators) when under `root`, else the path as given.
-fn display_path(root: Option<&Path>, file: &Path) -> String {
-    if let Some(root) = root {
-        let canon = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-        if let Ok(rel) = canon.strip_prefix(root) {
-            return rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-        }
-    }
-    file.to_string_lossy().into_owned()
+/// The display path derived from a `res://` path: drop the `res://` scheme (the remainder is already
+/// project-relative with `/` separators). Keeps `display` and the `res://` path in lockstep.
+fn res_display(res_path: &str) -> String {
+    res_path
+        .strip_prefix("res://")
+        .unwrap_or(res_path)
+        .to_owned()
+}
+
+/// The fallback display for a file with no `res://` path (no project root, or outside it): the path
+/// as discovered, normalized to `/` separators for cross-platform-stable output.
+fn raw_display(file: &Path) -> String {
+    file.to_string_lossy().replace('\\', "/")
 }
 
 /// Read a project's `project.godot` text, if present + readable.
@@ -265,4 +286,22 @@ fn read_project_godot(root: &Path) -> Option<Arc<str>> {
     std::fs::read(root.join("project.godot"))
         .ok()
         .map(|b| Arc::from(String::from_utf8_lossy(&b).into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn res_display_drops_the_scheme() {
+        assert_eq!(res_display("res://scripts/main.gd"), "scripts/main.gd");
+        assert_eq!(res_display("res://a.gd"), "a.gd");
+        assert_eq!(res_display("no-scheme"), "no-scheme"); // defensive fallthrough
+    }
+
+    #[test]
+    fn raw_display_normalizes_separators() {
+        // A backslash path collapses to forward slashes on every platform (deterministic output).
+        assert_eq!(raw_display(Path::new("a\\b\\c.gd")), "a/b/c.gd");
+    }
 }
