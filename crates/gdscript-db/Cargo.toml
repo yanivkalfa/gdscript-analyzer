@@ -3,6 +3,7 @@ name = "gdscript-db"
 description = "Input layer (virtual file system, project model, change application; salsa from Phase 3) for gdscript-analyzer."
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

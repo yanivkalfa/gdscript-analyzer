@@ -3,6 +3,7 @@ name = "gdscript-syntax"
 description = "Lexer, indentation pre-pass, and a lossless (cstree) parser for GDScript — gdscript-analyzer."
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
