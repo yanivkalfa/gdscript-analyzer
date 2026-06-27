@@ -797,10 +797,16 @@ impl Cx<'_> {
                 self.bool_ty()
             }
             Expr::Await(operand) => {
-                self.infer_expr(operand, &Expectation::None);
-                // The awaited result (a signal's args / a coroutine's return) is not tracked in
-                // Phase 2 — use the seam, not `Variant`, so `var x := await f()` never warns.
-                Ty::Unknown
+                let operand_ty = self.infer_expr(operand, &Expectation::None);
+                // `await coroutine()` yields the call's value, so await is **identity** on the operand
+                // type (`await f()` for `func f() -> int` is `int`) — recovered here. `await signal`
+                // instead yields the signal's emitted payload, which needs the Phase-3+ signal-signature
+                // table; until then it's the seam (never `Variant`, so `var x := await sig` never warns).
+                if matches!(operand_ty, Ty::Signal(_)) {
+                    Ty::Unknown
+                } else {
+                    operand_ty
+                }
             }
             Expr::Array(elems) => {
                 // Checking mode: an expected `Array[T]` is pushed down onto the literal (so
@@ -2056,6 +2062,44 @@ mod tests {
             !codes(&h).contains(&INFERENCE_ON_VARIANT),
             "seam branch should keep the ternary on the seam: {:?}",
             h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn await_a_coroutine_call_recovers_its_return_type() {
+        // `await f()` yields the call's value, so await is identity on a non-signal operand:
+        // `await make()` for `func make() -> int` types `x` as int (was the seam before).
+        let src = "func g() -> int:\n\tvar x := await make()\n\treturn x\nfunc make() -> int:\n\treturn 5\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "no false variant warning: {:?}",
+            h.result.diagnostics
+        );
+        let api = gdscript_api::bundled();
+        let x = &h.result.bindings[0];
+        assert!(
+            matches!(&x.ty, Ty::Builtin(b) if api.builtin(*b).name == "int"),
+            "await make() should recover int, got {:?}",
+            x.ty
+        );
+    }
+
+    #[test]
+    fn await_a_signal_stays_the_seam() {
+        // `await sig` yields the signal's payload (needs the Phase-3+ sig table) — must stay the seam,
+        // never the Signal type itself, and never a false INFERENCE_ON_VARIANT.
+        let src = "func f():\n\tvar x := await get_tree().process_frame\n\treturn x\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "awaiting a signal must not warn: {:?}",
+            h.result.diagnostics
+        );
+        assert!(
+            matches!(&h.result.bindings[0].ty, Ty::Unknown),
+            "awaiting a signal stays the seam, got {:?}",
+            h.result.bindings[0].ty
         );
     }
 
