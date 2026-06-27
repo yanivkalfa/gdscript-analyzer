@@ -14,11 +14,9 @@
                display:flex; align-items:center; gap:12px; }
       header h1 { font-size:14px; margin:0; font-weight:600; }
       header .status { color:var(--muted); font-size:12px; }
-      main { flex:1; display:grid; grid-template-columns:1fr 1fr; min-height:0; }
-      .pane { display:flex; flex-direction:column; min-height:0; border-right:1px solid var(--line); }
-      textarea { flex:1; resize:none; border:0; outline:0; padding:12px; background:var(--bg);
-                 color:var(--fg); font:inherit; tab-size:4; white-space:pre; }
-      .out { overflow:auto; padding:0; }
+      main { flex:1; display:grid; grid-template-columns:1fr 360px; min-height:0; }
+      #editor { min-height:0; border-right:1px solid var(--line); }
+      .out { overflow:auto; padding:0; background:var(--panel); }
       .out .section { padding:8px 12px; border-bottom:1px solid var(--line); }
       .out h2 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
                 margin:0 0 6px; }
@@ -28,50 +26,62 @@
       .sev-error { color:var(--err); } .sev-warning { color:var(--warn); }
       .sev-info, .sev-hint { color:var(--info); }
       .clean { color:var(--ok); }
-      .cursor-info { color:var(--muted); font-size:12px; white-space:pre-wrap; }
-      ul.completions { list-style:none; margin:6px 0 0; padding:0; max-height:30vh; overflow:auto; }
-      ul.completions li { padding:1px 0; }
-      ul.completions .detail { color:var(--muted); }
-      button { background:var(--line); color:var(--fg); border:0; border-radius:4px; padding:3px 8px;
-               cursor:pointer; font:inherit; font-size:12px; }
-      button:hover { background:#45475a; }
+      .hint { color:var(--muted); font-size:12px; }
     </style>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/editor/editor.main.css"
+    />
+    <!-- Monaco's AMD loader (a classic script, runs before the deferred module below sets up the editor). -->
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
   </head>
   <body>
     <header>
       <h1>gdscript-analyzer</h1>
-      <span class="status" id="status">loading WASM…</span>
-      <span style="flex:1"></span>
-      <button id="hoverBtn" title="Type at the cursor">hover</button>
-      <button id="complBtn" title="Completions at the cursor">complete</button>
+      <span class="status" id="status">loading…</span>
     </header>
     <main>
-      <div class="pane">
-        <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off">extends Node
+      <div id="editor"></div>
+      <div class="out" id="out">
+        <div class="section">
+          <h2>Diagnostics</h2>
+          <div id="diags"><span class="hint">analyzing…</span></div>
+        </div>
+        <div class="section">
+          <h2>About</h2>
+          <div class="hint">
+            A real <a href="https://github.com/yanivkalfa/gdscript-analyzer">gdscript-analyzer</a>
+            running entirely in your browser (WebAssembly) — no server, no Godot editor. Hover a symbol
+            for its inferred type; type <code>.</code> after a value for member completion. Diagnostics
+            update live.
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+      const status = $("status");
+      const URI = "inmemory://main.gd";
+      const MONACO_BASE = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs";
+
+      const SAMPLE = `extends Node
 
 @export var speed: int = 5
 
 func _ready() -> void:
-	var half = speed / 2          # INTEGER_DIVISION warning
-	var label := $Label           # node path (needs a scene to resolve)
-	print(half, label)
-</textarea>
-      </div>
-      <div class="pane out" id="out">
-        <div class="section"><h2>Diagnostics</h2><div id="diags"></div></div>
-        <div class="section"><h2>Cursor</h2><div class="cursor-info" id="cursor">—</div></div>
-        <div class="section"><h2>Completions</h2><ul class="completions" id="compl"></ul></div>
-      </div>
-    </main>
+\tvar half = speed / 2          # INTEGER_DIVISION warning
+\tvar doubled := await ramp()   # await recovers the coroutine return type (int)
+\tprint(half, doubled)
 
-    <!-- The WASM glue is produced by `wasm-pack build --target web` into ./pkg/ (see README). -->
-    <script type="module">
-      // ---- byte (UTF-8) <-> UTF-16 conversion: the page owns this (the analyzer speaks UTF-8 byte
-      //      offsets; the textarea's selectionStart/value are UTF-16 code units). ----
+func ramp() -> int:
+\treturn speed * 2
+`;
+
+      // ---- byte (UTF-8) <-> UTF-16 conversion. The analyzer speaks UTF-8 byte offsets; Monaco
+      //      positions/offsets are UTF-16 code units (JS string indices). This page owns the bridge. ----
       const enc = new TextEncoder();
-      /** UTF-16 code-unit offset -> UTF-8 byte offset. */
       const utf16ToByte = (text, u16) => enc.encode(text.slice(0, u16)).length;
-      /** UTF-8 byte offset -> UTF-16 code-unit offset (walks code points). */
       function byteToUtf16(text, byteOff) {
         let bytes = 0, u16 = 0;
         for (const ch of text) {
@@ -81,102 +91,219 @@ func _ready() -> void:
         }
         return u16;
       }
-      /** UTF-8 byte offset -> 1-based {line, col} for display. */
-      function byteToLineCol(text, byteOff) {
-        const u16 = byteToUtf16(text, byteOff);
-        const prefix = text.slice(0, u16);
-        const nl = prefix.lastIndexOf("\n");
-        return { line: (prefix.match(/\n/g) || []).length + 1, col: u16 - nl };
-      }
 
-      const $ = (id) => document.getElementById(id);
-      const code = $("code"), status = $("status");
-      const URI = "inmemory://main.gd";
-
+      // ---- load the analyzer (wasm) ----
       let az = null;
       try {
         const mod = await import("./pkg/gdscript.js");
-        await mod.default(); // init() — instantiates the .wasm
+        await mod.default(); // instantiate the .wasm
         az = new mod.Analyzer();
-        // The engine model (extension_api) is NOT embedded in the wasm; fetch + install it so
-        // completion/hover for engine classes (Button/Control/…) work. Optional — parse/type
-        // diagnostics work without it.
+        // The engine model (extension_api) is NOT embedded in the wasm — fetch + install it so
+        // completion/hover for engine classes (Node/Control/…) resolve. Parse/type diagnostics work
+        // without it.
+        let engine = "no engine model — engine-class completions limited";
         try {
           const r = await fetch("./data/extension_api.bin");
           if (r.ok && az.loadEngineApi(new Uint8Array(await r.arrayBuffer()))) {
-            status.textContent = "ready (engine model loaded)";
-          } else {
-            status.textContent = "ready (no engine model — engine-class completions limited)";
+            engine = "engine model loaded";
           }
-        } catch {
-          status.textContent = "ready (no engine model — engine-class completions limited)";
-        }
-        az.openDocument(URI, code.value, null);
-        analyze();
+        } catch { /* keep the limited-mode message */ }
+        status.textContent = `ready (${engine})`;
+        az.openDocument(URI, SAMPLE, null);
       } catch (e) {
         status.textContent = "failed to load WASM — run `wasm-pack build` (see README): " + e;
         console.error(e);
       }
 
-      function analyze() {
-        if (!az) return;
-        az.changeDocument(URI, code.value);
-        renderDiagnostics(JSON.parse(az.diagnostics(URI)));
+      // ---- load Monaco via its AMD loader (CDN), with a worker proxy so it runs offline-of-itself ----
+      function loadMonaco() {
+        return new Promise((resolve, reject) => {
+          self.MonacoEnvironment = {
+            getWorkerUrl() {
+              const proxy = `self.MonacoEnvironment={baseUrl:'${MONACO_BASE}/../'};importScripts('${MONACO_BASE}/base/worker/workerMain.js');`;
+              return `data:text/javascript;charset=utf-8,${encodeURIComponent(proxy)}`;
+            },
+          };
+          // eslint-disable-next-line no-undef
+          require.config({ paths: { vs: MONACO_BASE } });
+          // eslint-disable-next-line no-undef
+          require(["vs/editor/editor.main"], () => resolve(self.monaco), reject);
+        });
       }
 
-      function renderDiagnostics(diags) {
+      const monaco = await loadMonaco();
+
+      // A small GDScript Monarch grammar — enough for readable highlighting in the demo.
+      monaco.languages.register({ id: "gdscript" });
+      monaco.languages.setMonarchTokensProvider("gdscript", {
+        keywords: ["if","elif","else","for","while","match","when","break","continue","pass","return",
+          "func","var","const","enum","class","class_name","extends","signal","static","await","yield",
+          "is","in","as","and","or","not","self","super","null","true","false","void","export","onready",
+          "tool","breakpoint","assert","preload","load"],
+        tokenizer: {
+          root: [
+            [/#.*$/, "comment"],
+            [/@\w+/, "annotation"],
+            [/\$[\w/%]*/, "variable"],
+            [/"(?:[^"\\]|\\.)*"/, "string"],
+            [/'(?:[^'\\]|\\.)*'/, "string"],
+            [/\b\d[\d_]*\.?[\d_]*\b/, "number"],
+            [/[A-Z]\w*/, "type.identifier"],
+            [/[a-z_]\w*/, { cases: { "@keywords": "keyword", "@default": "identifier" } }],
+          ],
+        },
+      });
+
+      const editor = monaco.editor.create($("editor"), {
+        value: SAMPLE,
+        language: "gdscript",
+        theme: "vs-dark",
+        automaticLayout: true,
+        minimap: { enabled: false },
+        fontSize: 14,
+        tabSize: 4,
+        insertSpaces: false,
+        scrollBeyondLastLine: false,
+      });
+      const model = editor.getModel();
+
+      // ---- helpers bridging Monaco <-> analyzer offsets ----
+      const byteAt = (position) => utf16ToByte(model.getValue(), model.getOffsetAt(position));
+      function byteRangeToMonaco(text, start, end) {
+        const a = model.getPositionAt(byteToUtf16(text, start));
+        const b = model.getPositionAt(byteToUtf16(text, end));
+        return {
+          startLineNumber: a.lineNumber, startColumn: a.column,
+          endLineNumber: b.lineNumber, endColumn: b.column,
+        };
+      }
+      const SEVERITY = {
+        error: monaco.MarkerSeverity.Error, warning: monaco.MarkerSeverity.Warning,
+        info: monaco.MarkerSeverity.Info, hint: monaco.MarkerSeverity.Hint,
+      };
+      const COMPLETION_KIND = {
+        keyword: monaco.languages.CompletionItemKind.Keyword,
+        variable: monaco.languages.CompletionItemKind.Variable,
+        parameter: monaco.languages.CompletionItemKind.Variable,
+        constant: monaco.languages.CompletionItemKind.Constant,
+        function: monaco.languages.CompletionItemKind.Function,
+        method: monaco.languages.CompletionItemKind.Method,
+        property: monaco.languages.CompletionItemKind.Property,
+        field: monaco.languages.CompletionItemKind.Field,
+        member: monaco.languages.CompletionItemKind.Field,
+        class: monaco.languages.CompletionItemKind.Class,
+        type: monaco.languages.CompletionItemKind.Class,
+        enum: monaco.languages.CompletionItemKind.Enum,
+        enum_member: monaco.languages.CompletionItemKind.EnumMember,
+        signal: monaco.languages.CompletionItemKind.Event,
+      };
+
+      // ---- live diagnostics (markers + the side panel) ----
+      function analyze() {
+        if (!az) return;
+        const text = model.getValue();
+        az.changeDocument(URI, text);
+        let diags = [];
+        try { diags = JSON.parse(az.diagnostics(URI)); } catch { /* keep [] */ }
+        const markers = diags.map((d) => {
+          const r = byteRangeToMonaco(text, d.range.start, d.range.end);
+          return {
+            severity: SEVERITY[d.severity] ?? monaco.MarkerSeverity.Warning,
+            message: d.message, code: String(d.code ?? ""),
+            startLineNumber: r.startLineNumber, startColumn: r.startColumn,
+            endLineNumber: r.endLineNumber, endColumn: r.endColumn,
+          };
+        });
+        monaco.editor.setModelMarkers(model, "gdscript", markers);
+        renderDiagnosticList(diags, text);
+      }
+
+      function renderDiagnosticList(diags, text) {
         const box = $("diags");
         if (!diags.length) { box.innerHTML = '<span class="clean">No issues found.</span>'; return; }
         box.innerHTML = "";
         for (const d of diags) {
-          const { line, col } = byteToLineCol(code.value, d.range.start);
+          const r = byteRangeToMonaco(text, d.range.start, d.range.end);
           const el = document.createElement("div");
           el.className = "diag sev-" + d.severity;
-          el.innerHTML = `<span class="loc">${line}:${col}</span> [${d.code}] ${escapeHtml(d.message)}`;
-          el.onclick = () => { code.focus(); code.setSelectionRange(
-            byteToUtf16(code.value, d.range.start), byteToUtf16(code.value, d.range.end)); };
+          el.innerHTML = `<span class="loc">${r.startLineNumber}:${r.startColumn}</span> [${escapeHtml(d.code)}] ${escapeHtml(d.message)}`;
+          el.onclick = () => {
+            editor.setSelection(r);
+            editor.revealRangeInCenter(r);
+            editor.focus();
+          };
           box.appendChild(el);
         }
       }
 
-      function showHover() {
-        if (!az) return;
-        const off = utf16ToByte(code.value, code.selectionStart);
-        const raw = az.hover(URI, off);
-        if (!raw) { $("cursor").textContent = "(nothing typed at the cursor)"; return; }
-        // HoverResult is { ty_label, doc, range }. Show a clean "type — docs" line rather than the
-        // raw JSON; fall back to markdown/text (future shapes) and finally the JSON itself.
-        const h = JSON.parse(raw);
-        const parts = [];
-        if (h.ty_label) parts.push(h.ty_label);
-        if (h.doc) parts.push(h.doc);
-        $("cursor").textContent = parts.length ? parts.join("\n\n") : (h.markdown ?? h.text ?? raw);
-      }
-
-      function showCompletions() {
-        if (!az) return;
-        const off = utf16ToByte(code.value, code.selectionStart);
-        const items = JSON.parse(az.completions(URI, off));
-        const ul = $("compl");
-        ul.innerHTML = items.length ? "" : "<li class='detail'>(no completions)</li>";
-        for (const it of items.slice(0, 200)) {
-          const li = document.createElement("li");
-          li.innerHTML = `${escapeHtml(it.label)} <span class="detail">${escapeHtml(it.detail ?? it.kind ?? "")}</span>`;
-          ul.appendChild(li);
-        }
-      }
-
-      // A function declaration (hoisted) — `analyze()` runs on load and reaches this via
-      // renderDiagnostics, so a `const` here would throw a temporal-dead-zone error.
       function escapeHtml(s) {
         return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
       }
 
-      // Live diagnostics (debounced); hover/completions on demand.
+      // ---- hover provider: the analyzer's inferred type + docs ----
+      monaco.languages.registerHoverProvider("gdscript", {
+        provideHover(_m, position) {
+          if (!az) return null;
+          const raw = az.hover(URI, byteAt(position));
+          if (!raw) return null;
+          let h; try { h = JSON.parse(raw); } catch { return null; }
+          if (!h?.ty_label) return null;
+          const contents = [{ value: "```gdscript\n" + h.ty_label + "\n```" }];
+          if (h.doc) contents.push({ value: h.doc });
+          const range = h.range ? byteRangeToMonaco(model.getValue(), h.range.start, h.range.end) : undefined;
+          return { range, contents };
+        },
+      });
+
+      // ---- completion provider (triggered on `.` and by Ctrl-Space) ----
+      monaco.languages.registerCompletionItemProvider("gdscript", {
+        triggerCharacters: [".", "$", "%", "(", ","],
+        provideCompletionItems(_m, position) {
+          if (!az) return { suggestions: [] };
+          let items = [];
+          try { items = JSON.parse(az.completions(URI, byteAt(position))); } catch { /* [] */ }
+          const word = model.getWordUntilPosition(position);
+          const range = {
+            startLineNumber: position.lineNumber, endLineNumber: position.lineNumber,
+            startColumn: word.startColumn, endColumn: word.endColumn,
+          };
+          return {
+            suggestions: items.slice(0, 1000).map((it) => ({
+              label: String(it.label),
+              kind: COMPLETION_KIND[it.kind] ?? monaco.languages.CompletionItemKind.Text,
+              detail: it.detail ?? it.kind ?? undefined,
+              insertText: it.insert_text ?? String(it.label),
+              range,
+            })),
+          };
+        },
+      });
+
+      // ---- signature help (on `(` and `,`) ----
+      monaco.languages.registerSignatureHelpProvider("gdscript", {
+        signatureHelpTriggerCharacters: ["(", ","],
+        provideSignatureHelp(_m, position) {
+          if (!az) return null;
+          const raw = az.signatureHelp(URI, byteAt(position));
+          if (!raw) return null;
+          let s; try { s = JSON.parse(raw); } catch { return null; }
+          const sigs = (s.signatures ?? []).map((sig) => ({
+            label: sig.label ?? "",
+            // Monaco's signature field is `parameters`; the analyzer POD names it `params`.
+            parameters: (sig.params ?? []).map((p) => ({ label: p.label ?? p })),
+          }));
+          if (!sigs.length) return null;
+          return {
+            value: { signatures: sigs, activeSignature: s.active_signature ?? 0, activeParameter: s.active_parameter ?? 0 },
+            dispose() {},
+          };
+        },
+      });
+
+      // run now + on every edit (debounced)
       let t = 0;
-      code.addEventListener("input", () => { clearTimeout(t); t = setTimeout(analyze, 150); });
-      $("hoverBtn").onclick = showHover;
-      $("complBtn").onclick = showCompletions;
+      model.onDidChangeContent(() => { clearTimeout(t); t = setTimeout(analyze, 150); });
+      analyze();
     </script>
   </body>
 </html>
