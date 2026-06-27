@@ -198,6 +198,20 @@ impl Analysis {
         })
     }
 
+    /// Format `file`'s source, returning the tidied text — or `None` if the file is unknown.
+    /// Safe by construction: it normalizes whitespace + indentation and never changes meaning,
+    /// falling back to the original on anything it can't safely reformat (see [`gdscript_fmt`]).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn format(&self, file: FileId) -> Cancellable<Option<String>> {
+        catch(|| {
+            self.db.file_text(file).map(|ft| {
+                gdscript_fmt::format(ft.text(&self.db), &gdscript_fmt::FmtConfig::default())
+            })
+        })
+    }
+
     /// The document outline (classes, funcs, vars, consts, enums, signals, members).
     ///
     /// # Errors

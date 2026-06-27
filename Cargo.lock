@@ -650,6 +650,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdscript-fmt"
+version = "0.2.1"
+dependencies = [
+ "gdscript-base",
+ "gdscript-syntax",
+]
+
+[[package]]
 name = "gdscript-hir"
 version = "0.2.1"
 dependencies = [
@@ -674,6 +682,7 @@ dependencies = [
  "gdscript-api",
  "gdscript-base",
  "gdscript-db",
+ "gdscript-fmt",
  "gdscript-hir",
  "gdscript-syntax",
  "rustc-hash",

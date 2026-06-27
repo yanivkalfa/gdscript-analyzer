@@ -18,6 +18,7 @@ gdscript-syntax = { workspace = true }
 gdscript-api = { workspace = true }
 gdscript-db = { workspace = true }
 gdscript-hir = { workspace = true }
+gdscript-fmt = { workspace = true }
 salsa = { workspace = true }
 cstree = { workspace = true }
 rustc-hash = { workspace = true }
