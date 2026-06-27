@@ -40,6 +40,7 @@ pub fn find_references(db: &dyn Db, pos: FilePosition) -> Vec<Reference> {
             continue;
         };
         let text = ft.text(db);
+        let root = parse(db, ft).syntax_node();
         for hit in word_boundary_find(text, &name) {
             let cand = FilePosition {
                 file: file_id,
@@ -53,6 +54,8 @@ pub fn find_references(db: &dyn Db, pos: FilePosition) -> Vec<Reference> {
                         range,
                     }) {
                     ReferenceKind::Declaration
+                } else if is_write_position(&root, hit) {
+                    ReferenceKind::Write
                 } else {
                     ReferenceKind::Read
                 };
@@ -67,6 +70,66 @@ pub fn find_references(db: &dyn Db, pos: FilePosition) -> Vec<Reference> {
     out.sort_by_key(|r| (r.file.0, r.range.start));
     out.dedup();
     out
+}
+
+/// Whether the identifier token at `offset` is the **target of an assignment** (a write): a bare
+/// `NameRef` (`x = …`, `x += …`) or the member of a `FieldExpr` (`self.x = …`, `a.b = …`) that is
+/// the direct LHS operand of an assignment `BinExpr`. Conservative — a receiver (`a` in `a.b = …`),
+/// an index target (`arr[i] = …`), or anything else stays a read (never a false `Write`).
+fn is_write_position(root: &GdNode, offset: u32) -> bool {
+    let Some(tok) = ast::token_at(root, offset.into()) else {
+        return false;
+    };
+    let name_ref = tok.parent();
+    if name_ref.kind() != SyntaxKind::NameRef {
+        return false; // a declaration `Name`, a keyword, etc. — not an assignment-target reference
+    }
+    // The lvalue expression is the `NameRef` itself, or the `FieldExpr` it is the *member* of.
+    let lvalue = match name_ref.parent() {
+        Some(p) if p.kind() == SyntaxKind::FieldExpr && is_field_member(p, name_ref) => p.clone(),
+        _ => name_ref.clone(),
+    };
+    // It is a write iff that lvalue is the first operand of an assignment `BinExpr`.
+    let Some(bin) = lvalue.parent() else {
+        return false;
+    };
+    bin.kind() == SyntaxKind::BinExpr
+        && has_assign_op(bin)
+        && bin.children().next().map(|c| c.text_range()) == Some(lvalue.text_range())
+}
+
+/// Whether `name_ref` is the member (the `NameRef` after the `.`, i.e. the last `NameRef` child) of
+/// `field`, not its receiver.
+fn is_field_member(field: &GdNode, name_ref: &GdNode) -> bool {
+    field
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::NameRef)
+        .last()
+        .map(|c| c.text_range())
+        == Some(name_ref.text_range())
+}
+
+/// Whether `bin` carries an assignment operator (`=`, `+=`, `-=`, …) as a direct child token.
+fn has_assign_op(bin: &GdNode) -> bool {
+    bin.children_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .any(|t| {
+            matches!(
+                t.kind(),
+                SyntaxKind::Eq
+                    | SyntaxKind::PlusEq
+                    | SyntaxKind::MinusEq
+                    | SyntaxKind::StarEq
+                    | SyntaxKind::SlashEq
+                    | SyntaxKind::StarStarEq
+                    | SyntaxKind::PercentEq
+                    | SyntaxKind::AmpEq
+                    | SyntaxKind::PipeEq
+                    | SyntaxKind::CaretEq
+                    | SyntaxKind::ShlEq
+                    | SyntaxKind::ShrEq
+            )
+        })
 }
 
 // ---- rename -------------------------------------------------------------------------------
@@ -796,6 +859,44 @@ mod tests {
         assert!(
             h.ty_label.as_deref().is_some_and(|l| l.contains("String")),
             "hover should type the use as the local's String, got {:?}",
+            h.ty_label,
+        );
+    }
+
+    #[test]
+    fn find_refs_distinguishes_writes_from_reads() {
+        // `x = …` / `x += …` and `self.x = …` are writes; an RHS use is a read; the decl stays
+        // Declaration. (ReferenceKind::Write was previously never derived.)
+        let src = "var x := 0\nfunc f():\n\tx = 1\n\tx += 2\n\tself.x = 3\n\tvar y := x\n";
+        let db = db_with(&[(0, src)]);
+        let refs = find_references(&db, pos(0, "x", 0, src));
+        let count = |k| refs.iter().filter(|r| r.kind == k).count();
+        assert_eq!(count(ReferenceKind::Declaration), 1, "{refs:?}");
+        assert_eq!(count(ReferenceKind::Write), 3, "x=1, x+=2, self.x=3: {refs:?}");
+        assert_eq!(count(ReferenceKind::Read), 1, "var y := x: {refs:?}");
+    }
+
+    #[test]
+    fn classify_and_infer_agree_on_param_shadowing_a_member() {
+        // Second guard for the def.rs/infer.rs name-lookup duplication (the first covers a local):
+        // a param `hp: String` shadows a member `hp: int` — goto (classify) must reach the param and
+        // hover (infer) must type the use as String, so the two lookups can't silently drift.
+        let src = "var hp := 0\nfunc f(hp: String):\n\treturn hp\n";
+        let db = db_with(&[(0, src)]);
+        let param_decl = u32::try_from(src.match_indices("hp").nth(1).unwrap().0).unwrap();
+        let use_pos = pos(0, "hp", 2, src);
+        let targets = goto_definition(&db, use_pos);
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.file == FileId(0) && t.focus_range.start == param_decl),
+            "goto should resolve the use to the shadowing param, got {targets:?}",
+        );
+        let ft = db.file_text(FileId(0)).expect("file text");
+        let h = crate::semantic::hover(&db, ft, use_pos.offset).expect("hover at the use");
+        assert!(
+            h.ty_label.as_deref().is_some_and(|l| l.contains("String")),
+            "hover should type the use as the param's String, got {:?}",
             h.ty_label,
         );
     }
