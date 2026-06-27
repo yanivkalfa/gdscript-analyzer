@@ -111,10 +111,10 @@ pub fn class_name_collisions(db: &dyn Db, root: SourceRoot) -> Arc<FxHashSet<Smo
     let mut seen: FxHashSet<SmolStr> = FxHashSet::default();
     let mut dups: FxHashSet<SmolStr> = FxHashSet::default();
     for &file in root.files(db) {
-        if let Some(name) = file_class_name(db, file) {
-            if !seen.insert(name.clone()) {
-                dups.insert(name);
-            }
+        if let Some(name) = file_class_name(db, file)
+            && !seen.insert(name.clone())
+        {
+            dups.insert(name);
         }
     }
     Arc::new(dups)
@@ -596,7 +596,11 @@ mod tests {
     #[test]
     fn duplicate_class_name_warns_at_both_declarations() {
         let mut db = RootDatabase::default();
-        db.set_file_text(FileId(0), "class_name Dup\nfunc f():\n\tpass\n", Durability::LOW);
+        db.set_file_text(
+            FileId(0),
+            "class_name Dup\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
         db.set_file_text(FileId(1), "class_name Dup\nvar x := 1\n", Durability::LOW);
         db.sync_source_root();
 
@@ -621,7 +625,11 @@ mod tests {
     fn class_name_shadowing_an_engine_class_warns() {
         let mut db = RootDatabase::default();
         // `Node` is an engine class — declaring `class_name Node` shadows it.
-        db.set_file_text(FileId(0), "class_name Node\nfunc f():\n\tpass\n", Durability::LOW);
+        db.set_file_text(
+            FileId(0),
+            "class_name Node\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
         db.sync_source_root();
 
         let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
@@ -640,13 +648,21 @@ mod tests {
         db.sync_source_root();
 
         let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
-        assert!(shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER), "{:?}", fi.diagnostics);
+        assert!(
+            shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "{:?}",
+            fi.diagnostics
+        );
     }
 
     #[test]
     fn class_name_shadowing_a_star_autoload_warns() {
         let mut db = RootDatabase::default();
-        db.set_file_text(FileId(0), "class_name Game\nfunc f():\n\tpass\n", Durability::LOW);
+        db.set_file_text(
+            FileId(0),
+            "class_name Game\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
         db.set_file_path(FileId(0), "res://game.gd");
         // A `*`-singleton named `Game` — the class_name now hides the autoload global.
         db.set_project_config("[autoload]\nGame=\"*res://other.gd\"\n");
@@ -669,7 +685,11 @@ mod tests {
             "class_name MyVeryOwnUniquePlayer\nfunc f():\n\tpass\n",
             Durability::LOW,
         );
-        db.set_file_text(FileId(1), "class_name AnotherUniqueEnemy\n", Durability::LOW);
+        db.set_file_text(
+            FileId(1),
+            "class_name AnotherUniqueEnemy\n",
+            Durability::LOW,
+        );
         db.sync_source_root();
 
         for fid in [0, 1] {

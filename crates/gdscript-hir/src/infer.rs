@@ -246,9 +246,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         let collides = collisions_contains(db, &name)
             || resolve::resolve_global(api, &name).is_some()
             || is_autoload_singleton(db, &name);
-        if collides
-            && let Some(range) = class_name_decl_range(root)
-        {
+        if collides && let Some(range) = class_name_decl_range(root) {
             diagnostics.push(Diagnostic {
                 range,
                 severity: Severity::Warning,
@@ -302,7 +300,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         for _ in 0..MAX_ROUNDS {
             let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
             class.self_ty = self_ref.clone();
-            class.member_types = member_types.clone();
+            class.member_types.clone_from(&member_types);
             let mut next_member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
             final_units = Vec::new();
             final_diagnostics = Vec::new();
@@ -387,7 +385,7 @@ fn class_name_decl_range(root: &GdNode) -> Option<TextRange> {
         .into_iter()
         .find(|n| n.kind() == SyntaxKind::ClassNameDecl)?;
     let name_node = decl.children().find(|c| c.kind() == SyntaxKind::Name)?;
-    let r = cst::text_range_of(&name_node);
+    let r = cst::text_range_of(name_node);
     let text = name_node.text().to_string();
     let lead = u32::try_from(text.len() - text.trim_start().len()).unwrap_or(0);
     let len = u32::try_from(text.trim().len()).unwrap_or(0);
@@ -405,15 +403,12 @@ fn extends_decl_range(root: &GdNode) -> Option<TextRange> {
     for child in root.children() {
         match child.kind() {
             // Standalone `extends Target` — the whole clause is the anchor.
-            SyntaxKind::ExtendsClause => return Some(cst::text_range_of(&child)),
+            SyntaxKind::ExtendsClause => return Some(cst::text_range_of(child)),
             // Inline `class_name Name extends Target` — anchor the `extends` keyword onward.
             SyntaxKind::ClassNameDecl => {
-                if let Some(kw) = child
-                    .children()
-                    .find(|c| c.kind() == SyntaxKind::ExtendsKw)
-                {
-                    let start = cst::text_range_of(&kw).start;
-                    let end = cst::text_range_of(&child).end;
+                if let Some(kw) = child.children().find(|c| c.kind() == SyntaxKind::ExtendsKw) {
+                    let start = cst::text_range_of(kw).start;
+                    let end = cst::text_range_of(child).end;
                     return Some(TextRange::new(start, end));
                 }
             }
@@ -857,12 +852,15 @@ impl Cx<'_> {
                     // Anchor a relative `preload("sibling.gd")` to the importing file's directory
                     // before resolving (Godot anchors relative resource paths); absolute paths pass
                     // through, and a relative path with no anchor stays the seam.
-                    Some(p) => match resolve::anchor_res_path(self.self_res_path().as_deref(), &p) {
-                        Some(abs) => {
-                            resolve::resolve_external(self.db, &resolve::ExternalRef::Preload(abs))
+                    Some(p) => {
+                        match resolve::anchor_res_path(self.self_res_path().as_deref(), &p) {
+                            Some(abs) => resolve::resolve_external(
+                                self.db,
+                                &resolve::ExternalRef::Preload(abs),
+                            ),
+                            None => Ty::Unknown,
                         }
-                        None => Ty::Unknown,
-                    },
+                    }
                     None => Ty::Unknown,
                 }
             }
@@ -1959,8 +1957,7 @@ mod tests {
             "upcast is safe: {:?}",
             upcast.result.diagnostics
         );
-        let untyped =
-            infer_first_func("func f(p):\n\ttake(p)\nfunc take(n):\n\tpass\n");
+        let untyped = infer_first_func("func f(p):\n\ttake(p)\nfunc take(n):\n\tpass\n");
         assert!(
             !codes(&untyped).contains(&UNSAFE_CALL_ARGUMENT),
             "untyped param accepts anything: {:?}",
