@@ -714,6 +714,7 @@ dependencies = [
  "crossbeam-channel",
  "gdscript-base",
  "gdscript-ide",
+ "ignore",
  "lsp-server",
  "lsp-types",
  "serde",

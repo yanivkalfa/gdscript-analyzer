@@ -22,13 +22,17 @@
 
 pub mod convert;
 pub mod line_index;
+pub mod project;
 pub mod vfs;
 
 mod handlers;
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use anyhow::Result;
 use crossbeam_channel::Sender;
-use gdscript_base::Cancellable;
+use gdscript_base::{Cancellable, FileId};
 use gdscript_ide::{Analysis, AnalysisHost, Change};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
@@ -136,6 +140,7 @@ pub fn run(connection: &Connection) -> Result<()> {
     let (id, init_value) = connection.initialize_start()?;
     let init_params: InitializeParams = serde_json::from_value(init_value)?;
     let encoding = negotiate_encoding(&init_params);
+    let roots = workspace_roots(&init_params);
     let result = InitializeResult {
         capabilities: server_capabilities(encoding),
         server_info: Some(ServerInfo {
@@ -144,15 +149,27 @@ pub fn run(connection: &Connection) -> Result<()> {
         }),
     };
     connection.initialize_finish(id, serde_json::to_value(result)?)?;
-    main_loop(connection, encoding)
+    main_loop(connection, encoding, roots)
+}
+
+/// The workspace roots to scan: the client's `workspace_folders` (preferred), else the deprecated
+/// single `root_uri`. Empty when the client opened no folder (the server then runs per-open-file).
+fn workspace_roots(params: &InitializeParams) -> Vec<Uri> {
+    if let Some(folders) = &params.workspace_folders
+        && !folders.is_empty()
+    {
+        return folders.iter().map(|f| f.uri.clone()).collect();
+    }
+    #[allow(deprecated)]
+    params.root_uri.clone().into_iter().collect()
 }
 
 /// The event loop. Edits (text sync) and request *dispatch* run on this thread (the single writer);
 /// read requests are snapshotted and computed on a worker thread, their `Response`s arriving back on
 /// `task_rx`. A `select!` multiplexes the two so a slow read never blocks edits or other requests.
-fn main_loop(conn: &Connection, encoding: PositionEncoding) -> Result<()> {
+fn main_loop(conn: &Connection, encoding: PositionEncoding, roots: Vec<Uri>) -> Result<()> {
     let (task_tx, task_rx) = crossbeam_channel::unbounded::<Message>();
-    let mut state = GlobalState::new(encoding, task_tx);
+    let mut state = GlobalState::new(encoding, task_tx, roots);
     // `shutdown` is acked manually (not via `Connection::handle_shutdown`, which blocks) so the loop
     // keeps draining in-flight read responses to the client until `exit` — never leaving a read
     // request unanswered (the client would otherwise hang).
@@ -202,16 +219,55 @@ struct GlobalState {
     vfs: Vfs,
     encoding: PositionEncoding,
     task_tx: Sender<Message>,
+    /// The workspace roots to scan once `initialized` arrives.
+    roots: Vec<Uri>,
+    /// Whether the project scan has already run (idempotent — `initialized` fires once).
+    loaded: bool,
+    /// Files whose `res://` path has been fed to the host (so it's set exactly once).
+    with_path: HashSet<FileId>,
 }
 
 impl GlobalState {
-    fn new(encoding: PositionEncoding, task_tx: Sender<Message>) -> Self {
+    fn new(encoding: PositionEncoding, task_tx: Sender<Message>, roots: Vec<Uri>) -> Self {
         Self {
             host: AnalysisHost::new(),
             vfs: Vfs::default(),
             encoding,
             task_tx,
+            roots,
+            loaded: false,
+            with_path: HashSet::new(),
         }
+    }
+
+    /// Scan the workspace roots into the one host: every `.gd`/`.tscn` as a background file (with its
+    /// `res://` path), plus `project.godot` — so cross-file resolution (`class_name`, autoloads,
+    /// preload, scene typing) works against the whole project, not just open documents. Idempotent and
+    /// a no-op when no root resolves to a `project.godot` (the per-open-file fallback).
+    fn load_project(&mut self) {
+        if self.loaded || self.roots.is_empty() {
+            return;
+        }
+        self.loaded = true;
+        let loaded = project::load(&self.roots);
+        if loaded.is_empty() {
+            return;
+        }
+        let mut change = Change::new();
+        for f in &loaded.files {
+            let id = self.vfs.set_disk(&f.uri, Arc::clone(&f.text));
+            change.change_file(id, Arc::clone(&f.text));
+            if let Some(res) = &f.res_path {
+                self.vfs.set_res_path(id, res.clone());
+                if self.with_path.insert(id) {
+                    change.set_file_path(id, res.clone());
+                }
+            }
+        }
+        if let Some(cfg) = &loaded.config {
+            change.set_project_config(Arc::clone(cfg));
+        }
+        self.host.apply_change(change);
     }
 
     /// Dispatch a request: read features snapshot the analysis and run on a worker thread; unknown
@@ -333,20 +389,25 @@ impl GlobalState {
         });
     }
 
-    /// A navigation snapshot of every open document (so cross-file results map to URIs).
+    /// A navigation snapshot of **every known file** (open overlay or scanned-from-disk), so a
+    /// cross-file definition / reference / rename in any project file maps to a `Location` — not just
+    /// the handful of open documents.
     fn nav_ctx(&self) -> NavCtx {
         let docs = self
             .vfs
-            .iter()
-            .map(|(id, uri, doc)| {
-                (
+            .known_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let uri = self.vfs.uri(id)?.clone();
+                let snap = self.vfs.snapshot(id)?;
+                Some((
                     id,
                     NavDoc {
-                        uri: uri.clone(),
-                        text: doc.text.clone(),
-                        line_index: doc.line_index.clone(),
+                        uri,
+                        text: snap.text,
+                        line_index: snap.line_index,
                     },
-                )
+                ))
             })
             .collect();
         NavCtx {
@@ -462,6 +523,7 @@ impl GlobalState {
                     return Ok(()); // ignore a malformed notification (LSP: notifications get no reply)
                 };
                 let td = p.text_document;
+                self.maybe_update_project_config(&td.uri, &td.text);
                 let id = self.vfs.upsert(&td.uri, td.text, td.version);
                 self.commit(id);
                 self.publish_diagnostics(conn, id)?;
@@ -479,6 +541,7 @@ impl GlobalState {
                     return Ok(());
                 };
                 let new_text = self.apply_content_changes(id, &p.content_changes);
+                self.maybe_update_project_config(&uri, &new_text);
                 self.vfs.upsert(&uri, new_text, p.text_document.version);
                 self.commit(id);
                 self.publish_diagnostics(conn, id)?;
@@ -491,22 +554,47 @@ impl GlobalState {
                 };
                 if let Some(id) = self.vfs.id(&p.text_document.uri) {
                     self.vfs.close(id);
+                    // Revert the host to the file's on-disk text (it stays part of the project);
+                    // `commit` removes it entirely if it had no disk layer (an ad-hoc open).
+                    self.commit(id);
                     clear_diagnostics(conn, p.text_document.uri)?;
                 }
             }
-            // `initialized` is informational; `exit` is consumed by `handle_shutdown`.
+            // The client finished initializing → scan the workspace into the host (once).
+            "initialized" => self.load_project(),
+            // `exit` is consumed by the main loop before reaching here.
             _ => {}
         }
         Ok(())
     }
 
-    /// Feed the document's current text to the salsa input (the only mutation of the host).
-    fn commit(&mut self, id: gdscript_base::FileId) {
-        let Some(text) = self.vfs.doc(id).map(|d| d.text.clone()) else {
+    /// When `uri` is the project's `project.godot`, feed its text as the project config so an in-editor
+    /// edit of autoloads/version takes effect without a restart.
+    fn maybe_update_project_config(&mut self, uri: &Uri, text: &str) {
+        if uri.as_str().rsplit('/').next() == Some("project.godot") {
+            let mut change = Change::new();
+            change.set_project_config(text.to_owned());
+            self.host.apply_change(change);
+        }
+    }
+
+    /// Feed a file's *effective* text (overlay if open, else its on-disk layer) to the salsa input,
+    /// recording its `res://` path on first commit. A file with neither layer is removed from the host.
+    fn commit(&mut self, id: FileId) {
+        let Some(snap) = self.vfs.snapshot(id) else {
+            let mut change = Change::new();
+            change.remove_file(id);
+            self.host.apply_change(change);
+            self.with_path.remove(&id);
             return;
         };
         let mut change = Change::new();
-        change.change_file(id, text);
+        change.change_file(id, snap.text);
+        if let Some(res) = self.vfs.res_path(id).map(str::to_owned)
+            && self.with_path.insert(id)
+        {
+            change.set_file_path(id, res);
+        }
         self.host.apply_change(change);
     }
 
@@ -646,7 +734,110 @@ mod tests {
 
     /// A `GlobalState` with a throwaway task channel (for unit tests that don't drive the loop).
     fn test_state() -> GlobalState {
-        GlobalState::new(PositionEncoding::Utf16, crossbeam_channel::unbounded().0)
+        GlobalState::new(
+            PositionEncoding::Utf16,
+            crossbeam_channel::unbounded().0,
+            Vec::new(),
+        )
+    }
+
+    /// A unique scratch directory that wipes itself on drop (no `tempfile` dep).
+    struct TempProject(std::path::PathBuf);
+    impl TempProject {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "gdlsp_{tag}_{}_{:p}",
+                std::process::id(),
+                &raw const tag
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn write(&self, name: &str, contents: &str) {
+            std::fs::write(self.0.join(name), contents).unwrap();
+        }
+        fn uri(&self) -> Uri {
+            project::path_to_uri(&self.0.canonicalize().unwrap()).unwrap()
+        }
+    }
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn whole_project_loads_and_resolves_cross_file_without_collision() {
+        // The headline Phase-5 fix: a scanned-but-unopened library file lets an opened file resolve a
+        // cross-file `class_name`, AND opening that scanned file does NOT double-load it into a false
+        // `class_name`-collision (the FileId is reused via the canonical-path interner).
+        let proj = TempProject::new("xfile");
+        proj.write("project.godot", "[application]\nconfig/name=\"t\"\n");
+        proj.write(
+            "lib.gd",
+            "class_name Lib\nstatic func ping() -> int:\n\treturn 1\n",
+        );
+        proj.write("main.gd", "func go():\n\tvar n := Lib.ping()\n\treturn n\n");
+
+        let mut state = test_state();
+        state.roots = vec![proj.uri()];
+        state.load_project();
+
+        // Locate the scanned files by URI suffix.
+        let find = |state: &GlobalState, suffix: &str| {
+            state
+                .vfs
+                .known_ids()
+                .into_iter()
+                .find(|&id| state.vfs.uri(id).unwrap().as_str().ends_with(suffix))
+                .unwrap()
+        };
+        let lib = find(&state, "lib.gd");
+        let main = find(&state, "main.gd");
+
+        // A seam (unresolved cross-file `Lib`) would manufacture these; their absence proves resolution.
+        let unresolved = |d: &gdscript_base::Diagnostic| {
+            d.code == "INFERENCE_ON_VARIANT" || d.code.starts_with("UNSAFE")
+        };
+        // Snapshot in a block so it is dropped before the host is next mutated (salsa's single writer
+        // cancels outstanding snapshots and blocks until they release — a held snapshot would deadlock).
+        {
+            let a = state.host.analysis();
+            // `Lib` resolves cross-file from main.gd → no inference-on-variant / unsafe-access warning.
+            let main_diags = a.diagnostics(main).unwrap_or_default();
+            assert!(
+                !main_diags.iter().any(unresolved),
+                "main.gd should resolve `Lib.ping()` cross-file (no seam warning), got {main_diags:?}",
+            );
+            // lib.gd defines `Lib` exactly once → no SHADOWED_GLOBAL_IDENTIFIER (the double-load symptom).
+            let lib_diags = a.diagnostics(lib).unwrap_or_default();
+            assert!(
+                !lib_diags
+                    .iter()
+                    .any(|d| d.code == "SHADOWED_GLOBAL_IDENTIFIER"),
+                "the scanned class_name must not collide with itself: {lib_diags:?}",
+            );
+        }
+
+        // Opening main.gd (an overlay over its disk layer) must keep the same FileId + resolution.
+        let main_uri = state.vfs.uri(main).unwrap().clone();
+        let reopened = state.vfs.upsert(
+            &main_uri,
+            "func go():\n\tvar n := Lib.ping()\n".to_owned(),
+            1,
+        );
+        assert_eq!(reopened, main, "didOpen must reuse the scanned FileId");
+        state.commit(reopened);
+        assert!(
+            !state
+                .host
+                .analysis()
+                .diagnostics(main)
+                .unwrap_or_default()
+                .iter()
+                .any(unresolved),
+            "cross-file resolution must survive opening the file as an overlay",
+        );
     }
 
     #[test]
