@@ -533,6 +533,39 @@ mod tests {
         round_trips(src);
     }
 
+    #[test]
+    fn statement_level_annotation_in_a_body_parses_clean() {
+        // `@warning_ignore("…")` (and friends) can decorate a STATEMENT inside a function body, not
+        // just a declaration. It must parse as a sibling Annotation, not fall into expr-stmt and
+        // error. (Found on the godot-demo-projects corpus.)
+        let src = "func f():\n\t@warning_ignore(\"integer_division\")\n\tvar x := 1 / 2\n";
+        let parse = parse(src);
+        assert!(parse.errors().is_empty(), "no errors: {:?}", parse.errors());
+        round_trips(src);
+    }
+
+    #[test]
+    fn multiline_lambda_arg_with_dedented_closer_parses_clean() {
+        // A multi-line lambda passed as a call argument, with the closing `)` on its own line at a
+        // column BETWEEN the lambda header and its body (real Godot style — the tween demo). The `)`
+        // ends the body via the bracket close — no spurious INDENT, no syntax error.
+        let src = "func f():\n\tobj.call(func():\n\t\t\tbody()\n\t\t)\n";
+        let parse = parse(src);
+        assert!(parse.errors().is_empty(), "no errors: {:?}", parse.errors());
+        round_trips(src);
+    }
+
+    #[test]
+    fn multiline_lambda_body_ending_at_a_comma_parses_clean() {
+        // A multi-line lambda whose single-statement body is followed by `, more_args` on the same
+        // line (`call(func(v): body, 0.0, 1.0)`). A bare `,` at the lambda's enclosing bracket depth
+        // is the call's argument separator, so it ends the body. (Found on the corpus.)
+        let src = "func f():\n\tobj.call(\n\t\tfunc(v):\n\t\t\tuse(v), 0.0, 1.0)\n";
+        let parse = parse(src);
+        assert!(parse.errors().is_empty(), "no errors: {:?}", parse.errors());
+        round_trips(src);
+    }
+
     /// A broad, realistic GDScript file exercising most of the grammar. The key
     /// invariant is that it round-trips byte-for-byte and parses without panicking.
     const CORPUS: &str = r#"@tool

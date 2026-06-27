@@ -138,6 +138,23 @@ impl PrePass<'_> {
         let col = self.column(line);
         let at = first.range.start();
 
+        // A line whose first meaningful token is a closing bracket that closes a lambda's enclosing
+        // bracket is a *bracket continuation* — the `)` of `call(func(): … )` on its own dedented
+        // line, which real code often indents BETWEEN the lambda header and its body. Close that body
+        // now by BRACKET DEPTH (not column) so the line is treated as indentation-suppressed and no
+        // spurious INDENT is emitted for where the closer happens to sit. (The column-based
+        // `close_lambdas` below only fires when the line dedents to at-or-below the header column.)
+        if matches!(
+            first.kind,
+            SyntaxKind::RParen | SyntaxKind::RBrace | SyntaxKind::RBrack
+        ) && self
+            .lambda_stack
+            .last()
+            .is_some_and(|ctx| ctx.open_bracket_depth >= self.bracket_depth)
+        {
+            self.close_lambdas_on_bracket(self.bracket_depth.saturating_sub(1), at);
+        }
+
         // Close any lambda bodies this line has dedented back out of.
         self.close_lambdas(col, at);
 
@@ -174,6 +191,18 @@ impl PrePass<'_> {
                 {
                     let new_depth = self.bracket_depth.saturating_sub(1);
                     self.close_lambdas_on_bracket(new_depth, tok.range.start());
+                }
+                // A `,` at a lambda body's OWN enclosing bracket depth is the enclosing call's
+                // argument separator (`call(func(): body, next_arg)` — a bare comma can't be valid
+                // lambda-body syntax at that depth), so it ends the body mid-line too. Close by depth,
+                // not column, before the comma.
+                else if tok.kind == SyntaxKind::Comma
+                    && self
+                        .lambda_stack
+                        .last()
+                        .is_some_and(|ctx| ctx.open_bracket_depth == self.bracket_depth)
+                {
+                    self.close_lambdas_on_bracket(self.bracket_depth.saturating_sub(1), tok.range.start());
                 }
                 self.out.push(*tok);
                 self.track_bracket(tok.kind);
