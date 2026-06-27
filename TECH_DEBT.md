@@ -28,8 +28,13 @@ matrix + a vendored real-file corpus), and **524/524 godot-demo-projects scenes 
 - [ ] **Project-wide `script→scene` reverse index + salsa caching → M1.** M0's `node_with_script`
       answers the *per-scene* half only; the cross-project map and the `scene_model(db, FileId)`
       tracked query live in `gdscript-db`/`gdscript-hir`.
-- [ ] **`uid://` resolution → M1+.** M0 records `uid`; resolving a uid-only `ext_resource` to a path
-      needs the project UID map. M0 prefers `path=` when present.
+- [ ] **`uid://` resolution → DEFERRED (Phase-5, user-approved rationale).** M0 records `uid`;
+      resolving a uid-*only* `ext_resource` would need a project UID map. **Near-zero real value:** in
+      Godot 4.x every `ext_resource` is written with BOTH `path=` and `uid=`, so path-first resolution
+      (already implemented) handles every real case — a uid-only resource essentially never occurs. A
+      firewall-safe impl needs a new `uid` field on the `FileText` salsa input (a `uid` derived from
+      `scene_model` would couple the registry to body-text edits and break the cross-file firewall)
+      plus loader plumbing in BOTH the LSP and CLI. Deferred: bad cost/value ratio. M0 prefers `path=`.
 - [ ] **Inline `script = SubResource("…")` records no attachment.** An inline GDScript sub-resource
       has no external path; M0 sets `script = None` (M1 types the node by its declared `type=`). Rare.
 - [ ] **`name_span` includes the surrounding quotes** (the `name="…"` value span). Fine for coarse
@@ -118,16 +123,23 @@ sigil form's head segment and delegate. The completion fix guards on the `ast::t
 tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is lost.
 
 **M2/M3 deferrals (→ later):**
-- [ ] **Paths *into* an instance stay `Node`.** `$Enemy` is now typed (the instance root), but
-      `$Enemy/Sprite` (a node *inside* the sub-scene) still degrades to `Node` (`IntoInstance` — no
-      false warn). Resolving across the scene boundary into the sub-scene's own tree is the remaining
-      tail; the node-type case (the headline) is done.
+- [x] **Paths *into* an instance — DONE (Phase-5 hardening).** `$Enemy/Sprite` (a node *inside* the
+      instanced sub-scene) now types as the inner node's real type, not bare `Node`:
+      `SceneModel::resolve_into_instance` returns `(instance_node, tail)` at the boundary and
+      `infer::resolve_into_instance_ty` walks the tail from the sub-scene's root, recursing through
+      nested instance boundaries (depth-bounded ≤16). A genuinely-absent tail stays `Node` with no
+      false `INVALID_NODE_PATH`. An override child *under* an instance (mapping back into the
+      sub-scene tree) stays `Node` — the rare remaining tail. Test:
+      `path_into_an_instanced_subscene_types_the_inner_node`.
 - [x] **`self.get_node("…")` — DONE (post-LSP tech-debt pass).** Explicit `self.get_node("…")` now
       types like the bare form (`self` = the attach node). A *foreign* `obj.get_node("…")` stays a
       normal call → `Node` (correct — its path is relative to a node we can't resolve here).
-- [ ] **`%Unique` completion deferred.** `$`-path completion is done; `%`-name completion is held
-      because disambiguating `%Name` (unique node) from `a %b` (modulo) needs token context, not the
-      backward byte scan. Typing/goto/diagnostic for `%` all work — only its *completion* is pending.
+- [x] **`%Unique` completion — DONE (Phase-5 hardening).** `%Name` is disambiguated from `a % b`
+      (modulo) by the parsed token: the byte scan locates the leading `%`, then we confirm its token's
+      parent is `UniqueNodeExpr`, not `BinExpr`. A bare `%` offers every unique node in the owning
+      scene; `%Box/` resolves `Box` scene-wide and offers its children. Tests:
+      `unique_node_path_completion_offers_children`, `bare_percent_offers_all_unique_nodes`,
+      `percent_modulo_is_not_hijacked_as_a_unique_path`.
 - [ ] **Scene-aware rename → Phase 6.** Renaming a node in a `.tscn` and updating `$Path`s (or vice
       versa) is deferred per the plan; M2 ships the read-side features (type/goto/complete/diagnose).
 
@@ -188,14 +200,14 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       one file in the ReactiveUI-Godot corpus did, and it now analyzes clean.)
 
 ### IDE features (Tier 0 → Tier 1)
-- [ ] **Completions are not scope-aware.** By-name completion offers *every* document
-      symbol, not just names visible in the enclosing scope. Acceptable for Tier 0;
-      scope-awareness comes with the HIR. **Attempted + deferred (Phase-5):** a naive
-      enclosing-function filter is a *regression* — the CST `FuncDecl` range does not extend to the
-      end-of-function-body cursor (where you typically type), so it would HIDE the enclosing
-      function's own params/locals (worse than today's over-offering, which is safe). A correct fix
-      needs indentation-aware enclosing-scope detection (the cursor is in a func's body until a
-      dedent), not the raw CST range.
+- [x] **Scope-aware completions — DONE (Phase-5 hardening).** By-name completion now offers a
+      parameter / local `var`/`const` ONLY inside its owning function; class members stay visible
+      everywhere. The enclosing function is found by an **indentation scan** (`enclosing_func_offset`
+      in `features.rs`), NOT the CST `FuncDecl` range — that range stops at the last body token, so
+      typing on a fresh empty line at the end of a body (the common case) is *past* it and a range
+      test would wrongly HIDE the body's own params/locals (the prior attempted-and-rejected fix).
+      Tests: `completion_is_scope_aware_for_locals_and_params`,
+      `completion_at_class_level_offers_members_not_locals`.
 - [x] **Type inference / member completion / hover / inlay / signature help / code
       actions — DONE in Phase 2; goto-def / find-refs / rename / workspace symbols — DONE in
       Phase 3 M5** (cross-file, resolve-don't-string-match; `goto_definition` returns real targets).
@@ -365,8 +377,11 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       graph.** Correct (the re-resolve confirms) but does wasted `classify`s on files that name-but-
       don't-reference the symbol. A firewall-safe referrer reverse-index (keyed on `item_tree`, not
       bodies) is a perf follow-up if the large-project benchmark regresses.
-- [ ] **(M5) `ReferenceKind::Write` not derived.** find-refs tags `Declaration` vs `Read` only;
-      assignment-LHS `Write` is a cheap follow-up off the lowered body.
+- [x] **(M5) `ReferenceKind::Write` — DONE (Phase-5 hardening).** find-refs now tags a write when the
+      reference is the direct LHS operand of an assignment `BinExpr` — a bare `NameRef` (`x = …`,
+      `x += …`) or the member of a `FieldExpr` (`self.x = …`, `a.b = …`). Conservative: a receiver
+      (`a` in `a.b`), an index target (`arr[i] = …`), `==` (EqEq), and `:=` declarations stay `Read`.
+      Test: `find_refs_distinguishes_writes_from_reads`.
 - [x] **Scene (`.tscn`) autoloads → root script — DONE (post-LSP tech-debt pass).** A `*`-autoload
       pointing at a `.tscn` now resolves to its root node's attached-script `ScriptRef` (Phase-4 scene
       parsing unblocked it — `resolve_scene_autoload`), so `Music.play()` checks the real script. A
@@ -393,11 +408,20 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       `ItemTree::ConstItem` records `preload_path` and `script_class` resolves it via
       `resolve_external(Preload)` — without breaking the body-edit firewall (123 hir tests incl. the
       firewall tests stay green). Test: `cross_file_preload_const_member_resolves`.
-- [ ] **Parser gaps on the broader demo-projects corpus (NEW, Phase-1 follow-up).** Project-mode
-      over godot-demo-projects surfaced **307 `GDSCRIPT_SYNTAX`** errors (cascading
-      "expected a declaration" — a few unhandled syntactic forms, e.g. some lambda/match/typed
-      constructs the ReactiveUI-Godot corpus didn't exercise). 0 panics. Harden the parser +
-      grow the differential oracle against godot-demo-projects before v1.
+- [x] **Parser gaps on the broader demo-projects corpus — DONE (Phase-5 hardening): 307 → 0.**
+      Project-mode over godot-demo-projects (456 `.gd`) surfaced **307 `GDSCRIPT_SYNTAX`** errors
+      (0 panics), almost all cascading from THREE unhandled-but-valid forms, now fixed:
+      (1) a statement-level annotation inside a function body (`@warning_ignore("…")`) — `stmt()` now
+      parses a leading `@` as a sibling `Annotation`; (2) a multi-line lambda passed as a call
+      argument with the closing `)` on its own dedented line, indented BETWEEN the lambda header and
+      its body (the tween demo) — the prepass closes such a body by BRACKET DEPTH when a line leads
+      with a closer; (3) a multi-line lambda whose single-statement body is followed by `, more_args`
+      on the same line — a bare `,` at the lambda's enclosing bracket depth ends the body. Result:
+      **godot-demo-projects parses with 0 `GDSCRIPT_SYNTAX` errors, 0 panics**. Tests:
+      `statement_level_annotation_in_a_body`, `multiline_lambda_arg_with_dedented_closer`,
+      `multiline_lambda_body_ending_at_a_comma`. **Still open:** grow the *differential* (tree-sitter)
+      oracle + a CI gate that clones godot-demo-projects and asserts 0 parse errors (the run is ad hoc
+      via `cargo run -p gdscript-ide --example corpus -- <dir>` today).
 - [ ] **`corpus --project` is a robustness stress test, not a single-project run.** Merging many
       sub-projects into one host shares the `class_name` namespace; cross-project collisions are
       expected. A faithful per-project validation needs `project.godot`-scoped roots (M4).
@@ -463,16 +487,17 @@ seam, and rename identifier hygiene; all with regression tests):
       a parse scan (`anon_enum_variant_target`) since `item_tree` drops per-variant ranges.
 
 **Deferred** (verified real, but needing an AST-layer change or pairing with later inner-class work):
-- [ ] **Inner-class member navigation identity is not modeled.** Inner members now refuse rather
-      than corrupt; a full fix qualifies `GodotDef::Member` by the declaring inner-class scope and
-      resolves against the inner `ItemTree` (pairs with Phase-4/later inner-class type modeling).
-- [ ] **Symbols named with soft keywords (`match`/`when`) aren't modeled — AST-layer, not classify.**
-      `ast::Name::text()` reads only an `Ident` token, so *every* soft-keyword-named declaration is
-      dropped at the AST/semantic layer (item_tree member name `None`, body params skipped) — long
-      before `classify`. The root fix widens `Name::text()` (and the body `NameRef`/`field_member`
-      lowering) to the grammar's `at_name` whitelist (`Ident | MatchKw | WhenKw`), which ripples
-      through item_tree / hover / completion and needs its own corpus validation. Not a classify-only
-      knock-off; rare in real code (safe `None` today).
+- [ ] **Inner-class member navigation identity is not modeled — considered + DEFERRED (Phase-5).**
+      Inner members refuse rather than corrupt (safe today). A full fix qualifies `GodotDef::Member` by
+      the declaring inner-class scope and resolves against the inner `ItemTree`, rippling through
+      `classify_decl` / `member_owner` / `resolve_name_to_def` / the rename collision checks — a
+      deliberate ~multi-day project, not a quick win, so explicitly deferred in the hardening pass.
+- [x] **Symbols named with soft keywords (`match`/`when`) — DONE (Phase-5 hardening).** `Name::text()`
+      and `EnumVariant::text()` now read the grammar's `at_name` whitelist (`Ident | MatchKw | WhenKw`)
+      via a `name_token_text` helper, so such symbols reach item_tree / hover / completion. `classify`
+      treats a soft keyword as a symbol only in a name position (`Name`/`NameRef` parent), so a bare
+      `match` *statement* keyword stays a non-symbol. Tests:
+      `soft_keyword_names_are_not_dropped` (item_tree), `soft_keyword_named_member_is_navigable` (nav).
 - [x] **`extends "res://base.gd".Inner` (string + dotted) — DONE (correct-or-refuse).** Was resolving
       the base to the OUTER script (wrongly accepting its members). `parse_extends_tokens` now detects the
       trailing dotted selector and yields the new `ExtendsRef::ScriptPathInner`, which `resolve_base` routes
@@ -503,24 +528,49 @@ seam, and rename identifier hygiene; all with regression tests):
 - [x] **wasm bundle size:** `wasm-opt -Oz` via `[package.metadata.wasm-pack.profile.release]` (the
       `wasm-release` cargo profile isn't reachable through `wasm-pack --release`).
 
-### Deferred
+### Done — Phase-5 hardening pass (branch `feat/phase5-hardening`)
+The "do 1–8" follow-up batch. Each is documented in full under its own Phase section above; in brief:
+- [x] **§3 IDE completion/naming:** scope-aware completion (indentation scan), `%Unique` completion
+      (token-context modulo disambiguation), soft-keyword-named symbols (`match`/`when`).
+- [x] **§6 engine version:** parse `project.godot` `config/features` → `engine_version()` salsa query
+      + `project_engine_version()` plumbing (informational until Phase-6 multi-version bundling).
+- [x] **§4b scene tail:** `$Enemy/Sprite` paths INTO an instanced sub-scene now type the inner node.
+- [x] **§8 find-refs:** `ReferenceKind::Write` derivation + a 2nd classify/infer agreement guard.
+- [x] **§5 LSP debounce:** `didChange` diagnostics are coalesced (150 ms quiescence) via a `select!`
+      timer arm — text still commits immediately; a burst of keystrokes recomputes once.
+- [x] **§2 parser hardening:** **307 → 0** `GDSCRIPT_SYNTAX` errors on godot-demo-projects.
+
+### Deferred (Phase-5)
 - [ ] **LSP read dispatch is thread-per-request** (`std::thread::spawn` per read), not a bounded pool.
       Fine for an editor (request rate is editor-bounded); under adversarial load it could spawn many
-      threads. A bounded worker pool + a Worker/LatencySensitive split is the follow-up. Low criticality.
-- [ ] **LSP diagnostics are recomputed synchronously on every `didChange`** (on the write thread), not
-      debounced/coalesced. The incremental analyzer is fast (<5 ms warm), so this is low-criticality; a
-      debounce timer in the `select!` loop (and moving the compute to the snapshot/pool path) is the
-      follow-up.
-- [ ] **napi cross-platform matrix is 6/10 triples** (mac x2, win x64 + arm64, linux gnu x2). STILL
-      DEFERRED, each needing a CI-verified toolchain step: `x86_64`/`aarch64-unknown-linux-musl` (zigbuild),
-      `armv7-unknown-linux-gnueabihf` (cross), and the `wasm32-wasip1-threads` WASI fallback (emnapi runtime
-      + WASI-SDK). The exact napi-rs v3 CLI flags weren't verifiable locally — see `release-napi.yml`'s
-      header. Until musl/WASI land, `npm i` on Alpine / an unlisted platform won't resolve a binary.
-- [ ] **Distribution polish:** a `twiggy` wasm size-regression CI guard; ship the engine model as a
-      content-hashed `extension_api.<ver>.rkyv.br` (brotli) instead of the raw `.bin`; empirically
-      validate the CLI's SARIF output against GitHub code-scanning's ingester.
-- [ ] **guitkx (ReactiveUI-Godot) cross-file *library* go-to-definition** (e.g. `use_ref` → `core/hooks.gd`)
-      is a regression vs the old Godot proxy — the embedded-analyzer adapter loads only the single virtual
+      threads. A bounded worker pool + a Worker/LatencySensitive split is the follow-up. **Low
+      criticality, no correctness gain** (salsa cancellation already makes thread-per-request correct);
+      deferred deliberately in the hardening pass rather than risk the snapshot-lifetime subtleties.
+- [ ] **napi cross-platform matrix is 6/10 triples** (mac x2, win x64 + arm64, linux gnu x2). DEFERRED:
+      this is release-pipeline CI that **cannot be verified on the local Windows-gnu box** (no Linux
+      cross-toolchain, no zig/cross/WASI-SDK), and pushing unverified cross-compile + publish YAML into
+      the release pipeline is riskier than the documented gap. **Ready-to-execute spec:** add to the
+      `release-napi.yml` matrix + `bindings/node/package.json` `napi.targets` (in lockstep), each as a
+      separate leg marked `experimental` with `continue-on-error: ${{ matrix.settings.experimental }}`
+      so a not-yet-green leg can't fail a release: `x86_64-unknown-linux-musl` + `aarch64-unknown-linux-musl`
+      (`npm run build -- --target <triple> --use-napi-cross`; napi-cross bundles zig+musl),
+      `armv7-unknown-linux-gnueabihf` (`--use-napi-cross`). Then trigger `release-napi` via
+      `workflow_dispatch` (build-only) to confirm each leg builds before removing `experimental`. The
+      `wasm32-wasip1-threads` WASI fallback stays separately deferred (emnapi runtime + WASI-SDK link
+      step, genuinely unproven). Until these land, `npm i` on Alpine / an unlisted platform won't
+      resolve a binary.
+- [ ] **Distribution polish (DEFERRED — unverifiable locally):** a `twiggy` wasm size-regression CI
+      guard (needs `wasm-pack` on CI, not installed locally); empirically validate the CLI's SARIF
+      output against GitHub code-scanning's ingester (needs an actual code-scanning upload). *(The
+      engine model is ALREADY brotli-handled on the wasm path — `AnalysisHost::set_engine_api` decodes
+      a `fetch`ed brotli blob — so the "content-hashed `.rkyv.br`" item is partly done; the remaining
+      piece is the native/bundled side, low value.)*
+- [ ] **§7 guitkx (ReactiveUI-Godot) client integration — DEFERRED to a separate repo PR (Phase-5).**
+      It lives in a DIFFERENT repository (`ReactiveUI-Godot`, not the analyzer), so it is naturally its
+      own PR. Two items: (a) **cross-file *library* go-to-definition** (e.g. `use_ref` → `core/hooks.gd`)
+      — a regression vs the old Godot proxy; the embedded-analyzer adapter loads only the single virtual
       `.gd` doc, not the referenced library files. Needs a runtime-model pass (where `use_ref`/`V`/`Hooks`
-      resolve from) before loading the libraries into the handle. Same-file goto works; the seam prevents
-      false positives, so the current state is safe.
+      resolve from) before loading the libraries into the handle. Same-file goto works and the seam
+      prevents false positives, so the current state is safe. (b) **`analyzerProxy.ts` end-to-end
+      validation** — needs the napi `.node` build (`libnode.dll`, CI-only), so it is CI-gated. Best done
+      AFTER the analyzer's `@gdscript-analyzer/core` `^0.2.0` is published and the guitkx dep is bumped.
