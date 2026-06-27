@@ -535,6 +535,19 @@ impl Analyzer<'_> {
     }
 }
 
+/// The narrowing facts a condition establishes on its truthy (or falsy) edge — exposed so the
+/// checker can apply `and`/`or` short-circuit narrowing *within* a condition expression (the RHS of
+/// `a and b` is typed under `a`'s then-facts, `a or b`'s under `a`'s else-facts).
+#[must_use]
+pub fn condition_facts(body: &Body, cond: ExprId, truthy: bool) -> Vec<(Place, NarrowedTy)> {
+    Analyzer {
+        body,
+        entry_facts: FxHashMap::default(),
+        unreachable_anchors: Vec::new(),
+    }
+    .derive_facts(cond, truthy)
+}
+
 /// Merge the exits of several control-flow paths: the join (intersection) of the ones that fall
 /// through, or `None` if every path diverges.
 fn join_exits(exits: Vec<Option<FlowFacts>>) -> Option<FlowFacts> {

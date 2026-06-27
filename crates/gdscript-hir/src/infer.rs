@@ -1113,6 +1113,16 @@ impl Cx<'_> {
         if op == BinOp::Assign {
             return self.infer_assign(lhs, rhs);
         }
+        // Short-circuit narrowing (Workstream 2): the RHS of `a and b` is typed under `a`'s
+        // then-facts; `a or b`'s RHS under `a`'s else-facts. Restore the env afterward.
+        if matches!(op, BinOp::And | BinOp::Or) {
+            self.infer_expr(lhs, &Expectation::None);
+            let saved = self.narrowing.clone();
+            self.apply_condition_facts(lhs, op == BinOp::And);
+            self.infer_expr(rhs, &Expectation::None);
+            self.narrowing = saved;
+            return self.bool_ty();
+        }
         let lt = self.infer_expr(lhs, &Expectation::None);
         let rt = self.infer_expr(rhs, &Expectation::None);
         if op.is_boolean() {
@@ -1774,30 +1784,47 @@ impl Cx<'_> {
     /// (`d: Derived; if d is Base` keeps `Derived`), never narrow to a type we couldn't resolve.
     fn facts_to_narrowing(&self, id: body::StmtId) -> FxHashMap<String, Ty> {
         let mut out = FxHashMap::default();
-        let Some(facts) = self.flow.facts_before(id) else {
-            return out;
-        };
-        for (place, nt) in facts.iter() {
-            let NarrowedTy::Is(ptr) = nt else {
-                continue;
-            };
-            let narrowed = self.resolve_ptr_ty(*ptr);
-            if narrowed.is_uninformative() {
-                continue;
+        if let Some(facts) = self.flow.facts_before(id) {
+            for (place, nt) in facts.iter() {
+                if let Some((key, ty)) = self.narrowing_entry(place, nt) {
+                    out.insert(key, ty);
+                }
             }
-            // Widen-only, gated against the place's declared type. We can look that up directly for
-            // a local/param; for `self`-members / field chains the `is_uninformative` check above is
-            // the soundness floor (we never assert a member the un-narrowed type couldn't justify).
-            if let Place::Local(n) = place
-                && let Some(cur) = self.locals.get(n)
-                && !cur.is_uninformative()
-                && !self.is_subtype(&narrowed, cur)
-            {
-                continue;
-            }
-            out.insert(place.dotted_key(), narrowed);
         }
         out
+    }
+
+    /// Resolve one flow fact into a `(dotted-key, narrowed-type)` narrowing entry, applying the
+    /// widen-only + `is_uninformative` soundness gate. `None` if the fact doesn't narrow a type
+    /// (a `NotNull`/`Not`, an unresolvable/uninformative type, or an un-narrowing of a known subtype).
+    fn narrowing_entry(&self, place: &Place, nt: &NarrowedTy) -> Option<(String, Ty)> {
+        let NarrowedTy::Is(ptr) = nt else {
+            return None;
+        };
+        let narrowed = self.resolve_ptr_ty(*ptr);
+        if narrowed.is_uninformative() {
+            return None;
+        }
+        // Gate against a local/param's declared type; for `self`-members / field chains the
+        // `is_uninformative` check above is the soundness floor.
+        if let Place::Local(n) = place
+            && let Some(cur) = self.locals.get(n)
+            && !cur.is_uninformative()
+            && !self.is_subtype(&narrowed, cur)
+        {
+            return None;
+        }
+        Some((place.dotted_key(), narrowed))
+    }
+
+    /// Apply a condition's short-circuit narrowing to the active env, for typing the RHS of an
+    /// `and`/`or` (Workstream 2): `if x is T and x.method():` narrows `x` for `x.method()`.
+    fn apply_condition_facts(&mut self, cond: ExprId, truthy: bool) {
+        for (place, nt) in flow::condition_facts(self.body, cond, truthy) {
+            if let Some((key, ty)) = self.narrowing_entry(&place, &nt) {
+                self.narrowing.insert(key, ty);
+            }
+        }
     }
 
     /// A dotted access-path key for narrowing (`x`, `self.field`, `a.b.c`), or `None` for a
@@ -2018,6 +2045,45 @@ mod tests {
         // After `is Node`, x is Node; `.bogus()` is genuinely missing → UNSAFE.
         let h = infer_first_func("func f(x):\n\tif x is Node:\n\t\tx.bogus_method()\n");
         assert!(codes(&h).contains(&UNSAFE_METHOD_ACCESS));
+    }
+
+    #[test]
+    fn early_return_is_guard_narrows_past_the_guard() {
+        // `if not (x is Node): return` — the only non-returning path proves x is Node, so after the
+        // guard a real Node method is safe and a missing one warns (Workstream 2, beats the engine).
+        let safe =
+            infer_first_func("func f(x):\n\tif not (x is Node):\n\t\treturn\n\tx.get_parent()\n");
+        assert!(
+            codes(&safe).iter().all(|c| !c.starts_with("UNSAFE")),
+            "real Node method must not warn after the guard: {:?}",
+            codes(&safe)
+        );
+        let bogus =
+            infer_first_func("func f(x):\n\tif not (x is Node):\n\t\treturn\n\tx.bogus_method()\n");
+        assert!(
+            codes(&bogus).contains(&UNSAFE_METHOD_ACCESS),
+            "missing method must warn after the guard: {:?}",
+            codes(&bogus)
+        );
+    }
+
+    #[test]
+    fn and_short_circuit_narrows_the_rhs() {
+        // `x is Node and x.<m>()` types the RHS under x: Node — a real method is safe, a missing
+        // one warns. The engine does not narrow here (Workstream 2, beats the engine).
+        let safe = infer_first_func("func f(x):\n\tif x is Node and x.get_parent():\n\t\tpass\n");
+        assert!(
+            codes(&safe).iter().all(|c| !c.starts_with("UNSAFE")),
+            "real Node method in the and-rhs must not warn: {:?}",
+            codes(&safe)
+        );
+        let bogus =
+            infer_first_func("func f(x):\n\tif x is Node and x.bogus_method():\n\t\tpass\n");
+        assert!(
+            codes(&bogus).contains(&UNSAFE_METHOD_ACCESS),
+            "missing method in the and-rhs must warn: {:?}",
+            codes(&bogus)
+        );
     }
 
     #[test]
