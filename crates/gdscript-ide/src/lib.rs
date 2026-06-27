@@ -540,6 +540,110 @@ mod tests {
     }
 
     #[test]
+    fn unique_node_path_completion_offers_children() {
+        // `%Box/` resolves the unique node `Box` scene-wide and offers its children, typed by `type=`.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let scene = "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Box\" type=\"Panel\" parent=\".\"]\n\
+             unique_name_in_owner = true\n\
+             [node name=\"Ok\" type=\"Button\" parent=\"Box\"]\n\
+             [node name=\"Cancel\" type=\"Button\" parent=\"Box\"]\n";
+        change.change_file(FileId(0), scene);
+        change.set_file_path(FileId(0), "res://main.tscn");
+        let gd = "extends Control\nfunc _ready():\n\tvar b := %Box/\n";
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        let offset = u32::try_from(gd.find("%Box/").unwrap() + "%Box/".len()).unwrap();
+        let items = analysis
+            .completions(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap();
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Ok") && labels.contains(&"Cancel"),
+            "{labels:?}"
+        );
+        assert!(!labels.contains(&"func"), "node-path, not keyword completion");
+    }
+
+    #[test]
+    fn bare_percent_offers_all_unique_nodes() {
+        // A bare `%` offers every unique node in the owning scene (scene-wide), not just children.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let scene = "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Box\" type=\"Panel\" parent=\".\"]\n\
+             unique_name_in_owner = true\n\
+             [node name=\"Hud\" type=\"Control\" parent=\".\"]\n\
+             unique_name_in_owner = true\n";
+        change.change_file(FileId(0), scene);
+        change.set_file_path(FileId(0), "res://main.tscn");
+        let gd = "extends Control\nfunc _ready():\n\tvar b := %\n";
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        let offset = u32::try_from(gd.find("%\n").unwrap() + 1).unwrap();
+        let labels: Vec<_> = analysis
+            .completions(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(
+            labels.iter().any(|l| l == "Box") && labels.iter().any(|l| l == "Hud"),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn percent_modulo_is_not_hijacked_as_a_unique_path() {
+        // `count % Box` is modulo, not a unique-node path — completion must stay by-name (the parsed
+        // `%` token's parent is `BinExpr`, not `UniqueNodeExpr`).
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let scene = "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Box\" type=\"Panel\" parent=\".\"]\n\
+             unique_name_in_owner = true\n";
+        change.change_file(FileId(0), scene);
+        change.set_file_path(FileId(0), "res://main.tscn");
+        let gd = "extends Control\nfunc _ready():\n\tvar count := 10\n\tvar b := count %Box\n";
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        let offset = u32::try_from(gd.find("%Box").unwrap() + "%Box".len()).unwrap();
+        let labels: Vec<_> = analysis
+            .completions(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        // By-name completion ran (keywords present), node-path did not hijack the modulo.
+        assert!(labels.iter().any(|l| l == "func"), "expected by-name completion: {labels:?}");
+    }
+
+    #[test]
     fn completion_is_scope_aware_for_locals_and_params() {
         // By-name completion must offer class members everywhere, but a parameter / local of one
         // function must NOT leak into a sibling function. The enclosing function is found by

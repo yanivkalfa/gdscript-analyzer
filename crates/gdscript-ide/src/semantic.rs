@@ -165,35 +165,72 @@ pub fn node_path_completions(
     file: FileText,
     offset: u32,
 ) -> Option<Vec<CompletionItem>> {
-    let prefix = dollar_path_prefix(file.text(db), offset)?;
-    // The backward byte scan has no lexer awareness, so a `$name/` *inside a string literal or
-    // comment* (e.g. `var s = "$x/y"`) would otherwise hijack completion. Bail when the cursor sits
-    // in a `String`/`Comment` token. (The real `$Panel/` form is `Dollar`/`Ident`/`Slash` tokens,
-    // never `String`; the quoted `$"…"` form isn't byte-scannable anyway, so nothing is lost.)
+    let text = file.text(db);
+    // The backward byte scan has no lexer awareness, so a `$name/` / `%name/` *inside a string
+    // literal or comment* (e.g. `var s = "$x/y"`) would otherwise hijack completion. Bail when the
+    // cursor sits in a `String`/comment token. (The real `$Panel/` form is `Dollar`/`Ident`/`Slash`
+    // tokens, never `String`; the quoted `$"…"` form isn't byte-scannable anyway.)
     let root = parse(db, file).syntax_node();
-    if let Some(tok) = ast::token_at(&root, offset.saturating_sub(1).into()) {
-        // A `String` literal or any comment trivia at the cursor → not a real node-path context.
-        if tok.kind() == SyntaxKind::String || tok.kind().is_trivia() {
-            return None;
-        }
+    if let Some(tok) = ast::token_at(&root, offset.saturating_sub(1).into())
+        && (tok.kind() == SyntaxKind::String || tok.kind().is_trivia())
+    {
+        return None;
     }
     let ctx = queries::scene_context(db, file)?;
-    let parent = if prefix.is_empty() {
-        ctx.attach
-    } else {
-        ctx.model.resolve_path_from(ctx.attach, &prefix)?
+    let to_items = |parent| -> Vec<CompletionItem> {
+        ctx.model
+            .children_of(Some(parent))
+            .map(|(_, n)| CompletionItem {
+                label: n.name.to_string(),
+                kind: CompletionKind::Variable,
+                insert_text: None,
+                detail: Some(n.decl_type.as_deref().unwrap_or("Node").to_owned()),
+            })
+            .collect()
     };
-    let items = ctx
-        .model
-        .children_of(Some(parent))
-        .map(|(_, n)| CompletionItem {
-            label: n.name.to_string(),
-            kind: CompletionKind::Variable,
-            insert_text: None,
-            detail: Some(n.decl_type.as_deref().unwrap_or("Node").to_owned()),
-        })
-        .collect();
-    Some(items)
+    // `$path` → the child nodes of the resolved prefix (the attach node for a bare `$`).
+    if let Some(prefix) = dollar_path_prefix(text, offset) {
+        let parent = if prefix.is_empty() {
+            ctx.attach
+        } else {
+            ctx.model.resolve_path_from(ctx.attach, &prefix)?
+        };
+        return Some(to_items(parent));
+    }
+    // `%Unique` → scene-wide unique nodes. A bare `%` offers every unique node; `%Box/` offers the
+    // children of the unique node `Box`. The `%` must be a unique-name SIGIL, not a modulo operator
+    // (`a % b`): the parsed `%` token's parent is `UniqueNodeExpr` for the sigil but `BinExpr` for
+    // modulo (the grammar's prefix-`%` vs infix-`%`), so we bail on a `BinExpr` parent.
+    if let Some((prefix, pct_pos)) = unique_path_prefix(text, offset) {
+        let pct = u32::try_from(pct_pos).unwrap_or(0);
+        let is_modulo = ast::token_at(&root, pct.into()).is_some_and(|t| {
+            t.kind() == SyntaxKind::Percent && t.parent().kind() == SyntaxKind::BinExpr
+        });
+        if is_modulo {
+            return None;
+        }
+        if prefix.is_empty() {
+            let mut items: Vec<CompletionItem> = ctx
+                .model
+                .unique_nodes
+                .iter()
+                .filter_map(|(name, idx)| {
+                    let n = ctx.model.node(*idx)?;
+                    Some(CompletionItem {
+                        label: name.to_string(),
+                        kind: CompletionKind::Variable,
+                        insert_text: None,
+                        detail: Some(n.decl_type.as_deref().unwrap_or("Node").to_owned()),
+                    })
+                })
+                .collect();
+            items.sort_by(|a, b| a.label.cmp(&b.label)); // FxHashMap order is non-deterministic
+            return Some(items);
+        }
+        let parent = ctx.model.resolve_unique(&prefix)?;
+        return Some(to_items(parent));
+    }
+    None
 }
 
 /// If `offset` sits inside a `$`-path, the already-typed **parent** path — everything before the
@@ -217,6 +254,42 @@ fn dollar_path_prefix(text: &str, offset: u32) -> Option<String> {
                 let mut segs = segs_rev;
                 segs.reverse();
                 return Some(segs.join("/"));
+            }
+            b'/' => {
+                let seg_end = i - 1;
+                let mut s = seg_end;
+                while s > 0 && is_path_ident_byte(bytes[s - 1]) {
+                    s -= 1;
+                }
+                segs_rev.push(&text[s..seg_end]);
+                i = s;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Like [`dollar_path_prefix`] but for a `%Unique` path: the already-typed **parent** path before
+/// the segment under the cursor (`%Box/Bt|` → `("Box", pos)`, `%Box/|` → `("Box", pos)`, `%|` →
+/// `("", pos)`), plus the byte offset of the leading `%` (so the caller can confirm via the parsed
+/// token that this `%` is a unique-name sigil, not a modulo operator). `None` if not in a `%`-path.
+fn unique_path_prefix(text: &str, offset: u32) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = (offset as usize).min(bytes.len());
+    // skip the current (partial) segment under the cursor.
+    while i > 0 && is_path_ident_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    let mut segs_rev: Vec<&str> = Vec::new();
+    loop {
+        if i == 0 {
+            return None;
+        }
+        match bytes[i - 1] {
+            b'%' => {
+                let mut segs = segs_rev;
+                segs.reverse();
+                return Some((segs.join("/"), i - 1));
             }
             b'/' => {
                 let seg_end = i - 1;
