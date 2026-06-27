@@ -24,6 +24,7 @@ use crate::cst::{self, AstPtr};
 use crate::item_tree::{ItemTree, Member, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
 use crate::ty::{self, Assign, EnumRef, ScriptRefId, Ty};
+use crate::warnings::{RawWarning, WarningCode};
 
 // ---- diagnostic codes + message templates (Playbook §5, engine-matching) -----------------
 
@@ -93,8 +94,12 @@ pub struct InferenceResult {
     pub expr_ty: FxHashMap<ExprId, Ty>,
     /// The local bindings introduced by the body (params, `var`/`const`, `for` vars).
     pub bindings: Vec<Binding>,
-    /// The §5 type diagnostics raised.
+    /// The §5 type diagnostics raised directly (the ungated analyzer-native codes:
+    /// `TYPE_MISMATCH`, `INVALID_NODE_PATH` — these have no Godot warning-setting key).
     pub diagnostics: Vec<Diagnostic>,
+    /// The gateable Godot warnings, recorded severity-free. Resolved into final diagnostics by
+    /// [`crate::warnings::gate`] downstream of the cached `analyze_file` query (Workstream 1).
+    pub raw_warnings: Vec<RawWarning>,
 }
 
 impl InferenceResult {
@@ -137,6 +142,7 @@ pub fn infer(
         expr_ty: FxHashMap::default(),
         bindings: Vec::new(),
         diagnostics: Vec::new(),
+        raw_warnings: Vec::new(),
         locals: FxHashMap::default(),
         narrowing: FxHashMap::default(),
     };
@@ -163,6 +169,7 @@ pub fn infer(
         expr_ty: cx.expr_ty,
         bindings: cx.bindings,
         diagnostics: cx.diagnostics,
+        raw_warnings: cx.raw_warnings,
     }
 }
 
@@ -208,8 +215,12 @@ pub struct FileInference {
     pub tree: Arc<ItemTree>,
     /// The inferred function/field units.
     pub units: Vec<Unit>,
-    /// All type diagnostics, merged across units.
+    /// The ungated analyzer-native diagnostics, merged across units (`TYPE_MISMATCH`,
+    /// `INVALID_NODE_PATH`) plus the file-level `SHADOWED_GLOBAL_IDENTIFIER` / `CYCLIC_INHERITANCE`.
     pub diagnostics: Vec<Diagnostic>,
+    /// The severity-free gateable Godot warnings, merged across units. The IDE layer resolves
+    /// these via [`crate::warnings::gate`] against the project's settings (Workstream 1).
+    pub raw_warnings: Vec<RawWarning>,
 }
 
 impl FileInference {
@@ -227,10 +238,12 @@ impl FileInference {
 /// class-field initializer against a shared [`ClassScope`]. The single entry point for the
 /// IDE features (Playbook §6 — a pure `(api, parsed file) -> result` function).
 #[must_use]
+#[allow(clippy::too_many_lines)] // the two-pass field-fixpoint + function walk reads best whole
 pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId) -> FileInference {
     let tree = item_tree(root);
     let mut units = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut raw_warnings: Vec<RawWarning> = Vec::new();
     let mut member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
     // `self` is the script's OWN class (a self-`ScriptRef`), not just its engine base — so member
     // access on an aliased `self` resolves the file's own members (see `ClassScope::self_ty`).
@@ -297,6 +310,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         const MAX_ROUNDS: usize = 4;
         let mut final_units: Vec<Unit> = Vec::new();
         let mut final_diagnostics: Vec<Diagnostic> = Vec::new();
+        let mut final_raw_warnings: Vec<RawWarning> = Vec::new();
         for _ in 0..MAX_ROUNDS {
             let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
             class.self_ty = self_ref.clone();
@@ -304,6 +318,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
             let mut next_member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
             final_units = Vec::new();
             final_diagnostics = Vec::new();
+            final_raw_warnings = Vec::new();
             for m in &tree.members {
                 let (ptr, range) = match m {
                     Member::Var(v) => (v.ptr, v.range),
@@ -315,6 +330,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
                         next_member_types.insert(SmolStr::new(name), b.ty.clone());
                     }
                     final_diagnostics.extend(unit.result.diagnostics.iter().cloned());
+                    final_raw_warnings.extend(unit.result.raw_warnings.iter().cloned());
                     final_units.push(unit);
                 }
             }
@@ -324,6 +340,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
             member_types = next_member_types;
         }
         diagnostics.extend(final_diagnostics);
+        raw_warnings.extend(final_raw_warnings);
         units.extend(final_units);
     }
 
@@ -342,6 +359,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
                 .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
             let result = infer(db, api, root, &class, &body, return_ty);
             diagnostics.extend(result.diagnostics.iter().cloned());
+            raw_warnings.extend(result.raw_warnings.iter().cloned());
             units.push(Unit {
                 range: f.range,
                 body,
@@ -354,6 +372,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         tree,
         units,
         diagnostics,
+        raw_warnings,
     }
 }
 
@@ -486,6 +505,8 @@ struct Cx<'a> {
     expr_ty: FxHashMap<ExprId, Ty>,
     bindings: Vec<Binding>,
     diagnostics: Vec<Diagnostic>,
+    /// Severity-free gateable warnings (Workstream 1), resolved by `gate()` downstream.
+    raw_warnings: Vec<RawWarning>,
     /// Function-scoped local bindings (GDScript locals are function-, not block-, scoped).
     locals: FxHashMap<SmolStr, Ty>,
     /// Flow-scoped `is`/`as` narrowing facts, keyed by a dotted access path.
@@ -532,6 +553,17 @@ impl Cx<'_> {
         });
     }
 
+    /// Record a gateable Godot warning, severity-free. The resolved severity (and whether it fires
+    /// at all) is decided later by [`crate::warnings::gate`], keyed on the project's warning
+    /// settings — so a settings edit never re-runs inference (Workstream 1, the salsa firewall).
+    fn warn(&mut self, range: TextRange, code: WarningCode, message: String) {
+        self.raw_warnings.push(RawWarning {
+            range,
+            code,
+            message,
+        });
+    }
+
     fn range_of(&self, id: ExprId) -> TextRange {
         self.body.source_map.expr_range(id)
     }
@@ -540,10 +572,9 @@ impl Cx<'_> {
     /// unconditionally: `to` being `Variant`/`Unknown` yields `Ok`/no diagnostic.
     fn check_assign(&mut self, from: &Ty, to: &Ty, range: TextRange) {
         match ty::is_assignable(self.api, from, to) {
-            Assign::Narrowing => self.emit(
+            Assign::Narrowing => self.warn(
                 range,
-                Severity::Warning,
-                NARROWING_CONVERSION,
+                WarningCode::NarrowingConversion,
                 "Narrowing conversion (float is converted to int and loses precision).".to_owned(),
             ),
             Assign::No => {
@@ -687,10 +718,9 @@ impl Cx<'_> {
             // `var x := e` — inferred (hard); guard the Variant / null cases.
             (None, Some(init)) if v.is_inferred => {
                 if init.is_variant() {
-                    self.emit(
+                    self.warn(
                         range,
-                        Severity::Error,
-                        INFERENCE_ON_VARIANT,
+                        WarningCode::InferenceOnVariant,
                         inference_on_variant_msg(if v.is_const { "constant" } else { "variable" }),
                     );
                     Ty::Variant
@@ -1080,10 +1110,9 @@ impl Cx<'_> {
         }
         // `int / int` discards the fractional part.
         if op == BinOp::Div && self.is_int(&lt) && self.is_int(&rt) {
-            self.emit(
+            self.warn(
                 self.range_of(id),
-                Severity::Warning,
-                INTEGER_DIVISION,
+                WarningCode::IntegerDivision,
                 "Integer division. Decimal part will be discarded.".to_owned(),
             );
             return self.int_ty();
@@ -1200,10 +1229,9 @@ impl Cx<'_> {
             if ty::is_assignable(self.api, &arg_ty, param_ty) == Assign::OkUnsafe {
                 let pl = param_ty.label(self.api).unwrap_or_else(|| "?".to_owned());
                 let al = arg_ty.label(self.api).unwrap_or_else(|| "?".to_owned());
-                self.emit(
+                self.warn(
                     self.range_of(arg),
-                    Severity::Warning,
-                    UNSAFE_CALL_ARGUMENT,
+                    WarningCode::UnsafeCallArgument,
                     format!(
                         "The argument {} requires a value of type \"{pl}\" but is passed \"{al}\", which is unsafe.",
                         i + 1
@@ -1460,20 +1488,20 @@ impl Cx<'_> {
         let recv_label = recv.label(self.api).unwrap_or_else(|| "?".to_owned());
         let (code, message) = if as_method {
             (
-                UNSAFE_METHOD_ACCESS,
+                WarningCode::UnsafeMethodAccess,
                 format!(
                     "The method \"{name}()\" is not present on the inferred type \"{recv_label}\" (but may be present on a subtype)."
                 ),
             )
         } else {
             (
-                UNSAFE_PROPERTY_ACCESS,
+                WarningCode::UnsafePropertyAccess,
                 format!(
                     "The property \"{name}\" is not present on the inferred type \"{recv_label}\" (but may be present on a subtype)."
                 ),
             )
         };
-        self.emit(range, Severity::Warning, code, message);
+        self.warn(range, code, message);
     }
 
     fn member_ref_ty(&self, m: &MemberRef, as_method: bool) -> Ty {
@@ -1888,22 +1916,31 @@ mod tests {
         Harness { result, body }
     }
 
+    /// Every code inference produced — the ungated `diagnostics` plus the severity-free
+    /// `raw_warnings` (the gateable Godot codes, post-W1-M0). Infer-level tests assert what the
+    /// checker *records*; the gate-level resolution is tested in `crate::warnings`.
     fn codes(h: &Harness) -> Vec<&str> {
         h.result
             .diagnostics
             .iter()
             .map(|d| d.code.as_str())
+            .chain(h.result.raw_warnings.iter().map(|w| w.code.as_str()))
             .collect()
     }
 
     /// Run the whole-file pass (Pass 1 field fixpoint + Pass 2 functions) and collect every
-    /// diagnostic code. Drives `analyze_file` directly so the bounded member fixpoint runs.
+    /// diagnostic code (ungated diagnostics + raw gateable warnings). Drives `analyze_file`
+    /// directly so the bounded member fixpoint runs.
     fn file_codes(src: &str) -> Vec<String> {
         let api = gdscript_api::bundled();
         let db = gdscript_db::RootDatabase::default();
         let root = parse(src).syntax_node();
         let fi = analyze_file(&db, api, &root, FileId(0));
-        fi.diagnostics.iter().map(|d| d.code.clone()).collect()
+        fi.diagnostics
+            .iter()
+            .map(|d| d.code.clone())
+            .chain(fi.raw_warnings.iter().map(|w| w.code.as_str().to_owned()))
+            .collect()
     }
 
     #[test]
@@ -1933,11 +1970,7 @@ mod tests {
     #[test]
     fn int_to_float_is_silent() {
         let h = infer_first_func("func f():\n\tvar x: float = 3\n");
-        assert!(
-            h.result.diagnostics.is_empty(),
-            "{:?}",
-            h.result.diagnostics
-        );
+        assert!(codes(&h).is_empty(), "{:?}", codes(&h));
     }
 
     #[test]
@@ -1989,11 +2022,7 @@ mod tests {
     fn variant_receiver_never_unsafe() {
         // Untyped param → Variant receiver → unchecked, no diagnostic.
         let h = infer_first_func("func f(x):\n\tx.anything_at_all()\n");
-        assert!(
-            h.result.diagnostics.is_empty(),
-            "{:?}",
-            h.result.diagnostics
-        );
+        assert!(codes(&h).is_empty(), "{:?}", codes(&h));
     }
 
     #[test]
@@ -2183,11 +2212,7 @@ mod tests {
     fn unknown_seam_never_warns() {
         // `preload(...)` is Unknown; `:=` from it does NOT warn, and member access is unchecked.
         let h = infer_first_func("func f():\n\tvar s := preload(\"res://x.gd\")\n\ts.whatever()\n");
-        assert!(
-            h.result.diagnostics.is_empty(),
-            "{:?}",
-            h.result.diagnostics
-        );
+        assert!(codes(&h).is_empty(), "{:?}", codes(&h));
     }
 
     #[test]

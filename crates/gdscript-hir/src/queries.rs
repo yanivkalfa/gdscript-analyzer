@@ -23,6 +23,7 @@ use gdscript_scene::{NodeIdx, SceneModel};
 use crate::infer::FileInference;
 use crate::item_tree::{ItemTree, Member};
 use crate::ty::{ScriptRefId, Ty};
+use crate::warnings::{SuppressionMap, WarningSettings};
 
 /// The item tree for `file` (signatures only — the body-edit firewall). Memoized; recomputes
 /// when the parse changes but backdates when the resulting signatures are unchanged.
@@ -198,6 +199,29 @@ pub fn engine_version(db: &dyn Db, config: ProjectConfig) -> Option<(u32, u32)> 
 #[must_use]
 pub fn project_engine_version(db: &dyn Db) -> Option<(u32, u32)> {
     engine_version(db, db.project_config()?)
+}
+
+/// The project's resolved warning settings, parsed from `project.godot`'s
+/// `debug/gdscript/warnings/*` (Workstream 1). Keyed on [`ProjectConfig`] alone (MEDIUM
+/// durability) and reads no `.gd` body, so **editing a warning level invalidates only this query +
+/// the downstream gate, never `analyze_file`/`item_tree`/`infer`** — the salsa-cacheability
+/// invariant the gating seam depends on (W1 §3.4/§6).
+#[salsa::tracked]
+pub fn warning_settings(db: &dyn Db, config: ProjectConfig) -> Arc<WarningSettings> {
+    let text = config.project_godot_text(db);
+    let engine =
+        crate::project::parse_engine_version(text).unwrap_or_else(crate::warnings::bundled_version);
+    Arc::new(crate::project::parse_warning_settings(text, engine))
+}
+
+/// The per-file `@warning_ignore[_start|_restore]` suppression map (Workstream 1). Keyed on the
+/// file's parse — CST byte ranges are stable across incremental edits — so it recomputes only when
+/// the file text changes, never on a warning-setting edit.
+#[salsa::tracked]
+pub fn suppression_map(db: &dyn Db, file: FileText) -> Arc<SuppressionMap> {
+    Arc::new(crate::warnings::build_suppression_map(
+        &parse(db, file).syntax_node(),
+    ))
 }
 
 /// One member of a script class, as a cross-file reference sees it (a resolved type, never a
@@ -1538,6 +1562,64 @@ mod tests {
             AUTOLOAD_OBSERVED.load(Ordering::SeqCst),
             runs,
             "REGRESSION: a body edit re-ran an autoload_registry consumer — the config firewall broke",
+        );
+    }
+
+    // The W1 gating firewall (the M0 load-bearing test): editing a `debug/gdscript/warnings/*`
+    // level must re-run only `warning_settings` (+ the downstream gate in `type_diagnostics`),
+    // NEVER the cached `analyze_file` (inference). Severity is resolved downstream, so a settings
+    // edit leaves inference's `raw_warnings` untouched.
+
+    static ANALYZE_OBSERVED: AtomicU32 = AtomicU32::new(0);
+
+    #[salsa::tracked]
+    fn observe_analyze_file(db: &dyn gdscript_db::Db, file: FileText) -> usize {
+        ANALYZE_OBSERVED.fetch_add(1, Ordering::SeqCst);
+        analyze_file(db, file).raw_warnings.len()
+    }
+
+    #[test]
+    fn warning_level_edit_does_not_invalidate_analyze_file() {
+        use crate::warnings::{WarnLevel, WarningCode};
+
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "func f():\n\tvar x = 5 / 2\n", Durability::LOW);
+        db.set_file_path(FileId(0), "res://game.gd");
+        db.set_project_config(
+            "[autoload]\nGame=\"*res://game.gd\"\n[debug]\ngdscript/warnings/integer_division=2\n",
+        );
+        db.sync_source_root();
+        let file = db.file_text(FileId(0)).unwrap();
+        let config = db.project_config().unwrap();
+
+        // Prime: analyze_file runs once and records the gateable INTEGER_DIVISION raw warning.
+        assert_eq!(observe_analyze_file(&db, file), 1);
+        let runs = ANALYZE_OBSERVED.load(Ordering::SeqCst);
+        assert_eq!(
+            warning_settings(&db, config)
+                .per_code
+                .get(&WarningCode::IntegerDivision),
+            Some(&WarnLevel::Error),
+        );
+
+        // Edit ONLY the warning level (the `[autoload]` line is byte-identical). analyze_file must
+        // not recompute — its inputs (file text, engine, the autoload registry's *value*) are
+        // unchanged; only `warning_settings` re-runs.
+        db.set_project_config(
+            "[autoload]\nGame=\"*res://game.gd\"\n[debug]\ngdscript/warnings/integer_division=1\n",
+        );
+        assert_eq!(observe_analyze_file(&db, file), 1);
+        assert_eq!(
+            ANALYZE_OBSERVED.load(Ordering::SeqCst),
+            runs,
+            "REGRESSION: a warning-level edit re-ran analyze_file — the W1 gating firewall broke",
+        );
+        // The setting itself DID change (the test is not vacuous): the gate now sees WARN.
+        assert_eq!(
+            warning_settings(&db, config)
+                .per_code
+                .get(&WarningCode::IntegerDivision),
+            Some(&WarnLevel::Warn),
         );
     }
 

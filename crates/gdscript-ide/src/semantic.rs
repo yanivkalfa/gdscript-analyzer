@@ -21,8 +21,10 @@ use gdscript_hir::infer::{BindingKind, FileInference};
 use gdscript_hir::item_tree::{ItemTree, Member};
 use gdscript_hir::queries;
 use gdscript_hir::ty::{self, Ty};
+use gdscript_hir::warnings::{self, WarningSettings};
 use gdscript_syntax::ast;
 use gdscript_syntax::{GdNode, SyntaxKind};
+use std::sync::Arc;
 
 use cstree::util::NodeOrToken;
 
@@ -43,11 +45,30 @@ fn type_label(db: &dyn Db, api: &EngineApi, ty: &Ty) -> Option<String> {
 // ---- diagnostics -------------------------------------------------------------------------
 
 /// The §5 type diagnostics for a file (merged into [`crate::Analysis::diagnostics`]).
+///
+/// Runs the warning **gate** (Workstream 1) *downstream* of the cached `analyze_file` query: the
+/// ungated analyzer-native diagnostics pass through, and each severity-free [`RawWarning`] is
+/// resolved against the project's [`WarningSettings`] + the per-file suppression map. Because the
+/// settings query is keyed on `ProjectConfig` (not a body), a warning-level edit never re-runs
+/// inference — only this gate re-runs.
 #[must_use]
 pub fn type_diagnostics(db: &dyn Db, file: FileText) -> Vec<Diagnostic> {
     // `analyze_file` already yields an empty result with no engine model (wasm32), so the
     // diagnostics are naturally empty there — no separate guard needed.
-    queries::analyze_file(db, file).diagnostics.clone()
+    let inf = queries::analyze_file(db, file);
+    let settings = db.project_config().map_or_else(
+        || Arc::new(WarningSettings::analyzer_default()),
+        |c| queries::warning_settings(db, c),
+    );
+    let ignores = queries::suppression_map(db, file);
+    let path = file.res_path(db);
+    let mut out: Vec<Diagnostic> = inf.diagnostics.clone();
+    out.extend(
+        inf.raw_warnings
+            .iter()
+            .filter_map(|rw| warnings::gate(rw, &settings, &ignores, path.as_deref())),
+    );
+    out
 }
 
 // ---- hover -------------------------------------------------------------------------------
@@ -766,5 +787,30 @@ mod tests {
         let help = signature_help(&db, ft, offset).expect("signature");
         assert!(help.signatures[0].label.starts_with("add_child("));
         assert!(!help.signatures[0].params.is_empty());
+    }
+
+    #[test]
+    fn gating_drops_warnings_when_disabled_in_project_config() {
+        let src = "func f():\n\tvar x = 5 / 2\n";
+        // Standalone (no `project.godot`): the gateable INTEGER_DIVISION warning surfaces.
+        let (db, ft) = db_ft(src);
+        assert!(
+            type_diagnostics(&db, ft)
+                .iter()
+                .any(|d| d.code == "INTEGER_DIVISION"),
+            "standalone default should surface the warning",
+        );
+        // `debug/gdscript/warnings/enable=false` → the gate drops every gateable warning.
+        let mut db2 = RootDatabase::default();
+        db2.set_file_text(FileId(0), src, Durability::LOW);
+        db2.set_project_config("[debug]\ngdscript/warnings/enable=false\n");
+        db2.sync_source_root();
+        let ft2 = db2.file_text(FileId(0)).unwrap();
+        assert!(
+            type_diagnostics(&db2, ft2)
+                .iter()
+                .all(|d| d.code != "INTEGER_DIVISION"),
+            "enable=false must suppress gateable warnings",
+        );
     }
 }

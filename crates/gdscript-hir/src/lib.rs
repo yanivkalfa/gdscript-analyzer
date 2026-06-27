@@ -18,5 +18,6 @@ pub mod project;
 pub mod queries;
 pub mod resolve;
 pub mod ty;
+pub mod warnings;
 
 pub use cst::AstPtr;
