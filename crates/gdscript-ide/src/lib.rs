@@ -540,6 +540,66 @@ mod tests {
     }
 
     #[test]
+    fn completion_is_scope_aware_for_locals_and_params() {
+        // By-name completion must offer class members everywhere, but a parameter / local of one
+        // function must NOT leak into a sibling function. The enclosing function is found by
+        // indentation, so completing on a fresh (empty) indented line at the end of a body still
+        // sees that body's own params/locals (the case the CST-range approach regressed).
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let gd = "var member_v := 0\nfunc a(pa):\n\tvar la := 1\n\t\nfunc b(pb):\n\tvar lb := 2\n";
+        change.change_file(FileId(0), gd);
+        change.set_file_path(FileId(0), "res://m.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        // Cursor on the empty indented line inside a() (right after the body's tab).
+        let upto = "var member_v := 0\nfunc a(pa):\n\tvar la := 1\n\t";
+        let offset = u32::try_from(gd.find(upto).unwrap() + upto.len()).unwrap();
+        let items = analysis
+            .completions(FilePosition {
+                file: FileId(0),
+                offset,
+            })
+            .unwrap();
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        // Own param + own local + the class member + both func names are visible.
+        assert!(labels.contains(&"pa"), "own param `pa`: {labels:?}");
+        assert!(labels.contains(&"la"), "own local `la`: {labels:?}");
+        assert!(labels.contains(&"member_v"), "class member: {labels:?}");
+        assert!(
+            labels.contains(&"a") && labels.contains(&"b"),
+            "sibling func names: {labels:?}",
+        );
+        // b()'s param + local must NOT leak into a().
+        assert!(!labels.contains(&"pb"), "leaked b's param: {labels:?}");
+        assert!(!labels.contains(&"lb"), "leaked b's local: {labels:?}");
+    }
+
+    #[test]
+    fn completion_at_class_level_offers_members_not_locals() {
+        // At class level (no enclosing function) only members are offered — no function's locals.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let gd = "var member_v := 0\nfunc a():\n\tvar la := 1\n\nm\n";
+        change.change_file(FileId(0), gd);
+        change.set_file_path(FileId(0), "res://m.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        // Cursor after the top-level `m` (class level, indent 0).
+        let offset = u32::try_from(gd.rfind('m').unwrap() + 1).unwrap();
+        let items = analysis
+            .completions(FilePosition {
+                file: FileId(0),
+                offset,
+            })
+            .unwrap();
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"member_v") && labels.contains(&"a"), "{labels:?}");
+        assert!(!labels.contains(&"la"), "a()'s local must not leak to class level: {labels:?}");
+    }
+
+    #[test]
     fn goto_definition_on_a_node_path_jumps_into_the_tscn() {
         // Cursor on `$Btn` → a NavTarget pointing at the `[node name="Btn" …]` line in the owning
         // `.tscn` (the inverse of M1 typing; navigation the engine LSP cannot provide).

@@ -205,7 +205,7 @@ pub fn completions(db: &dyn Db, file: FileText, offset: u32) -> Vec<CompletionIt
             detail: None,
         })
         .collect();
-    items.extend(local_symbols(db, file));
+    items.extend(visible_symbols(db, file, offset));
     items
 }
 
@@ -213,17 +213,44 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Collect document-local symbol names (declarations, params, enum variants), deduped.
-/// Not scope-aware in Tier 0 — every name in the file is offered.
-fn local_symbols(db: &dyn Db, file: FileText) -> Vec<CompletionItem> {
+/// Collect the symbol names **visible at `offset`**, deduped. Class-level members (funcs, vars,
+/// consts, signals, enums, the `class_name`, inner classes) are always visible; a parameter or a
+/// local `var`/`const` is offered ONLY when the cursor sits inside its owning function. Enum
+/// variants stay class-level (an anonymous-enum variant is a class-level `int` constant).
+///
+/// The enclosing function is found by an **indentation scan**, not the CST `FuncDecl` range: that
+/// range stops at the last body token, so when you type on a fresh (still-empty) line at the end of
+/// a body the cursor is *past* it — a range test would then wrongly hide the function's own
+/// params/locals (worse than over-offering). See `TECH_DEBT.md`.
+fn visible_symbols(db: &dyn Db, file: FileText, offset: u32) -> Vec<CompletionItem> {
+    let text = file.text(db);
     let parsed = parse(db, file);
+    let root = parsed.syntax_node();
+    // The FuncDecl whose body the cursor sits in (the `func`/`static` token's parent), if any.
+    let enc_range = enclosing_func_offset(text, offset)
+        .and_then(|o| ast::token_at(&root, u32::try_from(o).unwrap_or(0).into()))
+        .map(|t| t.parent().clone())
+        .filter(|n| n.kind() == SyntaxKind::FuncDecl)
+        .map(|n| n.text_range());
+    // A local/param is in scope iff it lies within the enclosing function's range.
+    let in_scope = |node: &GdNode| enc_range.is_some_and(|r| r.contains_range(node.text_range()));
+
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for node in ast::descendants(&parsed.syntax_node()) {
+    for node in ast::descendants(&root) {
         let (name, kind) = if let Some(decl) = Decl::cast(node.clone()) {
             let Some(name) = decl.name() else { continue };
+            // A `var`/`const` in a func / accessor / lambda body is a LOCAL — scope it; otherwise
+            // it is a class member, always visible.
+            if is_in_callable_body(&node) && !in_scope(&node) {
+                continue;
+            }
             (name, decl_completion_kind(&decl))
         } else if node.kind() == SyntaxKind::Param {
+            // A parameter is visible only inside its own function.
+            if !in_scope(&node) {
+                continue;
+            }
             match ast::Param::cast(node.clone())
                 .and_then(|p| p.name())
                 .and_then(|n| n.text())
@@ -249,6 +276,85 @@ fn local_symbols(db: &dyn Db, file: FileText) -> Vec<CompletionItem> {
         }
     }
     out
+}
+
+/// Whether `node` is nested inside a callable body (a `func`, a `get`/`set` accessor, or a lambda)
+/// — i.e. a declaration here is a LOCAL, not a class member.
+fn is_in_callable_body(node: &GdNode) -> bool {
+    let mut cur = node.parent().cloned();
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            SyntaxKind::FuncDecl | SyntaxKind::Getter | SyntaxKind::Setter | SyntaxKind::LambdaExpr
+        ) {
+            return true;
+        }
+        cur = n.parent().cloned();
+    }
+    false
+}
+
+/// The byte offset of the `func`/`static` keyword of the function whose body contains `offset`,
+/// found by an indentation scan. Walk up from the cursor's line; the first shallower non-blank line
+/// that begins with `func`/`static func` owns the cursor's block — unless a shallower top-level
+/// (indent-0) non-`func` line is reached first, meaning the cursor is at class level. `None` then.
+fn enclosing_func_offset(text: &str, offset: u32) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let cursor = (offset as usize).min(bytes.len());
+    let mut line_start = cursor;
+    while line_start > 0 && bytes[line_start - 1] != b'\n' {
+        line_start -= 1;
+    }
+    let cur_indent = leading_ws(bytes, line_start);
+    let mut min_indent = cur_indent;
+    let mut i = line_start;
+    loop {
+        if i == 0 {
+            return None; // reached the top with no enclosing function
+        }
+        let prev_nl = i - 1; // the '\n' ending the previous line
+        let mut prev_start = prev_nl;
+        while prev_start > 0 && bytes[prev_start - 1] != b'\n' {
+            prev_start -= 1;
+        }
+        let line = &text[prev_start..prev_nl];
+        i = prev_start;
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue; // blank line — does not change block nesting
+        }
+        let li = line.len() - trimmed.len(); // leading-whitespace width
+        if li < min_indent {
+            if starts_a_func(trimmed) {
+                return Some(prev_start + li);
+            }
+            if li == 0 {
+                return None; // a top-level non-`func` header → cursor is at class level
+            }
+            min_indent = li; // a control-flow header (if/for/while/match/…) — keep ascending
+        }
+    }
+}
+
+/// Leading-whitespace (space/tab) width of the line starting at `line_start`.
+fn leading_ws(bytes: &[u8], line_start: usize) -> usize {
+    let mut i = line_start;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    i - line_start
+}
+
+/// Whether a trimmed line begins a function declaration (`func …` or `static func …`).
+fn starts_a_func(trimmed: &str) -> bool {
+    let is_func_kw = |s: &str| {
+        s.strip_prefix("func")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '(']))
+    };
+    is_func_kw(trimmed)
+        || trimmed
+            .strip_prefix("static")
+            .is_some_and(|rest| rest.starts_with([' ', '\t']) && is_func_kw(rest.trim_start()))
 }
 
 fn decl_completion_kind(decl: &Decl) -> CompletionKind {
@@ -411,7 +517,10 @@ mod tests {
     fn completion_offers_keywords_and_locals() {
         let src = "var health = 100\nfunc take_damage(amount):\n\tpass\n";
         let (db, ft) = db_ft(src);
-        let items = completions(&db, ft, u32::try_from(src.len()).unwrap());
+        // Cursor INSIDE take_damage's body (right after the body tab) — its param `amount` is in
+        // scope here. Completion is scope-aware, so the param is offered only inside its function.
+        let inside = u32::try_from("var health = 100\nfunc take_damage(amount):\n\t".len()).unwrap();
+        let items = completions(&db, ft, inside);
         assert!(
             items
                 .iter()
@@ -423,6 +532,14 @@ mod tests {
                 .iter()
                 .any(|i| i.label == "take_damage" && i.kind == CompletionKind::Function)
         );
-        assert!(items.iter().any(|i| i.label == "amount"));
+        assert!(items.iter().any(|i| i.label == "amount"), "param visible inside its body");
+
+        // At class level (end of file, indent 0) the param is NOT visible; members still are.
+        let at_eof = completions(&db, ft, u32::try_from(src.len()).unwrap());
+        assert!(at_eof.iter().any(|i| i.label == "health"));
+        assert!(
+            !at_eof.iter().any(|i| i.label == "amount"),
+            "a function's param must not leak to class level",
+        );
     }
 }
