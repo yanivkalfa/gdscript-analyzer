@@ -716,6 +716,41 @@ mod tests {
     }
 
     #[test]
+    fn completion_offers_params_in_lambda_setter_and_inline_bodies() {
+        // Regression (bug-hunt): the scope filter must offer a callable's own params inside its body
+        // for ALL callable kinds, not just multi-line `func`s: a top-level named lambda, a `get`/`set`
+        // accessor, and a one-line `func`. (The indentation-only scan missed these, hiding the param.)
+        let cases = [
+            // (source, the param that must be offered, a marker the cursor is placed right after)
+            ("var f := func(px):\n\treturn px\n", "px", "return "),
+            ("var x: int:\n\tset(sv):\n\t\t_x = sv\n", "sv", "_x = "),
+            ("func foo(ia): return ia\n", "ia", "return "),
+        ];
+        for (gd, param, marker) in cases {
+            let mut host = AnalysisHost::new();
+            let mut change = Change::new();
+            change.change_file(FileId(0), gd);
+            change.set_file_path(FileId(0), "res://m.gd");
+            host.apply_change(change);
+            let analysis = host.analysis();
+            let offset = u32::try_from(gd.find(marker).unwrap() + marker.len()).unwrap();
+            let labels: Vec<_> = analysis
+                .completions(FilePosition {
+                    file: FileId(0),
+                    offset,
+                })
+                .unwrap()
+                .into_iter()
+                .map(|i| i.label)
+                .collect();
+            assert!(
+                labels.iter().any(|l| l == param),
+                "param `{param}` should be offered inside its body for {gd:?}, got {labels:?}",
+            );
+        }
+    }
+
+    #[test]
     fn goto_definition_on_a_node_path_jumps_into_the_tscn() {
         // Cursor on `$Btn` → a NavTarget pointing at the `[node name="Btn" …]` line in the owning
         // `.tscn` (the inverse of M1 typing; navigation the engine LSP cannot provide).

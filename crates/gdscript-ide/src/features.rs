@@ -215,40 +215,34 @@ fn is_ident_byte(b: u8) -> bool {
 
 /// Collect the symbol names **visible at `offset`**, deduped. Class-level members (funcs, vars,
 /// consts, signals, enums, the `class_name`, inner classes) are always visible; a parameter or a
-/// local `var`/`const` is offered ONLY when the cursor sits inside its owning function. Enum
-/// variants stay class-level (an anonymous-enum variant is a class-level `int` constant).
+/// local `var`/`const` is offered ONLY when the cursor sits inside its owning callable — a `func`, a
+/// lambda, or a `get`/`set` accessor. Enum variants stay class-level (an anonymous-enum variant is a
+/// class-level `int` constant).
 ///
-/// The enclosing function is found by an **indentation scan**, not the CST `FuncDecl` range: that
-/// range stops at the last body token, so when you type on a fresh (still-empty) line at the end of
-/// a body the cursor is *past* it — a range test would then wrongly hide the function's own
-/// params/locals (worse than over-offering). See `TECH_DEBT.md`.
+/// Scope is decided per-declaration by [`local_in_scope`]: the node's owning callable is the CST
+/// ancestor (so lambdas / accessors / nested closures all work), and "cursor is inside that body" is
+/// CST range containment OR an indentation body-extent check — the latter because the CST range
+/// stops at the last body token, so a cursor typed on a fresh end-of-body line is *past* it and a
+/// range test alone would wrongly hide the body's own params/locals. See `TECH_DEBT.md`.
 fn visible_symbols(db: &dyn Db, file: FileText, offset: u32) -> Vec<CompletionItem> {
     let text = file.text(db);
     let parsed = parse(db, file);
     let root = parsed.syntax_node();
-    // The FuncDecl whose body the cursor sits in (the `func`/`static` token's parent), if any.
-    let enc_range = enclosing_func_offset(text, offset)
-        .and_then(|o| ast::token_at(&root, u32::try_from(o).unwrap_or(0).into()))
-        .map(|t| t.parent().clone())
-        .filter(|n| n.kind() == SyntaxKind::FuncDecl)
-        .map(|n| n.text_range());
-    // A local/param is in scope iff it lies within the enclosing function's range.
-    let in_scope = |node: &GdNode| enc_range.is_some_and(|r| r.contains_range(node.text_range()));
 
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for node in ast::descendants(&root) {
         let (name, kind) = if let Some(decl) = Decl::cast(node.clone()) {
             let Some(name) = decl.name() else { continue };
-            // A `var`/`const` in a func / accessor / lambda body is a LOCAL — scope it; otherwise
-            // it is a class member, always visible.
-            if is_in_callable_body(&node) && !in_scope(&node) {
+            // A `var`/`const` in a callable body is a LOCAL — scope it to that body; otherwise it is
+            // a class member, always visible.
+            if owning_callable(&node).is_some() && !local_in_scope(text, &node, offset) {
                 continue;
             }
             (name, decl_completion_kind(&decl))
         } else if node.kind() == SyntaxKind::Param {
-            // A parameter is visible only inside its own function.
-            if !in_scope(&node) {
+            // A parameter is visible only inside its own callable's body.
+            if !local_in_scope(text, &node, offset) {
                 continue;
             }
             match ast::Param::cast(node.clone())
@@ -278,62 +272,110 @@ fn visible_symbols(db: &dyn Db, file: FileText, offset: u32) -> Vec<CompletionIt
     out
 }
 
-/// Whether `node` is nested inside a callable body (a `func`, a `get`/`set` accessor, or a lambda)
-/// — i.e. a declaration here is a LOCAL, not a class member.
-fn is_in_callable_body(node: &GdNode) -> bool {
+/// The nearest enclosing callable (`func`, lambda, or `get`/`set` accessor) of `node`, or `None`
+/// if `node` is at class level. A declaration inside one is a LOCAL, scoped to that callable's body.
+fn owning_callable(node: &GdNode) -> Option<GdNode> {
     let mut cur = node.parent().cloned();
     while let Some(n) = cur {
         if matches!(
             n.kind(),
             SyntaxKind::FuncDecl | SyntaxKind::Getter | SyntaxKind::Setter | SyntaxKind::LambdaExpr
         ) {
-            return true;
+            return Some(n);
         }
         cur = n.parent().cloned();
     }
-    false
+    None
 }
 
-/// The byte offset of the `func`/`static` keyword of the function whose body contains `offset`,
-/// found by an indentation scan. Walk up from the cursor's line; the first shallower non-blank line
-/// that begins with `func`/`static func` owns the cursor's block — unless a shallower top-level
-/// (indent-0) non-`func` line is reached first, meaning the cursor is at class level. `None` then.
-fn enclosing_func_offset(text: &str, offset: u32) -> Option<usize> {
+/// Whether the param/local `node` is in scope at `offset`: the cursor must sit inside the body of
+/// the node's owning callable. If the cursor is on the callable's own header line (at/after where it
+/// starts), it is the inline-body case (`var f := func(x): |`, `set(v): |`); otherwise the cursor's
+/// line must be within the header's indented body (the multi-line case, robust to the fresh
+/// end-of-body line the CST range omits). Nesting works for free — a closure's body lines are
+/// indented under the enclosing func's header, so the func's locals stay visible there too. The CST
+/// `FuncDecl` range is deliberately NOT used for containment: it absorbs trailing newlines to EOF,
+/// which would wrongly scope a class-level cursor at end of file.
+fn local_in_scope(text: &str, node: &GdNode, offset: u32) -> bool {
+    let Some(callable) = owning_callable(node) else {
+        return false;
+    };
     let bytes = text.as_bytes();
-    let cursor = (offset as usize).min(bytes.len());
-    let mut line_start = cursor;
-    while line_start > 0 && bytes[line_start - 1] != b'\n' {
-        line_start -= 1;
+    // The `func`/`get`/`set` keyword offset — NOT the node's `text_range().start()`, which absorbs
+    // leading trivia (the preceding newline) and would put the header on the previous line.
+    let start = callable_keyword_offset(&callable);
+    let header_ls = line_start(bytes, start as usize);
+    let cursor_ls = line_start(bytes, (offset as usize).min(bytes.len()));
+    if cursor_ls == header_ls {
+        // Inline body: the cursor is on the callable's own header line, at or after where the
+        // callable begins (so `var f := func(x): |` is in the lambda, but a cursor on `|var f` isn't).
+        return offset >= start;
     }
-    let cur_indent = leading_ws(bytes, line_start);
-    let mut min_indent = cur_indent;
-    let mut i = line_start;
-    loop {
-        if i == 0 {
-            return None; // reached the top with no enclosing function
-        }
-        let prev_nl = i - 1; // the '\n' ending the previous line
-        let mut prev_start = prev_nl;
-        while prev_start > 0 && bytes[prev_start - 1] != b'\n' {
-            prev_start -= 1;
-        }
-        let line = &text[prev_start..prev_nl];
-        i = prev_start;
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue; // blank line — does not change block nesting
-        }
-        let li = line.len() - trimmed.len(); // leading-whitespace width
-        if li < min_indent {
-            if starts_a_func(trimmed) {
-                return Some(prev_start + li);
-            }
-            if li == 0 {
-                return None; // a top-level non-`func` header → cursor is at class level
-            }
-            min_indent = li; // a control-flow header (if/for/while/match/…) — keep ascending
-        }
+    cursor_in_indented_body(text, start, offset)
+}
+
+/// The byte offset of a callable's leading keyword (`func`/`static`/`get`/`set`) — the first
+/// non-trivia token of the node. Used instead of `text_range().start()`, which includes the leading
+/// trivia (e.g. the preceding newline) attached to the node by the tree sink.
+fn callable_keyword_offset(node: &GdNode) -> u32 {
+    node.descendants_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .find(|t| !t.kind().is_trivia())
+        .map_or_else(
+            || u32::from(node.text_range().start()),
+            |t| u32::from(t.text_range().start()),
+        )
+}
+
+/// Whether `cursor` sits on a line below the callable header at `header_off` that is still part of
+/// the header's indented body — i.e. the cursor's line, and every non-blank line between, is
+/// indented deeper than the header. Robust to the fresh end-of-body line the CST range omits.
+fn cursor_in_indented_body(text: &str, header_off: u32, cursor: u32) -> bool {
+    let bytes = text.as_bytes();
+    let header_ls = line_start(bytes, header_off as usize);
+    let header_indent = leading_ws(bytes, header_ls);
+    let cursor = (cursor as usize).min(bytes.len());
+    let cursor_ls = line_start(bytes, cursor);
+    if cursor_ls <= header_ls {
+        return false; // the cursor is on the header line or above (handled by range containment)
     }
+    // The cursor's own line must be indented deeper than the header (its leading whitespace — what
+    // the user has typed so far on a fresh line).
+    if leading_ws(bytes, cursor_ls) <= header_indent {
+        return false;
+    }
+    // No non-blank line strictly between the header and the cursor may dedent back to the header.
+    let mut pos = line_end(bytes, header_ls);
+    while pos < cursor_ls {
+        pos += 1; // step past the '\n' onto the next line's start
+        if pos >= cursor_ls {
+            break;
+        }
+        let eol = line_end(bytes, pos);
+        if !text[pos..eol].trim().is_empty() && leading_ws(bytes, pos) <= header_indent {
+            return false;
+        }
+        pos = eol;
+    }
+    true
+}
+
+/// The start offset of the line containing `off` (just after the preceding `\n`, or 0).
+fn line_start(bytes: &[u8], off: usize) -> usize {
+    let mut s = off.min(bytes.len());
+    while s > 0 && bytes[s - 1] != b'\n' {
+        s -= 1;
+    }
+    s
+}
+
+/// The end offset of the line starting at `ls` (the next `\n`, or end of text).
+fn line_end(bytes: &[u8], ls: usize) -> usize {
+    let mut e = ls;
+    while e < bytes.len() && bytes[e] != b'\n' {
+        e += 1;
+    }
+    e
 }
 
 /// Leading-whitespace (space/tab) width of the line starting at `line_start`.
@@ -343,18 +385,6 @@ fn leading_ws(bytes: &[u8], line_start: usize) -> usize {
         i += 1;
     }
     i - line_start
-}
-
-/// Whether a trimmed line begins a function declaration (`func …` or `static func …`).
-fn starts_a_func(trimmed: &str) -> bool {
-    let is_func_kw = |s: &str| {
-        s.strip_prefix("func")
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '(']))
-    };
-    is_func_kw(trimmed)
-        || trimmed
-            .strip_prefix("static")
-            .is_some_and(|rest| rest.starts_with([' ', '\t']) && is_func_kw(rest.trim_start()))
 }
 
 fn decl_completion_kind(decl: &Decl) -> CompletionKind {
