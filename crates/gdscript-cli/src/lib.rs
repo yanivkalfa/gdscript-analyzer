@@ -72,8 +72,8 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
             let cfg = resolve_config(g, &p.paths)?;
             run_diagnostics(p, g, DiagFilter::WarningsOnly, &cfg)
         }
-        // `symbols` (data) and `format` (Phase-5 passthrough) don't consume config options, but an
-        // explicit `--config <bad file>` must still surface as a config error (exit 2) — so validate it.
+        // `symbols` (data) and `format` don't consume the lint config options, but an explicit
+        // `--config <bad file>` must still surface as a config error (exit 2) — so validate it.
         Command::Symbols(p) => {
             resolve_config(g, &p.paths)?;
             run_symbols(p, g)
@@ -144,8 +144,8 @@ fn run_symbols(paths: &PathsArg, g: &GlobalArgs) -> anyhow::Result<i32> {
     Ok(EXIT_OK)
 }
 
-/// `format`: Phase 5 is a passthrough (identity) — no file is ever changed. `--check`/`--write` are
-/// accepted plumbing; the real formatter is Phase 6.
+/// `format`: normalize each file via [`gdscript_fmt`]. Default streams to stdout; `--check` reports
+/// + exits 1 on any change; `--write` rewrites changed files in place.
 fn run_format(args: &FormatArgs, g: &GlobalArgs) -> i32 {
     let project = Project::load(&args.paths.paths);
     print_load_errors(&project);
