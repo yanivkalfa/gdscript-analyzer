@@ -571,7 +571,10 @@ mod tests {
             labels.contains(&"Ok") && labels.contains(&"Cancel"),
             "{labels:?}"
         );
-        assert!(!labels.contains(&"func"), "node-path, not keyword completion");
+        assert!(
+            !labels.contains(&"func"),
+            "node-path, not keyword completion"
+        );
     }
 
     #[test]
@@ -640,7 +643,10 @@ mod tests {
             .map(|i| i.label)
             .collect();
         // By-name completion ran (keywords present), node-path did not hijack the modulo.
-        assert!(labels.iter().any(|l| l == "func"), "expected by-name completion: {labels:?}");
+        assert!(
+            labels.iter().any(|l| l == "func"),
+            "expected by-name completion: {labels:?}"
+        );
     }
 
     #[test]
@@ -699,8 +705,14 @@ mod tests {
             })
             .unwrap();
         let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
-        assert!(labels.contains(&"member_v") && labels.contains(&"a"), "{labels:?}");
-        assert!(!labels.contains(&"la"), "a()'s local must not leak to class level: {labels:?}");
+        assert!(
+            labels.contains(&"member_v") && labels.contains(&"a"),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"la"),
+            "a()'s local must not leak to class level: {labels:?}"
+        );
     }
 
     #[test]

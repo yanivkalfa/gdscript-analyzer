@@ -1133,7 +1133,11 @@ mod tests {
             },
         );
         let open = next_diagnostics(&client);
-        assert!(open.diagnostics.is_empty(), "clean open: {:?}", open.diagnostics);
+        assert!(
+            open.diagnostics.is_empty(),
+            "clean open: {:?}",
+            open.diagnostics
+        );
 
         for (v, text) in [
             (2, "func f():\n\tvar a := 9\n"),

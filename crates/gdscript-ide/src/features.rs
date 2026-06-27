@@ -519,7 +519,8 @@ mod tests {
         let (db, ft) = db_ft(src);
         // Cursor INSIDE take_damage's body (right after the body tab) — its param `amount` is in
         // scope here. Completion is scope-aware, so the param is offered only inside its function.
-        let inside = u32::try_from("var health = 100\nfunc take_damage(amount):\n\t".len()).unwrap();
+        let inside =
+            u32::try_from("var health = 100\nfunc take_damage(amount):\n\t".len()).unwrap();
         let items = completions(&db, ft, inside);
         assert!(
             items
@@ -532,7 +533,10 @@ mod tests {
                 .iter()
                 .any(|i| i.label == "take_damage" && i.kind == CompletionKind::Function)
         );
-        assert!(items.iter().any(|i| i.label == "amount"), "param visible inside its body");
+        assert!(
+            items.iter().any(|i| i.label == "amount"),
+            "param visible inside its body"
+        );
 
         // At class level (end of file, indent 0) the param is NOT visible; members still are.
         let at_eof = completions(&db, ft, u32::try_from(src.len()).unwrap());

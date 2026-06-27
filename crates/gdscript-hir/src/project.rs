@@ -198,8 +198,7 @@ mod tests {
     #[test]
     fn engine_version_picks_the_version_shaped_entry_anywhere_in_the_array() {
         // The version need not be first; feature tags (rendering, etc.) are skipped.
-        let src =
-            "[application]\nconfig/features=PackedStringArray(\"Forward Plus\", \"4.6\", \"Mobile\")\n";
+        let src = "[application]\nconfig/features=PackedStringArray(\"Forward Plus\", \"4.6\", \"Mobile\")\n";
         assert_eq!(parse_engine_version(src), Some((4, 6)));
     }
 
@@ -218,7 +217,10 @@ mod tests {
     #[test]
     fn engine_version_none_when_absent_or_no_version_entry() {
         assert_eq!(parse_engine_version(""), None);
-        assert_eq!(parse_engine_version("[application]\nconfig/name=\"X\"\n"), None);
+        assert_eq!(
+            parse_engine_version("[application]\nconfig/name=\"X\"\n"),
+            None
+        );
         // config/features outside [application] is not the engine version.
         assert_eq!(
             parse_engine_version("[rendering]\nconfig/features=PackedStringArray(\"4.6\")\n"),

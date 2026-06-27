@@ -872,7 +872,11 @@ mod tests {
         let refs = find_references(&db, pos(0, "x", 0, src));
         let count = |k| refs.iter().filter(|r| r.kind == k).count();
         assert_eq!(count(ReferenceKind::Declaration), 1, "{refs:?}");
-        assert_eq!(count(ReferenceKind::Write), 3, "x=1, x+=2, self.x=3: {refs:?}");
+        assert_eq!(
+            count(ReferenceKind::Write),
+            3,
+            "x=1, x+=2, self.x=3: {refs:?}"
+        );
         assert_eq!(count(ReferenceKind::Read), 1, "var y := x: {refs:?}");
     }
 

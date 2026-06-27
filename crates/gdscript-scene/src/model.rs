@@ -348,7 +348,10 @@ impl SceneModel {
         if p.is_empty() || p == "." || p.starts_with('/') {
             return None;
         }
-        let segs: Vec<&str> = p.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+        let segs: Vec<&str> = p
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
         let mut cur = base;
         for (i, seg) in segs.iter().enumerate() {
             if *seg == ".." {

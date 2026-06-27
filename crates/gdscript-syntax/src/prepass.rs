@@ -202,7 +202,10 @@ impl PrePass<'_> {
                         .last()
                         .is_some_and(|ctx| ctx.open_bracket_depth == self.bracket_depth)
                 {
-                    self.close_lambdas_on_bracket(self.bracket_depth.saturating_sub(1), tok.range.start());
+                    self.close_lambdas_on_bracket(
+                        self.bracket_depth.saturating_sub(1),
+                        tok.range.start(),
+                    );
                 }
                 self.out.push(*tok);
                 self.track_bracket(tok.kind);
