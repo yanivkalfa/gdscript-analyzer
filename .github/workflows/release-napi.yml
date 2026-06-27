@@ -126,6 +126,16 @@ jobs:
           registry-url: "https://registry.npmjs.org" # writes .npmrc (required for provenance)
       - name: npm install
         run: npm install
+      # release-plz bumps the Rust crate version in Cargo.toml but NOT this JS package.json, so a tag
+      # run would otherwise try to publish the stale version and fail ("cannot publish over X"). Sync
+      # the npm version to the workspace version BEFORE assembling the per-platform packages, so
+      # `create-npm-dirs` + `prepublish` (which writes the per-platform optionalDependencies) all use
+      # the release version.
+      - name: Sync the npm package version to the workspace version
+        run: |
+          VER=$(grep -m1 '^version' ../../Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Publishing @gdscript-analyzer/core@$VER (from Cargo.toml)"
+          npm pkg set version="$VER"
       - name: Create npm dirs
         run: npm exec napi create-npm-dirs
       - name: Download all build artifacts
