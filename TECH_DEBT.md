@@ -646,6 +646,16 @@ file-level scan, gated by the existing seam). Landed in M1: `EMPTY_FILE`, `UNUSE
 
 ### W3/W4/W5 — Phase-6 deferrals (infra needing CI services or measurement-first decisions)
 
+- [ ] **W3 — formatter reflow / gdformat parity.** Landed: the `gdscript-fmt` crate — a
+      safe-by-construction whitespace + **block-indentation** normalizer (re-emits the pre-pass
+      token stream, every significant token verbatim, with a re-parse significant-token-equality
+      fallback), wired into `Analysis::format` + the CLI (`format --check/--write`/stdout) + LSP
+      `textDocument/formatting`. Deferred (the bulk of `gdformat` parity): the **Wadler/Prettier
+      `Doc` IR + line-reflow** (wrapping long calls/arrays/dicts to `line_width`), **intra-line
+      spacing normalization** (one space around binary operators, after commas/colons), a blank-line
+      policy (2 between top-level defs / 1 inside), and `format_range`. The reflow tail is additive
+      on the established `format()` API + safety net; pair it with a `gdformat`-differential golden
+      corpus + a `DEVIATIONS.md`.
 - [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page. Deferred: the W6 **contract page** (authored with the freeze — it embeds the verbatim semver policy + the Godot-version matrix); CI-built `examples/` exercising the public API; the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates); playground-as-live-docs deep links.
 - [ ] **CLI `--strict` / `--engine-defaults` override.** Today the strictness is chosen by `project.godot` presence (standalone = strict, project = engine defaults). An explicit CLI flag to force either mode regardless needs a host-level settings override (the gate's settings selection is in `type_diagnostics`, keyed on `project_config()`); thread a "force strict" toggle through the `Db` or inject a synthetic `WarningSettings`.
