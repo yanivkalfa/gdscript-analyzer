@@ -540,6 +540,217 @@ mod tests {
     }
 
     #[test]
+    fn unique_node_path_completion_offers_children() {
+        // `%Box/` resolves the unique node `Box` scene-wide and offers its children, typed by `type=`.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let scene = "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Box\" type=\"Panel\" parent=\".\"]\n\
+             unique_name_in_owner = true\n\
+             [node name=\"Ok\" type=\"Button\" parent=\"Box\"]\n\
+             [node name=\"Cancel\" type=\"Button\" parent=\"Box\"]\n";
+        change.change_file(FileId(0), scene);
+        change.set_file_path(FileId(0), "res://main.tscn");
+        let gd = "extends Control\nfunc _ready():\n\tvar b := %Box/\n";
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        let offset = u32::try_from(gd.find("%Box/").unwrap() + "%Box/".len()).unwrap();
+        let items = analysis
+            .completions(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap();
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Ok") && labels.contains(&"Cancel"),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"func"),
+            "node-path, not keyword completion"
+        );
+    }
+
+    #[test]
+    fn bare_percent_offers_all_unique_nodes() {
+        // A bare `%` offers every unique node in the owning scene (scene-wide), not just children.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let scene = "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Box\" type=\"Panel\" parent=\".\"]\n\
+             unique_name_in_owner = true\n\
+             [node name=\"Hud\" type=\"Control\" parent=\".\"]\n\
+             unique_name_in_owner = true\n";
+        change.change_file(FileId(0), scene);
+        change.set_file_path(FileId(0), "res://main.tscn");
+        let gd = "extends Control\nfunc _ready():\n\tvar b := %\n";
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        let offset = u32::try_from(gd.find("%\n").unwrap() + 1).unwrap();
+        let labels: Vec<_> = analysis
+            .completions(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(
+            labels.iter().any(|l| l == "Box") && labels.iter().any(|l| l == "Hud"),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn percent_modulo_is_not_hijacked_as_a_unique_path() {
+        // `count % Box` is modulo, not a unique-node path — completion must stay by-name (the parsed
+        // `%` token's parent is `BinExpr`, not `UniqueNodeExpr`).
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let scene = "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Box\" type=\"Panel\" parent=\".\"]\n\
+             unique_name_in_owner = true\n";
+        change.change_file(FileId(0), scene);
+        change.set_file_path(FileId(0), "res://main.tscn");
+        let gd = "extends Control\nfunc _ready():\n\tvar count := 10\n\tvar b := count %Box\n";
+        change.change_file(FileId(1), gd);
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        let offset = u32::try_from(gd.find("%Box").unwrap() + "%Box".len()).unwrap();
+        let labels: Vec<_> = analysis
+            .completions(FilePosition {
+                file: FileId(1),
+                offset,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        // By-name completion ran (keywords present), node-path did not hijack the modulo.
+        assert!(
+            labels.iter().any(|l| l == "func"),
+            "expected by-name completion: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_is_scope_aware_for_locals_and_params() {
+        // By-name completion must offer class members everywhere, but a parameter / local of one
+        // function must NOT leak into a sibling function. The enclosing function is found by
+        // indentation, so completing on a fresh (empty) indented line at the end of a body still
+        // sees that body's own params/locals (the case the CST-range approach regressed).
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let gd = "var member_v := 0\nfunc a(pa):\n\tvar la := 1\n\t\nfunc b(pb):\n\tvar lb := 2\n";
+        change.change_file(FileId(0), gd);
+        change.set_file_path(FileId(0), "res://m.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        // Cursor on the empty indented line inside a() (right after the body's tab).
+        let upto = "var member_v := 0\nfunc a(pa):\n\tvar la := 1\n\t";
+        let offset = u32::try_from(gd.find(upto).unwrap() + upto.len()).unwrap();
+        let items = analysis
+            .completions(FilePosition {
+                file: FileId(0),
+                offset,
+            })
+            .unwrap();
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        // Own param + own local + the class member + both func names are visible.
+        assert!(labels.contains(&"pa"), "own param `pa`: {labels:?}");
+        assert!(labels.contains(&"la"), "own local `la`: {labels:?}");
+        assert!(labels.contains(&"member_v"), "class member: {labels:?}");
+        assert!(
+            labels.contains(&"a") && labels.contains(&"b"),
+            "sibling func names: {labels:?}",
+        );
+        // b()'s param + local must NOT leak into a().
+        assert!(!labels.contains(&"pb"), "leaked b's param: {labels:?}");
+        assert!(!labels.contains(&"lb"), "leaked b's local: {labels:?}");
+    }
+
+    #[test]
+    fn completion_at_class_level_offers_members_not_locals() {
+        // At class level (no enclosing function) only members are offered — no function's locals.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        let gd = "var member_v := 0\nfunc a():\n\tvar la := 1\n\nm\n";
+        change.change_file(FileId(0), gd);
+        change.set_file_path(FileId(0), "res://m.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+        // Cursor after the top-level `m` (class level, indent 0).
+        let offset = u32::try_from(gd.rfind('m').unwrap() + 1).unwrap();
+        let items = analysis
+            .completions(FilePosition {
+                file: FileId(0),
+                offset,
+            })
+            .unwrap();
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"member_v") && labels.contains(&"a"),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"la"),
+            "a()'s local must not leak to class level: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_offers_params_in_lambda_setter_and_inline_bodies() {
+        // Regression (bug-hunt): the scope filter must offer a callable's own params inside its body
+        // for ALL callable kinds, not just multi-line `func`s: a top-level named lambda, a `get`/`set`
+        // accessor, and a one-line `func`. (The indentation-only scan missed these, hiding the param.)
+        let cases = [
+            // (source, the param that must be offered, a marker the cursor is placed right after)
+            ("var f := func(px):\n\treturn px\n", "px", "return "),
+            ("var x: int:\n\tset(sv):\n\t\t_x = sv\n", "sv", "_x = "),
+            ("func foo(ia): return ia\n", "ia", "return "),
+        ];
+        for (gd, param, marker) in cases {
+            let mut host = AnalysisHost::new();
+            let mut change = Change::new();
+            change.change_file(FileId(0), gd);
+            change.set_file_path(FileId(0), "res://m.gd");
+            host.apply_change(change);
+            let analysis = host.analysis();
+            let offset = u32::try_from(gd.find(marker).unwrap() + marker.len()).unwrap();
+            let labels: Vec<_> = analysis
+                .completions(FilePosition {
+                    file: FileId(0),
+                    offset,
+                })
+                .unwrap()
+                .into_iter()
+                .map(|i| i.label)
+                .collect();
+            assert!(
+                labels.iter().any(|l| l == param),
+                "param `{param}` should be offered inside its body for {gd:?}, got {labels:?}",
+            );
+        }
+    }
+
+    #[test]
     fn goto_definition_on_a_node_path_jumps_into_the_tscn() {
         // Cursor on `$Btn` → a NavTarget pointing at the `[node name="Btn" …]` line in the owning
         // `.tscn` (the inverse of M1 typing; navigation the engine LSP cannot provide).

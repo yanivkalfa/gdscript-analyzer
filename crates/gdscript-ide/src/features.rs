@@ -205,7 +205,7 @@ pub fn completions(db: &dyn Db, file: FileText, offset: u32) -> Vec<CompletionIt
             detail: None,
         })
         .collect();
-    items.extend(local_symbols(db, file));
+    items.extend(visible_symbols(db, file, offset));
     items
 }
 
@@ -213,17 +213,38 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Collect document-local symbol names (declarations, params, enum variants), deduped.
-/// Not scope-aware in Tier 0 — every name in the file is offered.
-fn local_symbols(db: &dyn Db, file: FileText) -> Vec<CompletionItem> {
+/// Collect the symbol names **visible at `offset`**, deduped. Class-level members (funcs, vars,
+/// consts, signals, enums, the `class_name`, inner classes) are always visible; a parameter or a
+/// local `var`/`const` is offered ONLY when the cursor sits inside its owning callable — a `func`, a
+/// lambda, or a `get`/`set` accessor. Enum variants stay class-level (an anonymous-enum variant is a
+/// class-level `int` constant).
+///
+/// Scope is decided per-declaration by [`local_in_scope`]: the node's owning callable is the CST
+/// ancestor (so lambdas / accessors / nested closures all work), and "cursor is inside that body" is
+/// CST range containment OR an indentation body-extent check — the latter because the CST range
+/// stops at the last body token, so a cursor typed on a fresh end-of-body line is *past* it and a
+/// range test alone would wrongly hide the body's own params/locals. See `TECH_DEBT.md`.
+fn visible_symbols(db: &dyn Db, file: FileText, offset: u32) -> Vec<CompletionItem> {
+    let text = file.text(db);
     let parsed = parse(db, file);
+    let root = parsed.syntax_node();
+
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for node in ast::descendants(&parsed.syntax_node()) {
+    for node in ast::descendants(&root) {
         let (name, kind) = if let Some(decl) = Decl::cast(node.clone()) {
             let Some(name) = decl.name() else { continue };
+            // A `var`/`const` in a callable body is a LOCAL — scope it to that body; otherwise it is
+            // a class member, always visible.
+            if owning_callable(&node).is_some() && !local_in_scope(text, &node, offset) {
+                continue;
+            }
             (name, decl_completion_kind(&decl))
         } else if node.kind() == SyntaxKind::Param {
+            // A parameter is visible only inside its own callable's body.
+            if !local_in_scope(text, &node, offset) {
+                continue;
+            }
             match ast::Param::cast(node.clone())
                 .and_then(|p| p.name())
                 .and_then(|n| n.text())
@@ -249,6 +270,121 @@ fn local_symbols(db: &dyn Db, file: FileText) -> Vec<CompletionItem> {
         }
     }
     out
+}
+
+/// The nearest enclosing callable (`func`, lambda, or `get`/`set` accessor) of `node`, or `None`
+/// if `node` is at class level. A declaration inside one is a LOCAL, scoped to that callable's body.
+fn owning_callable(node: &GdNode) -> Option<GdNode> {
+    let mut cur = node.parent().cloned();
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            SyntaxKind::FuncDecl | SyntaxKind::Getter | SyntaxKind::Setter | SyntaxKind::LambdaExpr
+        ) {
+            return Some(n);
+        }
+        cur = n.parent().cloned();
+    }
+    None
+}
+
+/// Whether the param/local `node` is in scope at `offset`: the cursor must sit inside the body of
+/// the node's owning callable. If the cursor is on the callable's own header line (at/after where it
+/// starts), it is the inline-body case (`var f := func(x): |`, `set(v): |`); otherwise the cursor's
+/// line must be within the header's indented body (the multi-line case, robust to the fresh
+/// end-of-body line the CST range omits). Nesting works for free — a closure's body lines are
+/// indented under the enclosing func's header, so the func's locals stay visible there too. The CST
+/// `FuncDecl` range is deliberately NOT used for containment: it absorbs trailing newlines to EOF,
+/// which would wrongly scope a class-level cursor at end of file.
+fn local_in_scope(text: &str, node: &GdNode, offset: u32) -> bool {
+    let Some(callable) = owning_callable(node) else {
+        return false;
+    };
+    let bytes = text.as_bytes();
+    // The `func`/`get`/`set` keyword offset — NOT the node's `text_range().start()`, which absorbs
+    // leading trivia (the preceding newline) and would put the header on the previous line.
+    let start = callable_keyword_offset(&callable);
+    let header_ls = line_start(bytes, start as usize);
+    let cursor_ls = line_start(bytes, (offset as usize).min(bytes.len()));
+    if cursor_ls == header_ls {
+        // Inline body: the cursor is on the callable's own header line, at or after where the
+        // callable begins (so `var f := func(x): |` is in the lambda, but a cursor on `|var f` isn't).
+        return offset >= start;
+    }
+    cursor_in_indented_body(text, start, offset)
+}
+
+/// The byte offset of a callable's leading keyword (`func`/`static`/`get`/`set`) — the first
+/// non-trivia token of the node. Used instead of `text_range().start()`, which includes the leading
+/// trivia (e.g. the preceding newline) attached to the node by the tree sink.
+fn callable_keyword_offset(node: &GdNode) -> u32 {
+    node.descendants_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .find(|t| !t.kind().is_trivia())
+        .map_or_else(
+            || u32::from(node.text_range().start()),
+            |t| u32::from(t.text_range().start()),
+        )
+}
+
+/// Whether `cursor` sits on a line below the callable header at `header_off` that is still part of
+/// the header's indented body — i.e. the cursor's line, and every non-blank line between, is
+/// indented deeper than the header. Robust to the fresh end-of-body line the CST range omits.
+fn cursor_in_indented_body(text: &str, header_off: u32, cursor: u32) -> bool {
+    let bytes = text.as_bytes();
+    let header_ls = line_start(bytes, header_off as usize);
+    let header_indent = leading_ws(bytes, header_ls);
+    let cursor = (cursor as usize).min(bytes.len());
+    let cursor_ls = line_start(bytes, cursor);
+    if cursor_ls <= header_ls {
+        return false; // the cursor is on the header line or above (handled by range containment)
+    }
+    // The cursor's own line must be indented deeper than the header (its leading whitespace — what
+    // the user has typed so far on a fresh line).
+    if leading_ws(bytes, cursor_ls) <= header_indent {
+        return false;
+    }
+    // No non-blank line strictly between the header and the cursor may dedent back to the header.
+    let mut pos = line_end(bytes, header_ls);
+    while pos < cursor_ls {
+        pos += 1; // step past the '\n' onto the next line's start
+        if pos >= cursor_ls {
+            break;
+        }
+        let eol = line_end(bytes, pos);
+        if !text[pos..eol].trim().is_empty() && leading_ws(bytes, pos) <= header_indent {
+            return false;
+        }
+        pos = eol;
+    }
+    true
+}
+
+/// The start offset of the line containing `off` (just after the preceding `\n`, or 0).
+fn line_start(bytes: &[u8], off: usize) -> usize {
+    let mut s = off.min(bytes.len());
+    while s > 0 && bytes[s - 1] != b'\n' {
+        s -= 1;
+    }
+    s
+}
+
+/// The end offset of the line starting at `ls` (the next `\n`, or end of text).
+fn line_end(bytes: &[u8], ls: usize) -> usize {
+    let mut e = ls;
+    while e < bytes.len() && bytes[e] != b'\n' {
+        e += 1;
+    }
+    e
+}
+
+/// Leading-whitespace (space/tab) width of the line starting at `line_start`.
+fn leading_ws(bytes: &[u8], line_start: usize) -> usize {
+    let mut i = line_start;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    i - line_start
 }
 
 fn decl_completion_kind(decl: &Decl) -> CompletionKind {
@@ -411,7 +547,11 @@ mod tests {
     fn completion_offers_keywords_and_locals() {
         let src = "var health = 100\nfunc take_damage(amount):\n\tpass\n";
         let (db, ft) = db_ft(src);
-        let items = completions(&db, ft, u32::try_from(src.len()).unwrap());
+        // Cursor INSIDE take_damage's body (right after the body tab) — its param `amount` is in
+        // scope here. Completion is scope-aware, so the param is offered only inside its function.
+        let inside =
+            u32::try_from("var health = 100\nfunc take_damage(amount):\n\t".len()).unwrap();
+        let items = completions(&db, ft, inside);
         assert!(
             items
                 .iter()
@@ -423,6 +563,17 @@ mod tests {
                 .iter()
                 .any(|i| i.label == "take_damage" && i.kind == CompletionKind::Function)
         );
-        assert!(items.iter().any(|i| i.label == "amount"));
+        assert!(
+            items.iter().any(|i| i.label == "amount"),
+            "param visible inside its body"
+        );
+
+        // At class level (end of file, indent 0) the param is NOT visible; members still are.
+        let at_eof = completions(&db, ft, u32::try_from(src.len()).unwrap());
+        assert!(at_eof.iter().any(|i| i.label == "health"));
+        assert!(
+            !at_eof.iter().any(|i| i.label == "amount"),
+            "a function's param must not leak to class level",
+        );
     }
 }

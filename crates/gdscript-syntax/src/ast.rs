@@ -97,13 +97,29 @@ fn token_text(node: &GdNode, kind: SyntaxKind) -> Option<String> {
         .map(|t| t.text().to_owned())
 }
 
+/// The text of the first direct child token usable as a *name* — the grammar's `at_name`
+/// whitelist: an `Ident`, or one of the soft keywords `match`/`when` (Godot's `is_identifier()`
+/// permits both as identifiers). Without this, a symbol named `match`/`when` is silently dropped at
+/// the AST layer because its token is `MatchKw`/`WhenKw`, not `Ident`. See `TECH_DEBT.md`.
+fn name_token_text(node: &GdNode) -> Option<String> {
+    node.children_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .find(|t| {
+            matches!(
+                t.kind(),
+                SyntaxKind::Ident | SyntaxKind::MatchKw | SyntaxKind::WhenKw
+            )
+        })
+        .map(|t| t.text().to_owned())
+}
+
 // ---- accessors ------------------------------------------------------------------
 
 impl Name {
-    /// The identifier text.
+    /// The identifier text (incl. the soft-keyword names `match`/`when`).
     #[must_use]
     pub fn text(&self) -> Option<String> {
-        token_text(&self.0, SyntaxKind::Ident)
+        name_token_text(&self.0)
     }
 }
 
@@ -201,10 +217,10 @@ impl EnumDecl {
 }
 
 impl EnumVariant {
-    /// The variant name.
+    /// The variant name (incl. the soft-keyword names `match`/`when`).
     #[must_use]
     pub fn text(&self) -> Option<String> {
-        token_text(&self.0, SyntaxKind::Ident)
+        name_token_text(&self.0)
     }
 }
 

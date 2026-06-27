@@ -334,6 +334,52 @@ impl SceneModel {
         }
     }
 
+    /// If walking `path` from `base` descends INTO an instanced sub-scene — the walk reaches an
+    /// instance node whose next (plain) child segment lives *inside* that sub-scene — return
+    /// `(instance_node, remaining_tail)` so the caller can continue the walk in the sub-scene's own
+    /// tree (`$Enemy/Sprite` → resolve `Enemy`, then resolve `Sprite` in `enemy.tscn`). `None` if the
+    /// path resolves wholly within this scene, escapes (`..`/absolute), or misses somewhere that is
+    /// not exactly an instance node — an override child *under* an instance stays unresolved here
+    /// (typed `Node`, no false warning), since mapping it back into the sub-scene needs more than the
+    /// boundary node. The boundary returned is the instance node itself.
+    #[must_use]
+    pub fn resolve_into_instance(&self, base: NodeIdx, path: &str) -> Option<(NodeIdx, String)> {
+        let p = path.trim();
+        if p.is_empty() || p == "." || p.starts_with('/') {
+            return None;
+        }
+        let segs: Vec<&str> = p
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
+        let mut cur = base;
+        for (i, seg) in segs.iter().enumerate() {
+            if *seg == ".." {
+                return None;
+            }
+            match self.step_segment(cur, seg) {
+                Some(next) => cur = next,
+                None => {
+                    return if !seg.starts_with('%')
+                        && self.node(cur).is_some_and(|n| n.instance.is_some())
+                    {
+                        Some((cur, segs[i..].join("/")))
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+        None // resolved wholly within this scene
+    }
+
+    /// The `%`-sigil counterpart of [`resolve_into_instance`](Self::resolve_into_instance): a
+    /// `%Unique/Tail` whose `%Unique` is an instance node and `Tail` descends into the sub-scene.
+    #[must_use]
+    pub fn resolve_unique_into_instance(&self, path: &str) -> Option<(NodeIdx, String)> {
+        self.resolve_into_instance(self.root?, &Self::with_unique_head(path))
+    }
+
     /// Whether `start` or any ancestor (up to the root) is an instance boundary (`instance=` /
     /// `instance_placeholder` / an inherited-scene root) — i.e. a missing tail below it lives in a
     /// sub-scene we don't recurse into, not a genuine dangling/missing node. Depth-bounded.

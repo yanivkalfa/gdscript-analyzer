@@ -480,6 +480,10 @@ impl Parser<'_> {
     /// member loop skips terminators.
     fn stmt(&mut self) {
         match self.nth(0) {
+            // A statement-level annotation (`@warning_ignore("…")`, `@warning_ignore_start(…)`, …)
+            // decorates the following statement. Like a member annotation it is a sibling node; the
+            // block loop parses the decorated statement next.
+            At => self.annotation(),
             IfKw => self.if_stmt(),
             ForKw => self.for_stmt(),
             WhileKw => self.while_stmt(),

@@ -179,6 +179,27 @@ pub fn autoload_registry(db: &dyn Db, config: ProjectConfig) -> Arc<AutoloadRegi
     Arc::new(AutoloadRegistry { singletons })
 }
 
+/// The Godot engine `(major, minor)` declared by `project.godot`'s `[application]`
+/// `config/features`, or `None` if unspecified. Keyed on [`ProjectConfig`] alone (MEDIUM
+/// durability), so it backdates across `.gd` body edits — the same cross-file firewall as
+/// [`autoload_registry`].
+///
+/// Phase-5 plumbing: the value is exposed for engine-API-model selection, but only ONE engine model
+/// is bundled today (`gdscript_api::GODOT_VERSION`), so it is currently informational. Phase 6
+/// (multi-version bundling via the Godot-sync job) will use it to pick the matching `ApiInput`,
+/// snapping to the nearest bundled minor and defaulting to the newest when absent.
+#[salsa::tracked]
+pub fn engine_version(db: &dyn Db, config: ProjectConfig) -> Option<(u32, u32)> {
+    crate::project::parse_engine_version(config.project_godot_text(db))
+}
+
+/// Convenience over [`engine_version`]: the project's declared engine `(major, minor)`, or `None`
+/// when there is no `project.godot` or it declares no version.
+#[must_use]
+pub fn project_engine_version(db: &dyn Db) -> Option<(u32, u32)> {
+    engine_version(db, db.project_config()?)
+}
+
 /// One member of a script class, as a cross-file reference sees it (a resolved type, never a
 /// byte range).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1386,6 +1407,26 @@ mod tests {
     }
 
     #[test]
+    fn engine_version_from_project_config_is_firewalled_against_body_edits() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "func f():\n\tpass\n", Durability::LOW);
+        db.set_file_path(FileId(0), "res://main.gd");
+        db.set_project_config("[application]\nconfig/features=PackedStringArray(\"4.6\")\n");
+        db.sync_source_root();
+        assert_eq!(project_engine_version(&db), Some((4, 6)));
+
+        // A `.gd` body edit must NOT change the project's declared engine version (the query is
+        // keyed on ProjectConfig alone — the cross-file firewall).
+        db.set_file_text(FileId(0), "func f():\n\tvar x := 1\n", Durability::LOW);
+        db.sync_source_root();
+        assert_eq!(project_engine_version(&db), Some((4, 6)));
+
+        // No `project.godot` → no declared version.
+        let empty = RootDatabase::default();
+        assert_eq!(project_engine_version(&empty), None);
+    }
+
+    #[test]
     fn star_autoload_gdscript_resolves_as_global_and_members() {
         let mut db = RootDatabase::default();
         // `game.gd` has NO class_name — the autoload resolves it by PATH (not the class registry).
@@ -1858,6 +1899,46 @@ mod tests {
         assert!(
             binding_labels(&db).iter().any(|l| l == "int"),
             "$Enemy.hp() should recurse into the instanced sub-scene root's script Enemy",
+        );
+    }
+
+    #[test]
+    fn path_into_an_instanced_subscene_types_the_inner_node() {
+        // main.tscn: Root(script=main.gd) > Enemy(instance=enemy.tscn). enemy.tscn: Enemy(Node2D) >
+        // Sprite(Sprite2D). M3 typed `$Enemy` itself; this §4b step continues the walk INTO the
+        // sub-scene, so `$Enemy/Sprite` types as `Sprite2D` (the inner node), not bare `Node`.
+        // `$Enemy/Nope` stays `Node` with NO false INVALID_NODE_PATH (binding_labels asserts zero
+        // diagnostics).
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://enemy.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Enemy\" parent=\".\" instance=ExtResource(\"2\")]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar s := $Enemy/Sprite\n\tvar n := $Enemy/Nope\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_file_text(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [node name=\"Enemy\" type=\"Node2D\"]\n\
+             [node name=\"Sprite\" type=\"Sprite2D\" parent=\".\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://enemy.tscn");
+        db.sync_source_root();
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Sprite2D"),
+            "$Enemy/Sprite should type as the sub-scene's Sprite (Sprite2D)",
         );
     }
 
