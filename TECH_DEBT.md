@@ -190,7 +190,12 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
 ### IDE features (Tier 0 → Tier 1)
 - [ ] **Completions are not scope-aware.** By-name completion offers *every* document
       symbol, not just names visible in the enclosing scope. Acceptable for Tier 0;
-      scope-awareness comes with the HIR.
+      scope-awareness comes with the HIR. **Attempted + deferred (Phase-5):** a naive
+      enclosing-function filter is a *regression* — the CST `FuncDecl` range does not extend to the
+      end-of-function-body cursor (where you typically type), so it would HIDE the enclosing
+      function's own params/locals (worse than today's over-offering, which is safe). A correct fix
+      needs indentation-aware enclosing-scope detection (the cursor is in a func's body until a
+      dedent), not the raw CST range.
 - [x] **Type inference / member completion / hover / inlay / signature help / code
       actions — DONE in Phase 2; goto-def / find-refs / rename / workspace symbols — DONE in
       Phase 3 M5** (cross-file, resolve-don't-string-match; `goto_definition` returns real targets).
@@ -246,9 +251,11 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       seeing `a` as `Variant`/seam — no false `INFERENCE_ON_VARIANT`. Tests:
       `field_inferred_from_earlier_field_is_typed`, `field_forward_reference_is_seamed_not_warned`,
       `standalone_inferred_field_unchanged` (no-regression).
-- [ ] **`await` and inner-class member types resolve to the seam (`Unknown`).** Conservative
-      (never a false positive), but imprecise: `await sig` doesn't recover the signal's arg
-      type, and `inner_instance.field` isn't typed. Refine with the project graph (P3).
+- [x] **`await` of a coroutine call recovers its return type — DONE (Phase-5).** `await` is now
+      *identity* on a non-signal operand (`await f()` for `func f() -> int` is `int`), recovered in
+      `infer.rs`. Still the seam (deliberately): **`await sig`** (the signal's emitted payload needs the
+      Phase-3+ signal-signature table) and **inner-class `inner_instance.field`** types. Tests:
+      `await_a_coroutine_call_recovers_its_return_type`, `await_a_signal_stays_the_seam`.
 
 ### Validation
 - [ ] **Type-diagnostic corpus is one project.** Validated on ReactiveUI-Godot (89 `.gd`):
@@ -350,7 +357,10 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
 - [ ] **(M5) `classify` duplicates `infer.rs`'s name-lookup order.** Two copies of the local → member
       → inherited → global → autoload → engine precedence (one returns a `Ty`, one a `GodotDef`).
       Unify behind shared `def.rs` helpers once the Phase-2 byte-identical inference guarantee can be
-      re-validated. A `classify`↔`infer` agreement test on the corpus would guard the duplication.
+      re-validated. **Guard added (Phase-5):** `classify_and_infer_agree_on_local_shadowing_a_member`
+      (gdscript-ide) locks in that goto-definition (classify) and hover (infer) resolve a use to the
+      SAME declaration under local-over-member shadowing — so a future drift fails CI. The full
+      unification behind shared helpers is still TODO.
 - [ ] **(M5) `Member`/`Global` find-refs scope is project-wide-candidates, not a precise referrer
       graph.** Correct (the re-resolve confirms) but does wasted `classify`s on files that name-but-
       don't-reference the symbol. A firewall-safe referrer reverse-index (keyed on `item_tree`, not
@@ -374,15 +384,15 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       (faithful: one `project.godot`, one namespace). A `--multi-project` harness mode (discover every
       `project.godot`, one host per sub-project) is the exhaustive demo-projects gate — deferred; the
       merged `--project` mode remains the panic/robustness stress test. (Supersedes the M2 stress-test note.)
-- [ ] **Relative `preload`/`extends` paths (`preload("sibling.gd")`) resolve to the seam.** Godot anchors
-      them to the importing script's dir: `resolved = script_path.get_base_dir().path_join(p).simplify_path()`
-      (CONFIRMED `reduce_preload` 4664-4667). Absolute `res://`/`user://` are handled; relative needs the
-      importing file's path threaded into resolution (better done deliberately with **M5**'s file-context
-      work). 0 occurrences in the reference corpus; conservative seam = no false positives.
-- [ ] **Cross-*file* `preload`-const member access is the seam.** `const X = preload(…)` then `X.new()` is
-      typed in the **declaring** file (the member pre-pass infers the initializer). Reading that const from
-      *another* file (`other.X`) sees `script_class`'s annotation-only sig (`Variant`), because `script_class`
-      is offset-free and does not infer const *initializers*. Rare; the corpus pattern is same-file.
+- [x] **Relative `preload`/`extends` paths (`preload("sibling.gd")`) — DONE.** Anchored to the importing
+      script's dir (`get_base_dir().path_join(p).simplify_path()`) via `resolve::anchor_res_path`, then
+      resolved through the `res://` path map. Absolute + relative both handled (`anchor_res_path` tests).
+- [x] **Cross-*file* `preload`-const member access — DONE (Phase-5, the firewall path).** `const X =
+      preload("res://x.gd")` read from *another* file (`other.X`) now resolves to the preloaded script's
+      `ScriptRef`. The preload path is **signature-level** (a const decl is not a function body), so
+      `ItemTree::ConstItem` records `preload_path` and `script_class` resolves it via
+      `resolve_external(Preload)` — without breaking the body-edit firewall (123 hir tests incl. the
+      firewall tests stay green). Test: `cross_file_preload_const_member_resolves`.
 - [ ] **Parser gaps on the broader demo-projects corpus (NEW, Phase-1 follow-up).** Project-mode
       over godot-demo-projects surfaced **307 `GDSCRIPT_SYNTAX`** errors (cascading
       "expected a declaration" — a few unhandled syntactic forms, e.g. some lambda/match/typed
@@ -463,7 +473,54 @@ seam, and rename identifier hygiene; all with regression tests):
       lowering) to the grammar's `at_name` whitelist (`Ident | MatchKw | WhenKw`), which ripples
       through item_tree / hover / completion and needs its own corpus validation. Not a classify-only
       knock-off; rare in real code (safe `None` today).
-- [ ] **`extends "res://base.gd".Inner` (string + dotted) resolves the base to the OUTER script,**
-      dropping `.Inner`. `parse_extends_tokens` returns `ScriptPath` on the first `String` and never
-      consults the trailing idents. The correct-or-refuse fix routes the string+dotted form to the
-      seam (needs a new `ExtendsRef` variant; pairs with inner-class modeling). Very rare; 0 in corpus.
+- [x] **`extends "res://base.gd".Inner` (string + dotted) — DONE (correct-or-refuse).** Was resolving
+      the base to the OUTER script (wrongly accepting its members). `parse_extends_tokens` now detects the
+      trailing dotted selector and yields the new `ExtendsRef::ScriptPathInner`, which `resolve_base` routes
+      to the seam (`Unknown`) — never the outer script. The full inner-class resolution still pairs with
+      inner-class modeling. Test: `extends_script_path_with_inner_class_is_distinguished`.
+
+---
+
+## Phase 5 — Clients & Distribution
+
+### Done
+- [x] **Standalone LSP `gdscript-lsp` whole-project loading.** On `initialized` the server walks the
+      workspace to `project.godot`, loads every `.gd` + `.tscn` (with `res://` paths) + the project config
+      into one host — so class_name / autoloads / preload / scene typing work, and nav/rename span the
+      whole project (not just open docs). A canonical-path VFS interner layers an open overlay over the
+      disk layer (no double-load / false collision). `workspace/didChangeWatchedFiles` keeps it in sync
+      with external edits. (`project.rs`, `vfs.rs`, `lib.rs`; tests
+      `whole_project_loads_and_resolves_cross_file_without_collision`,
+      `watched_file_creation_lights_up_cross_file_resolution`.)
+- [x] **CLI rustc-style human output (annotate-snippets) + config discovery.** `--config`/`--no-config`
+      were dead flags; now a `gdscript-analyzer.toml` is discovered (walk-up), an explicit file / inline
+      `key=value` override / `--no-config` are honored, carrying `error_on_warning` (the option set is
+      intentionally minimal — the warning taxonomy is Phase 6). `CLICOLOR=0` honored. Dropped the unused
+      `anstream`/`anstyle` deps.
+- [x] **napi win-arm64 (`aarch64-pc-windows-msvc`)** added to the publish matrix (a native MSVC cross).
+- [x] **Web playground = a real Monaco editor** (CDN AMD loader, build-less) with live diagnostics
+      (`setModelMarkers`) + hover/completion/signature-help providers over the wasm `Analyzer`.
+- [x] **wasm bundle size:** `wasm-opt -Oz` via `[package.metadata.wasm-pack.profile.release]` (the
+      `wasm-release` cargo profile isn't reachable through `wasm-pack --release`).
+
+### Deferred
+- [ ] **LSP read dispatch is thread-per-request** (`std::thread::spawn` per read), not a bounded pool.
+      Fine for an editor (request rate is editor-bounded); under adversarial load it could spawn many
+      threads. A bounded worker pool + a Worker/LatencySensitive split is the follow-up. Low criticality.
+- [ ] **LSP diagnostics are recomputed synchronously on every `didChange`** (on the write thread), not
+      debounced/coalesced. The incremental analyzer is fast (<5 ms warm), so this is low-criticality; a
+      debounce timer in the `select!` loop (and moving the compute to the snapshot/pool path) is the
+      follow-up.
+- [ ] **napi cross-platform matrix is 6/10 triples** (mac x2, win x64 + arm64, linux gnu x2). STILL
+      DEFERRED, each needing a CI-verified toolchain step: `x86_64`/`aarch64-unknown-linux-musl` (zigbuild),
+      `armv7-unknown-linux-gnueabihf` (cross), and the `wasm32-wasip1-threads` WASI fallback (emnapi runtime
+      + WASI-SDK). The exact napi-rs v3 CLI flags weren't verifiable locally — see `release-napi.yml`'s
+      header. Until musl/WASI land, `npm i` on Alpine / an unlisted platform won't resolve a binary.
+- [ ] **Distribution polish:** a `twiggy` wasm size-regression CI guard; ship the engine model as a
+      content-hashed `extension_api.<ver>.rkyv.br` (brotli) instead of the raw `.bin`; empirically
+      validate the CLI's SARIF output against GitHub code-scanning's ingester.
+- [ ] **guitkx (ReactiveUI-Godot) cross-file *library* go-to-definition** (e.g. `use_ref` → `core/hooks.gd`)
+      is a regression vs the old Godot proxy — the embedded-analyzer adapter loads only the single virtual
+      `.gd` doc, not the referenced library files. Needs a runtime-model pass (where `use_ref`/`V`/`Hooks`
+      resolve from) before loading the libraries into the handle. Same-file goto works; the seam prevents
+      false positives, so the current state is safe.
