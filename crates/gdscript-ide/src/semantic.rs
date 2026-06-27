@@ -448,8 +448,9 @@ fn resolve_signature(
             if let Some(u) = api.utility(&name) {
                 return Some(util_signature(api, &name, u));
             }
-            // A bare call is `self.name(...)` — resolve it against the inherited base.
-            if let Ty::Object(base) = gdscript_hir::resolve::resolve_base(db, api, tree)
+            // A bare call is `self.name(...)` — resolve it against the inherited base. Only an
+            // engine `Object` base is consulted here, so the relative-path anchor is irrelevant.
+            if let Ty::Object(base) = gdscript_hir::resolve::resolve_base(db, api, tree, None)
                 && let Some(MemberRef::Method(sig)) = api.lookup_member(base, &name)
             {
                 return Some(method_signature(api, &name, sig));

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use gdscript_db::{Db, FileText, ProjectConfig, SourceRoot, parse};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use gdscript_base::FileId;
@@ -88,8 +88,8 @@ pub fn file_class_name(db: &dyn Db, file: FileText) -> Option<SmolStr> {
 
 /// The project-wide global `class_name` registry. Keyed on the [`SourceRoot`] file-set input and
 /// the per-file [`file_class_name`] projections. A duplicate `class_name` keeps the first by
-/// `FileId` order (the file set is sorted), so resolution is deterministic. (Collision
-/// diagnostics are an M1 follow-up.)
+/// `FileId` order (the file set is sorted), so resolution is deterministic. Collision *diagnostics*
+/// (warning at each duplicate declaration) are the separate [`class_name_collisions`] projection.
 #[salsa::tracked]
 pub fn global_registry(db: &dyn Db, root: SourceRoot) -> Arc<GlobalRegistry> {
     let mut classes = FxHashMap::default();
@@ -99,6 +99,25 @@ pub fn global_registry(db: &dyn Db, root: SourceRoot) -> Arc<GlobalRegistry> {
         }
     }
     Arc::new(GlobalRegistry { classes })
+}
+
+/// The set of global `class_name`s declared by **more than one** file in `root` — the shadowing
+/// diagnostic's cross-file half. Mirrors [`global_registry`]'s firewall exactly: it reads only the
+/// offset-free [`file_class_name`] projection of each file (never a body or byte range), so a
+/// keystroke never rebuilds it. `global_registry` keeps the *first* declarer silently; this query
+/// names the duplicates so [`crate::infer::analyze_file`] can warn at each colliding declaration.
+#[salsa::tracked]
+pub fn class_name_collisions(db: &dyn Db, root: SourceRoot) -> Arc<FxHashSet<SmolStr>> {
+    let mut seen: FxHashSet<SmolStr> = FxHashSet::default();
+    let mut dups: FxHashSet<SmolStr> = FxHashSet::default();
+    for &file in root.files(db) {
+        if let Some(name) = file_class_name(db, file)
+            && !seen.insert(name.clone())
+        {
+            dups.insert(name);
+        }
+    }
+    Arc::new(dups)
 }
 
 /// The project-wide `res:// path → FileId` registry (M3): the map `preload("res://x.gd")` and
@@ -229,7 +248,28 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
         let sig = match m {
             Member::Func(f) => MemberSig::Method(resolve_ann(f.return_type.as_deref())),
             Member::Var(v) => MemberSig::Field(resolve_ann(v.type_ref.as_deref())),
-            Member::Const(c) => MemberSig::Field(resolve_ann(c.type_ref.as_deref())),
+            // `const X = preload("res://…")` (no annotation) resolves cross-file to the preloaded
+            // script's `ScriptRef` (the SCRIPT meta-type) — the same resolution the declaring file does
+            // same-file, which the offset-free projection otherwise drops. A relative path is anchored
+            // to this file's dir. An explicit annotation wins.
+            Member::Const(c) => MemberSig::Field(
+                c.type_ref
+                    .is_none()
+                    .then_some(c.preload_path.as_deref())
+                    .flatten()
+                    .and_then(|raw| {
+                        crate::resolve::anchor_res_path(file.res_path(db).as_deref(), raw)
+                    })
+                    .map_or_else(
+                        || resolve_ann(c.type_ref.as_deref()),
+                        |abs| {
+                            crate::resolve::resolve_external(
+                                db,
+                                &crate::resolve::ExternalRef::Preload(abs),
+                            )
+                        },
+                    ),
+            ),
             Member::Signal(_) => MemberSig::Signal,
             // Enums + inner classes aren't modeled as instance members yet (M2+).
             Member::Enum(_) | Member::Class(_) => continue,
@@ -238,7 +278,7 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
     }
     // The resolved `extends` base — a user `ScriptRef` (another class_name / "res://…") walks
     // into the inheritance chain; an engine `Object` ends it at the API table.
-    let base = crate::resolve::resolve_base(db, api, &tree);
+    let base = crate::resolve::resolve_base(db, api, &tree, file.res_path(db).as_deref());
     Arc::new(ScriptClass { members, base })
 }
 
@@ -544,6 +584,145 @@ mod tests {
         );
     }
 
+    // ---- W2: class_name collision / shadowing diagnostics ---------------------------------
+
+    use crate::infer::SHADOWED_GLOBAL_IDENTIFIER;
+
+    fn shadow_codes(fi: &Arc<FileInference>) -> Vec<&str> {
+        fi.diagnostics
+            .iter()
+            .filter(|d| d.code == SHADOWED_GLOBAL_IDENTIFIER)
+            .map(|d| d.code.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn class_name_collisions_names_only_the_duplicates() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "class_name Dup\n", Durability::LOW);
+        db.set_file_text(FileId(1), "class_name Dup\n", Durability::LOW);
+        db.set_file_text(FileId(2), "class_name Unique\n", Durability::LOW);
+        db.sync_source_root();
+        let root = db.source_root().unwrap();
+
+        let cols = class_name_collisions(&db, root);
+        assert!(cols.contains(&SmolStr::new("Dup")));
+        assert!(
+            !cols.contains(&SmolStr::new("Unique")),
+            "a singly-declared class_name is not a collision",
+        );
+        assert_eq!(cols.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_class_name_warns_at_both_declarations() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name Dup\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
+        db.set_file_text(FileId(1), "class_name Dup\nvar x := 1\n", Durability::LOW);
+        db.sync_source_root();
+
+        for fid in [0, 1] {
+            let fi = analyze_file(&db, db.file_text(FileId(fid)).unwrap());
+            assert!(
+                shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+                "file {fid} should warn on the duplicate class_name: {:?}",
+                fi.diagnostics
+            );
+            // The warning points at the NAME (`Dup` at offset 11), not byte 0 or the keyword.
+            let d = fi
+                .diagnostics
+                .iter()
+                .find(|d| d.code == SHADOWED_GLOBAL_IDENTIFIER)
+                .unwrap();
+            assert_eq!(d.range, gdscript_base::TextRange::new(11, 14));
+        }
+    }
+
+    #[test]
+    fn class_name_shadowing_an_engine_class_warns() {
+        let mut db = RootDatabase::default();
+        // `Node` is an engine class — declaring `class_name Node` shadows it.
+        db.set_file_text(
+            FileId(0),
+            "class_name Node\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(
+            shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "class_name Node must warn (shadows the engine class): {:?}",
+            fi.diagnostics
+        );
+    }
+
+    #[test]
+    fn class_name_shadowing_a_builtin_type_warns() {
+        let mut db = RootDatabase::default();
+        // `Vector2` is a builtin Variant type — a `class_name Vector2` hides it.
+        db.set_file_text(FileId(0), "class_name Vector2\n", Durability::LOW);
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(
+            shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "{:?}",
+            fi.diagnostics
+        );
+    }
+
+    #[test]
+    fn class_name_shadowing_a_star_autoload_warns() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name Game\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://game.gd");
+        // A `*`-singleton named `Game` — the class_name now hides the autoload global.
+        db.set_project_config("[autoload]\nGame=\"*res://other.gd\"\n");
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(
+            shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "class_name Game must warn (shadows the `*Game` autoload): {:?}",
+            fi.diagnostics
+        );
+    }
+
+    #[test]
+    fn unique_non_shadowing_class_name_does_not_warn() {
+        // No false positive: a one-of-a-kind name that is no engine/builtin/autoload symbol.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name MyVeryOwnUniquePlayer\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
+        db.set_file_text(
+            FileId(1),
+            "class_name AnotherUniqueEnemy\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+
+        for fid in [0, 1] {
+            let fi = analyze_file(&db, db.file_text(FileId(fid)).unwrap());
+            assert!(
+                shadow_codes(&fi).is_empty(),
+                "file {fid}: a unique class_name must not warn: {:?}",
+                fi.diagnostics
+            );
+        }
+    }
+
     #[test]
     fn unknown_member_on_script_ref_is_seam_not_warning() {
         let mut db = RootDatabase::default();
@@ -614,11 +793,14 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_extends_terminates() {
+    fn cyclic_extends_flags_each_cycle_member_and_terminates() {
+        use crate::infer::CYCLIC_INHERITANCE;
         let mut db = RootDatabase::default();
-        // A extends B extends A — illegal in Godot, but the member walk must not loop.
+        // A extends B extends A — illegal in Godot. The member walk must not loop, AND each file on
+        // the cycle must be flagged `CYCLIC_INHERITANCE` at its own `extends` decl.
         db.set_file_text(FileId(0), "class_name A\nextends B\n", Durability::LOW);
         db.set_file_text(FileId(1), "class_name B\nextends A\n", Durability::LOW);
+        // A third, ACYCLIC file that merely USES `A` — it is not on the cycle, so it must stay clean.
         db.set_file_text(
             FileId(2),
             "func use_it():\n\tvar a: A\n\tvar x := a.nope()\n",
@@ -626,9 +808,63 @@ mod tests {
         );
         db.sync_source_root();
 
-        // Must terminate (depth cap) — a.nope() walks A->B->A->… and bottoms out at the seam.
+        // Each cycle member is flagged exactly once, at its own `extends`.
+        for id in [FileId(0), FileId(1)] {
+            let fi = analyze_file(&db, db.file_text(id).unwrap());
+            let cyclic: Vec<_> = fi
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == CYCLIC_INHERITANCE)
+                .collect();
+            assert_eq!(cyclic.len(), 1, "file {id:?}: {:?}", fi.diagnostics);
+        }
+
+        // The user file is off the cycle — `a.nope()` walks A->B->A->… and bottoms out at the seam
+        // (no panic/hang, no diagnostic on this file).
         let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn cyclic_extends_via_res_path_two_files_flags_no_hang() {
+        use crate::infer::CYCLIC_INHERITANCE;
+        let mut db = RootDatabase::default();
+        // a.gd extends "res://b.gd"; b.gd extends "res://a.gd" — a 2-file `res://` path cycle.
+        set_with_path(&mut db, 0, "res://a.gd", "extends \"res://b.gd\"\n");
+        set_with_path(&mut db, 1, "res://b.gd", "extends \"res://a.gd\"\n");
+        db.sync_source_root();
+
+        for id in [FileId(0), FileId(1)] {
+            let fi = analyze_file(&db, db.file_text(id).unwrap());
+            assert!(
+                fi.diagnostics.iter().any(|d| d.code == CYCLIC_INHERITANCE),
+                "file {id:?} expected CYCLIC_INHERITANCE: {:?}",
+                fi.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn deep_acyclic_extends_chain_does_not_false_fire() {
+        use crate::infer::CYCLIC_INHERITANCE;
+        let mut db = RootDatabase::default();
+        // A 5-deep ACYCLIC chain bottoming out at an engine base: C0 -> C1 -> ... -> C4 -> Node.
+        // None revisits the start, so NONE may be flagged `CYCLIC_INHERITANCE`.
+        db.set_file_text(FileId(0), "class_name C0\nextends C1\n", Durability::LOW);
+        db.set_file_text(FileId(1), "class_name C1\nextends C2\n", Durability::LOW);
+        db.set_file_text(FileId(2), "class_name C2\nextends C3\n", Durability::LOW);
+        db.set_file_text(FileId(3), "class_name C3\nextends C4\n", Durability::LOW);
+        db.set_file_text(FileId(4), "class_name C4\nextends Node\n", Durability::LOW);
+        db.sync_source_root();
+
+        for id in (0..5).map(FileId) {
+            let fi = analyze_file(&db, db.file_text(id).unwrap());
+            assert!(
+                !fi.diagnostics.iter().any(|d| d.code == CYCLIC_INHERITANCE),
+                "file {id:?} false-fired CYCLIC_INHERITANCE: {:?}",
+                fi.diagnostics
+            );
+        }
     }
 
     // ---- M3: res:// path map + preload / extends "res://…" const-aliasing -----------------
@@ -728,6 +964,49 @@ mod tests {
     }
 
     #[test]
+    fn cross_file_preload_const_member_resolves() {
+        // The xfile-preload-const fix: another file reading `Holder.W` where
+        // `const W = preload("res://widget.gd")` resolves W to the preloaded script. Previously the
+        // offset-free script_class projection saw only the const's (absent) annotation → Variant.
+        let mut db = RootDatabase::default();
+        set_with_path(
+            &mut db,
+            0,
+            "res://widget.gd",
+            "class_name Widget\nfunc make() -> int:\n\treturn 5\n",
+        );
+        set_with_path(
+            &mut db,
+            1,
+            "res://holder.gd",
+            "class_name Holder\nconst W = preload(\"res://widget.gd\")\n",
+        );
+        set_with_path(
+            &mut db,
+            2,
+            "res://user.gd",
+            "func use_it():\n\tvar a := Holder.W.make()\n",
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("use_it unit");
+        // Holder.W → Widget's ScriptRef → .make() → int (cross-file, through the const).
+        assert_eq!(
+            unit.result.bindings[0].ty.label(api).as_deref(),
+            Some("int"),
+            "Holder.W.make() should resolve cross-file to int, got {:?}",
+            unit.result.bindings[0].ty
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
     fn preload_of_script_without_class_name_resolves() {
         // The key distinction from M1: preload resolves by PATH, so a script with *no* class_name
         // (absent from the global_registry) is still resolved.
@@ -809,6 +1088,50 @@ mod tests {
         assert_eq!(
             unit.result.bindings[3].ty.label(api).as_deref(),
             Some("int")
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn relative_extends_path_anchors_to_importing_dir() {
+        let mut db = RootDatabase::default();
+        // base.gd under entities/, reachable only by path (no class_name).
+        set_with_path(
+            &mut db,
+            0,
+            "res://entities/base.gd",
+            "extends Node\nfunc base_method() -> int:\n\treturn 1\n",
+        );
+        // derived.gd in the SAME dir uses a RELATIVE `extends "base.gd"` (anchored to entities/).
+        set_with_path(
+            &mut db,
+            1,
+            "res://entities/derived.gd",
+            "class_name Derived\nextends \"base.gd\"\nfunc own() -> String:\n\treturn \"x\"\n",
+        );
+        set_with_path(
+            &mut db,
+            2,
+            "res://main.gd",
+            "func use_it():\n\tvar d: Derived\n\tvar a := d.own()\n\tvar b := d.base_method()\n",
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| u.result.bindings.len() >= 3)
+            .expect("use_it unit with 3 bindings (d, a, b)");
+        // bindings: [0]=`d: Derived`, [1]=own() (own member), [2]=base_method() (relative-extends base).
+        assert_eq!(
+            unit.result.bindings[1].ty.label(api).as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            unit.result.bindings[2].ty.label(api).as_deref(),
+            Some("int"),
+            "base_method() must resolve through the relative `extends \"base.gd\"`"
         );
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
     }
@@ -1015,6 +1338,49 @@ mod tests {
             unit.result.bindings[0].ty.label(api).as_deref(),
             Some("int"),
             "Music.volume() should resolve via the scene root's script",
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn star_autoload_scene_resolves_via_script_class_shortcut() {
+        // A `*`-autoload `.tscn` whose root has NO `script=` ext_resource but carries the header
+        // `script_class="…"` shortcut resolves through the class_name registry (the recorded
+        // shortcut, without a script ext_resource). Autoload name `Audio` ≠ class_name `MusicPlayer`
+        // so the resolution can ONLY go via the scene's script_class shortcut.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name MusicPlayer\nfunc volume() -> int:\n\treturn 5\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://music.gd");
+        db.set_file_text(
+            FileId(1),
+            "[gd_scene format=3 script_class=\"MusicPlayer\"]\n[node name=\"Root\" type=\"Node\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://music.tscn");
+        db.set_file_text(
+            FileId(2),
+            "func f():\n\tvar v := Audio.volume()\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://main.gd");
+        db.set_project_config("[autoload]\nAudio=\"*res://music.tscn\"\n");
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("f unit");
+        assert_eq!(
+            unit.result.bindings[0].ty.label(api).as_deref(),
+            Some("int"),
+            "Audio.volume() should resolve via the scene's script_class= shortcut",
         );
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
     }
@@ -1346,7 +1712,10 @@ mod tests {
         let mut db = RootDatabase::default();
         db.set_file_text(
             FileId(1),
-            "extends Node\nfunc f(p):\n\tvar a := get_node(p)\n\tvar b := $Nope\n",
+            // `p: NodePath` so the computed `get_node(p)` still exercises node-path resolution but
+            // without an (orthogonal, legitimate) UNSAFE_CALL_ARGUMENT on an untyped Variant arg —
+            // that warning has its own tests in `infer`.
+            "extends Node\nfunc f(p: NodePath):\n\tvar a := get_node(p)\n\tvar b := $Nope\n",
             Durability::LOW,
         );
         db.set_file_path(FileId(1), "res://lone.gd");

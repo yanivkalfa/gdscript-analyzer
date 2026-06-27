@@ -4,6 +4,7 @@
 
 use std::io::{self, Write};
 
+use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 use gdscript_base::{Diagnostic, Severity};
 use serde_json::json;
 
@@ -54,21 +55,9 @@ pub fn emit(
     }
 }
 
-// ---- human (concise, rustc/Ruff style) ----
+// ---- human (rustc-style: severity header + source snippet + caret, via annotate-snippets) ----
 
-/// The anstyle color for a severity (only applied when `color`).
-fn severity_style(sev: Severity) -> anstyle::Style {
-    use anstyle::AnsiColor::{Blue, Cyan, Red, Yellow};
-    let color = match sev {
-        Severity::Error => Red,
-        Severity::Warning => Yellow,
-        Severity::Info => Blue,
-        Severity::Hint => Cyan,
-    };
-    anstyle::Style::new().fg_color(Some(color.into())).bold()
-}
-
-/// The lowercase severity word.
+/// The lowercase severity word (used by the `json` format; the human format renders its own header).
 fn severity_word(sev: Severity) -> &'static str {
     match sev {
         Severity::Error => "error",
@@ -78,26 +67,40 @@ fn severity_word(sev: Severity) -> &'static str {
     }
 }
 
-/// `path:line:col: severity[CODE] message`, one per diagnostic (the summary line is printed
-/// separately, to stderr, by the caller). The `severity[CODE]` is colored by severity when `color`.
+/// The `annotate-snippets` level for a severity (`Hint` → `NOTE`, which annotate-snippets has).
+fn severity_level(sev: Severity) -> Level<'static> {
+    match sev {
+        Severity::Error => Level::ERROR,
+        Severity::Warning => Level::WARNING,
+        Severity::Info => Level::INFO,
+        Severity::Hint => Level::NOTE,
+    }
+}
+
+/// The rustc/Ruff-style rich human format: a `severity[CODE]: message` header, then the source line
+/// with a caret under the offending span, rendered by `annotate-snippets`. Colored (styled renderer)
+/// only when `color`; machine formats are never colored. The byte span is clamped to the source so an
+/// out-of-bounds (e.g. EOF) range can never panic the renderer.
 fn human(located: &[Located<'_>], color: bool, w: &mut dyn Write) -> io::Result<()> {
+    let renderer = if color {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    };
     for l in located {
-        let style = severity_style(l.diag.severity);
-        let (open, close) = if color {
-            (style.render().to_string(), style.render_reset().to_string())
-        } else {
-            (String::new(), String::new())
-        };
-        writeln!(
-            w,
-            "{}:{}:{}: {open}{}[{}]{close} {}",
-            l.file.display,
-            l.start.line,
-            l.start.char_col,
-            severity_word(l.diag.severity),
-            l.diag.code,
-            l.diag.message,
-        )?;
+        let len = l.file.text.len();
+        let span = (l.diag.range.start as usize).min(len)..(l.diag.range.end as usize).min(len);
+        let group = severity_level(l.diag.severity)
+            .primary_title(l.diag.message.as_str())
+            .id(l.diag.code.as_str())
+            .element(
+                Snippet::source(l.file.text.as_ref())
+                    .path(l.file.display.as_str())
+                    .line_start(1)
+                    .fold(true)
+                    .annotation(AnnotationKind::Primary.span(span)),
+            );
+        writeln!(w, "{}", renderer.render(&[group]))?;
     }
     Ok(())
 }
@@ -328,7 +331,9 @@ mod tests {
     }
 
     #[test]
-    fn human_concise_is_1_based() {
+    fn human_rich_shows_location_code_message_and_caret() {
+        // The rustc-style rich format: a `warning[CODE]: message` header, the file:line:col origin
+        // (1-based), the source line, and a caret under the `5 / 2` span (bytes 8..13).
         let f = file("a.gd", "var x = 5 / 2\n");
         let out = render(
             Format::Human,
@@ -341,10 +346,11 @@ mod tests {
                 "Integer division.",
             )],
         );
-        assert_eq!(
-            out,
-            "a.gd:1:9: warning[INTEGER_DIVISION] Integer division.\n"
-        );
+        assert!(out.contains("INTEGER_DIVISION"), "code missing:\n{out}");
+        assert!(out.contains("Integer division."), "message missing:\n{out}");
+        assert!(out.contains("a.gd:1:9"), "1-based origin missing:\n{out}");
+        assert!(out.contains("var x = 5 / 2"), "source line missing:\n{out}");
+        assert!(out.contains('^'), "caret underline missing:\n{out}");
     }
 
     #[test]

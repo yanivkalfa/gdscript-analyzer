@@ -117,12 +117,12 @@ pub struct NavDoc {
     pub line_index: LineIndex,
 }
 
-/// A snapshot of every open document, so a navigation result in **any** open file maps to a
-/// `Location`. A result in an un-opened file (not yet in the workspace VFS) is skipped — full
-/// project scanning is a follow-up. Built on the main thread, moved to the worker.
+/// A snapshot of every **known** file (open overlay or scanned-from-disk), so a navigation result in
+/// any project file maps to a `Location`. A result in a file outside the loaded project (none, when a
+/// `project.godot` root was found) is skipped. Built on the main thread, moved to the worker.
 #[derive(Debug)]
 pub struct NavCtx {
-    /// Open documents by `FileId`.
+    /// Known project files by `FileId`.
     pub docs: HashMap<FileId, NavDoc>,
     /// The negotiated encoding.
     pub encoding: PositionEncoding,
@@ -191,9 +191,8 @@ pub fn workspace_symbols(
 
 impl NavCtx {
     /// A POD [`SourceChange`] → an LSP [`WorkspaceEdit`](lsp::WorkspaceEdit), or `None` if any edited
-    /// file isn't open — a rename/quick-fix must be **all-or-nothing**, so we'd rather refuse than
-    /// emit a partial edit that leaves a stale reference behind (full project scanning is a
-    /// follow-up).
+    /// file isn't in the loaded project — a rename/quick-fix must be **all-or-nothing**, so we'd
+    /// rather refuse than emit a partial edit that leaves a stale reference behind.
     #[allow(
         clippy::mutable_key_type,
         reason = "lsp_types::Uri's interior cache never affects Hash/Eq"
@@ -253,7 +252,7 @@ pub fn rename(
         Ok(change) => nav.workspace_edit(&change).ok_or_else(|| {
             (
                 crate::REQUEST_FAILED,
-                "rename affects files not open in the editor — open them and retry".to_owned(),
+                "rename affects a file outside the loaded project".to_owned(),
             )
         }),
         Err(error) => Err((crate::REQUEST_FAILED, rename_error_message(&error))),

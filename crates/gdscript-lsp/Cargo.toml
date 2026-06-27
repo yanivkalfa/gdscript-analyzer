@@ -27,6 +27,8 @@ crossbeam-channel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+# Workspace file discovery for the standalone server's project scan (honors .gitignore/.gdignore).
+ignore = { workspace = true }
 
 [lints]
 workspace = true
