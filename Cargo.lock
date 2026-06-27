@@ -618,6 +618,7 @@ dependencies = [
  "anyhow",
  "clap",
  "gdscript-base",
+ "gdscript-fmt",
  "gdscript-ide",
  "ignore",
  "rayon",

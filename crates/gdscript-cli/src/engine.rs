@@ -29,6 +29,8 @@ pub struct SourceFile {
     pub text: Arc<str>,
     /// The per-file 1-based position converter.
     pub line_index: LineIndex,
+    /// The on-disk path (for `format --write`); `None` for stdin.
+    pub path: Option<PathBuf>,
 }
 
 /// A file we could not read (surfaced as a usage-level problem, not a diagnostic).
@@ -78,7 +80,9 @@ impl Project {
         // resolves under the project root both are `Some`/relative; otherwise both fall back to the
         // raw path together (Hunt #2/#3 — a prior split derivation could disagree if root vs file
         // canonicalization differed).
-        let mut discovered: Vec<(String, Option<String>, Arc<str>)> = Vec::new();
+        // `(display, res_path, text, on-disk path)`.
+        type Discovered = (String, Option<String>, Arc<str>, Option<PathBuf>);
+        let mut discovered: Vec<Discovered> = Vec::new();
         let mut errors = Vec::new();
         let mut seen = BTreeSet::new();
 
@@ -95,7 +99,7 @@ impl Project {
         if stdin_requested {
             let mut buf = String::new();
             match std::io::stdin().read_to_string(&mut buf) {
-                Ok(_) => discovered.push(("<stdin>".to_owned(), None, Arc::from(buf))),
+                Ok(_) => discovered.push(("<stdin>".to_owned(), None, Arc::from(buf), None)),
                 Err(e) => errors.push(LoadError {
                     display: "<stdin>".into(),
                     message: e.to_string(),
@@ -118,7 +122,7 @@ impl Project {
                         // GDScript is UTF-8; decode lossily so a stray byte never aborts the run.
                         let text: Arc<str> =
                             Arc::from(String::from_utf8_lossy(&bytes).into_owned());
-                        discovered.push((display, res_path, text));
+                        discovered.push((display, res_path, text, Some(path.clone())));
                     }
                     Err(e) => errors.push(LoadError {
                         display,
@@ -132,7 +136,7 @@ impl Project {
         let mut host = AnalysisHost::new();
         let mut change = Change::new();
         let mut files = Vec::with_capacity(discovered.len());
-        for (i, (display, res_path, text)) in discovered.into_iter().enumerate() {
+        for (i, (display, res_path, text, path)) in discovered.into_iter().enumerate() {
             let id = FileId(u32::try_from(i).unwrap_or(u32::MAX));
             change.change_file(id, Arc::clone(&text));
             if let Some(res) = &res_path {
@@ -143,6 +147,7 @@ impl Project {
                 display,
                 line_index: LineIndex::new(&text),
                 text,
+                path,
             });
         }
         // Feed `project.godot` so autoload resolution lights up.
