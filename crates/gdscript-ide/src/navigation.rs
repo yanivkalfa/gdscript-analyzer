@@ -770,6 +770,37 @@ mod tests {
     }
 
     #[test]
+    fn classify_and_infer_agree_on_local_shadowing_a_member() {
+        // Guard for the def.rs/infer.rs name-lookup duplication (the post-M5 hunt flagged that the two
+        // copies of local→member→…→global precedence could drift): goto-definition (classify) and
+        // hover (infer) must resolve a use to the SAME declaration. Here a local `count` shadows a
+        // member `count` — goto must jump to the local, and hover must type the use as the local's
+        // String, not the member's int.
+        let src = "var count := 0\nfunc f():\n\tvar count := \"hi\"\n\treturn count\n";
+        let db = db_with(&[(0, src)]);
+        let local_decl = u32::try_from(src.match_indices("count").nth(1).unwrap().0).unwrap();
+        let use_pos = pos(0, "count", 2, src);
+
+        // classify (goto) → the shadowing local declaration, not the member at offset 4.
+        let targets = goto_definition(&db, use_pos);
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.file == FileId(0) && t.focus_range.start == local_decl),
+            "goto should resolve the use to the shadowing local, got {targets:?}",
+        );
+
+        // infer (hover) → String (the local), agreeing with classify (not the member's int).
+        let ft = db.file_text(FileId(0)).expect("file text");
+        let h = crate::semantic::hover(&db, ft, use_pos.offset).expect("hover at the use");
+        assert!(
+            h.ty_label.as_deref().is_some_and(|l| l.contains("String")),
+            "hover should type the use as the local's String, got {:?}",
+            h.ty_label,
+        );
+    }
+
+    #[test]
     fn find_refs_distinguishes_same_named_members() {
         let a = "class_name A\nfunc update():\n\tpass\nfunc go():\n\tself.update()\n";
         let b = "class_name B\nfunc update():\n\tpass\n";
