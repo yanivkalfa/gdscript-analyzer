@@ -801,6 +801,27 @@ mod tests {
     }
 
     #[test]
+    fn soft_keyword_named_member_is_navigable() {
+        // A member named `match` (a Godot soft-keyword identifier) must be reachable by goto-def and
+        // find-refs. It used to be dropped at the AST layer (`Name::text()` read only `Ident`), so
+        // navigation never saw it. Regression for the soft-keyword-name fix.
+        let src = "func match():\n\tpass\nfunc caller():\n\tself.match()\n";
+        let db = db_with(&[(0, src)]);
+        let decl_off = u32::try_from(src.match_indices("match").next().unwrap().0).unwrap();
+        // goto-def from the call `self.match()` → the `func match()` declaration.
+        let targets = goto_definition(&db, pos(0, "match", 1, src));
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.file == FileId(0) && t.focus_range.start == decl_off),
+            "goto on `self.match()` should reach `func match()`, got {targets:?}",
+        );
+        // find-refs from the declaration → decl + the call = 2.
+        let refs = find_references(&db, pos(0, "match", 0, src));
+        assert_eq!(refs.len(), 2, "decl + self.match() call: {refs:?}");
+    }
+
+    #[test]
     fn find_refs_distinguishes_same_named_members() {
         let a = "class_name A\nfunc update():\n\tpass\nfunc go():\n\tself.update()\n";
         let b = "class_name B\nfunc update():\n\tpass\n";

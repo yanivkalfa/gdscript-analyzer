@@ -96,12 +96,19 @@ pub fn classify(db: &dyn Db, pos: FilePosition) -> Option<GodotDef> {
     let ft = db.file_text(pos.file)?;
     let root = parse(db, ft).syntax_node();
     let tok = ast::token_at(&root, pos.offset.into())?;
-    if tok.kind() != SyntaxKind::Ident {
+    let parent = tok.parent();
+    // Identifiers are symbols. The soft keywords `match`/`when` are too — but ONLY in a name
+    // position (a `Name` decl, or a `NameRef`/`FieldExpr` member). A bare `match` *statement* keyword
+    // (parent = `MatchStmt`) must stay a non-symbol, else the cursor on it would falsely resolve to a
+    // same-named declaration. (Mirrors the grammar's `at_name` whitelist; see `TECH_DEBT.md`.)
+    let is_name_tok = tok.kind() == SyntaxKind::Ident
+        || (matches!(tok.kind(), SyntaxKind::MatchKw | SyntaxKind::WhenKw)
+            && matches!(parent.kind(), SyntaxKind::Name | SyntaxKind::NameRef));
+    if !is_name_tok {
         return None; // keywords / punctuation are not symbols
     }
     let name = SmolStr::new(tok.text());
     let tok_range = cst::token_range(&tok);
-    let parent = tok.parent();
 
     // (A) Declaration sites: the cursor is on the `Name` token of a declaration.
     if parent.kind() == SyntaxKind::Name

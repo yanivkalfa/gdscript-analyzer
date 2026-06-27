@@ -463,6 +463,24 @@ mod tests {
     }
 
     #[test]
+    fn soft_keyword_names_are_not_dropped() {
+        // `match`/`when` are valid identifiers (Godot `is_identifier()` whitelist), so they must
+        // reach the item tree as member / param / variant names — not be dropped as keywords.
+        // Regression for the AST-layer `Name::text()` gap (see `TECH_DEBT.md`).
+        let tree = tree_of("var when := 1\nfunc match(when: int):\n\tpass\nenum E { match, when }\n");
+        let names: Vec<_> = tree.members.iter().filter_map(Member::name).collect();
+        assert_eq!(names, vec!["when", "match", "E"]);
+        let Some(Member::Func(f)) = tree.member("match") else {
+            panic!("expected a func named `match`")
+        };
+        assert_eq!(f.params[0].name, "when");
+        let Some(Member::Enum(e)) = tree.member("E") else {
+            panic!("expected enum E")
+        };
+        assert_eq!(e.variants, vec![SmolStr::new("match"), SmolStr::new("when")]);
+    }
+
+    #[test]
     fn var_init_and_inference_flags() {
         let tree = tree_of("var a: int = 1\nvar b := 2\nvar c\nvar d = 3\n");
         let vars: Vec<&VarItem> = tree
