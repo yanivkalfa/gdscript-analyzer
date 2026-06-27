@@ -28,6 +28,7 @@ pub mod vfs;
 mod handlers;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -37,9 +38,11 @@ use gdscript_ide::{Analysis, AnalysisHost, Change};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CodeActionParams, CodeActionProviderCapability, CompletionOptions, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, FoldingRangeProviderCapability,
-    HoverProviderCapability, InitializeParams, InitializeResult, OneOf, PositionEncodingKind,
-    PublishDiagnosticsParams, RenameOptions, RenameParams, SemanticTokensFullOptions,
+    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, FileChangeType, FileSystemWatcher,
+    FoldingRangeProviderCapability, GlobPattern, HoverProviderCapability, InitializeParams,
+    InitializeResult, OneOf, PositionEncodingKind, PublishDiagnosticsParams, Registration,
+    RegistrationParams, RenameOptions, RenameParams, SemanticTokensFullOptions,
     SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
     SignatureHelpOptions, TextDocumentContentChangeEvent, TextDocumentIdentifier,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
@@ -225,6 +228,9 @@ struct GlobalState {
     loaded: bool,
     /// Files whose `res://` path has been fed to the host (so it's set exactly once).
     with_path: HashSet<FileId>,
+    /// The scanned project root (the `project.godot` dir) — for computing a `res://` path for a file
+    /// created later (a `didChangeWatchedFiles` Created event).
+    project_root: Option<PathBuf>,
 }
 
 impl GlobalState {
@@ -237,6 +243,7 @@ impl GlobalState {
             roots,
             loaded: false,
             with_path: HashSet::new(),
+            project_root: None,
         }
     }
 
@@ -268,6 +275,7 @@ impl GlobalState {
             change.set_project_config(Arc::clone(cfg));
         }
         self.host.apply_change(change);
+        self.project_root = loaded.root; // moved after the borrows above end
     }
 
     /// Dispatch a request: read features snapshot the analysis and run on a worker thread; unknown
@@ -560,10 +568,73 @@ impl GlobalState {
                     clear_diagnostics(conn, p.text_document.uri)?;
                 }
             }
-            // The client finished initializing → scan the workspace into the host (once).
-            "initialized" => self.load_project(),
+            // The client finished initializing → scan the workspace into the host (once) + register
+            // file watchers so external `.gd`/`.tscn`/`project.godot` edits keep it in sync.
+            "initialized" => {
+                self.load_project();
+                if self.project_root.is_some() {
+                    register_file_watchers(conn)?;
+                }
+            }
+            "workspace/didChangeWatchedFiles" => self.on_watched_files_changed(conn, note)?,
             // `exit` is consumed by the main loop before reaching here.
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Apply external file changes (a `workspace/didChangeWatchedFiles` notification) to the host: a
+    /// changed/created `.gd`/`.tscn` is re-read from disk into its background layer; a deleted one is
+    /// dropped. An **open** document is left alone (its editor overlay wins). Open documents then get
+    /// fresh diagnostics, since a background change can shift their cross-file resolution.
+    fn on_watched_files_changed(&mut self, conn: &Connection, note: &Notification) -> Result<()> {
+        let Ok(p) = serde_json::from_value::<DidChangeWatchedFilesParams>(note.params.clone())
+        else {
+            return Ok(());
+        };
+        for ev in p.changes {
+            // A project.godot change re-feeds the config (handled regardless of overlay state).
+            if let Some(path) = project::uri_to_path(&ev.uri)
+                && path.file_name().is_some_and(|n| n == "project.godot")
+            {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let mut change = Change::new();
+                    change.set_project_config(text);
+                    self.host.apply_change(change);
+                }
+                continue;
+            }
+            let id = self.vfs.intern(&ev.uri);
+            if self.vfs.doc(id).is_some() {
+                continue; // an open document's overlay wins — don't disturb it from disk
+            }
+            if ev.typ == FileChangeType::DELETED {
+                self.vfs.remove_disk(id);
+                let mut change = Change::new();
+                change.remove_file(id);
+                self.host.apply_change(change);
+                self.with_path.remove(&id);
+                continue;
+            }
+            // Created / Changed: re-read the file into its background layer.
+            let Some(path) = project::uri_to_path(&ev.uri) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let text: Arc<str> = Arc::from(String::from_utf8_lossy(&bytes).into_owned());
+            self.vfs.set_disk(&ev.uri, text);
+            if let Some(root) = &self.project_root
+                && let Some(res) = project::res_path_for(root, &path)
+            {
+                self.vfs.set_res_path(id, res);
+            }
+            self.commit(id);
+        }
+        // Refresh open documents — their cross-file resolution may have shifted under the change.
+        for id in self.vfs.open_ids() {
+            self.publish_diagnostics(conn, id)?;
         }
         Ok(())
     }
@@ -650,6 +721,36 @@ impl GlobalState {
         };
         send_notification(conn, "textDocument/publishDiagnostics", &params)
     }
+}
+
+/// Dynamically register file watchers so the client sends `workspace/didChangeWatchedFiles` for the
+/// project's `.gd` / `.tscn` / `project.godot` files. This is a server→client *request*
+/// (`client/registerCapability`); the client's reply is ignored (the main loop drops a stray
+/// `Response`). Requires the client to support `workspace.didChangeWatchedFiles.dynamicRegistration`
+/// (VS Code, Neovim, … do); a client that doesn't simply never sends the notification.
+fn register_file_watchers(conn: &Connection) -> Result<()> {
+    let watchers = ["**/*.gd", "**/*.tscn", "**/project.godot"]
+        .into_iter()
+        .map(|g| FileSystemWatcher {
+            glob_pattern: GlobPattern::String(g.to_owned()),
+            kind: None, // default: Create | Change | Delete
+        })
+        .collect();
+    let options = DidChangeWatchedFilesRegistrationOptions { watchers };
+    let params = RegistrationParams {
+        registrations: vec![Registration {
+            id: "gdscript-watch-files".to_owned(),
+            method: "workspace/didChangeWatchedFiles".to_owned(),
+            register_options: Some(serde_json::to_value(options)?),
+        }],
+    };
+    let req = Request::new(
+        RequestId::from("gdscript-register-watchers".to_owned()),
+        "client/registerCapability".to_owned(),
+        serde_json::to_value(params)?,
+    );
+    conn.sender.send(Message::Request(req))?;
+    Ok(())
 }
 
 /// The shared shape of whole-file request params (`documentSymbol`/`foldingRange`): the target doc.
@@ -837,6 +938,53 @@ mod tests {
                 .iter()
                 .any(unresolved),
             "cross-file resolution must survive opening the file as an overlay",
+        );
+    }
+
+    #[test]
+    fn watched_file_creation_lights_up_cross_file_resolution() {
+        // didChangeWatchedFiles completes whole-project loading: a `.gd` created on disk *after* the
+        // initial scan is ingested, so an existing file's cross-file reference now resolves.
+        let proj = TempProject::new("watch");
+        proj.write("project.godot", "[application]\nconfig/name=\"t\"\n");
+        proj.write("main.gd", "func go():\n\tvar n := Lib.ping()\n\treturn n\n");
+        // lib.gd does NOT exist at scan time → `Lib` is the seam.
+
+        let (server, _client) = Connection::memory();
+        let mut state = test_state();
+        state.roots = vec![proj.uri()];
+        state.load_project();
+        let main = state
+            .vfs
+            .known_ids()
+            .into_iter()
+            .find(|&id| state.vfs.uri(id).unwrap().as_str().ends_with("main.gd"))
+            .unwrap();
+
+        // Create lib.gd on disk, then deliver the watcher event.
+        proj.write(
+            "lib.gd",
+            "class_name Lib\nstatic func ping() -> int:\n\treturn 1\n",
+        );
+        let lib_path = proj.0.join("lib.gd").canonicalize().unwrap();
+        let params = DidChangeWatchedFilesParams {
+            changes: vec![lsp_types::FileEvent {
+                uri: project::path_to_uri(&lib_path).unwrap(),
+                typ: FileChangeType::CREATED,
+            }],
+        };
+        let note = Notification::new(
+            "workspace/didChangeWatchedFiles".to_owned(),
+            serde_json::to_value(params).unwrap(),
+        );
+        state.on_watched_files_changed(&server, &note).unwrap();
+
+        // main.gd now sees the newly-created `Lib` → `n` is typed int (an `: int` inlay hint appears).
+        let hints = state.host.analysis().inlay_hints(main).unwrap_or_default();
+        let json = serde_json::to_string(&hints).unwrap();
+        assert!(
+            json.contains("int"),
+            "creating lib.gd should let main.gd resolve Lib.ping() and type `n` as int: {json}",
         );
     }
 

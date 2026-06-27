@@ -31,6 +31,9 @@ pub struct LoadedFile {
 /// The result of scanning a workspace: every `.gd`/`.tscn` file + the `project.godot` text (if any).
 #[derive(Debug, Default)]
 pub struct LoadedProject {
+    /// The project root (the `project.godot` directory) — kept so later file-watch events can compute
+    /// a `res://` path for a newly-created file.
+    pub root: Option<PathBuf>,
     /// Every discovered source/scene file (discovery order).
     pub files: Vec<LoadedFile>,
     /// The `project.godot` text, enabling `[autoload]` resolution + version detection.
@@ -80,8 +83,9 @@ pub fn load(roots: &[Uri]) -> LoadedProject {
         }
     }
     LoadedProject {
-        files,
         config: read_project_godot(&root),
+        files,
+        root: Some(root),
     }
 }
 
@@ -123,7 +127,8 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
 
 /// The `res://`-relative path of `file` under project `root` (with `/` separators), or `None` when
 /// `file` is not under `root`.
-fn res_path_for(root: &Path, file: &Path) -> Option<String> {
+#[must_use]
+pub fn res_path_for(root: &Path, file: &Path) -> Option<String> {
     let rel = file.strip_prefix(root).ok()?;
     let mut s = String::from("res://");
     for (i, comp) in rel.components().enumerate() {

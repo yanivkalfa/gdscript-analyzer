@@ -165,6 +165,17 @@ impl Vfs {
         self.docs.remove(&id.0);
     }
 
+    /// Drop a file's background **disk** layer (on an external delete). The overlay, if open, is left.
+    pub fn remove_disk(&mut self, id: FileId) {
+        self.disk.remove(&id.0);
+    }
+
+    /// Every currently-open (overlaid) `FileId` — for refreshing diagnostics after a background change.
+    #[must_use]
+    pub fn open_ids(&self) -> Vec<FileId> {
+        self.docs.keys().map(|&k| FileId(k)).collect()
+    }
+
     /// Every known `FileId` (overlay or disk), ascending — for a navigation snapshot spanning the
     /// whole project, not just open documents.
     #[must_use]
