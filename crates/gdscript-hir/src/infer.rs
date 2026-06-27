@@ -14,7 +14,7 @@ use gdscript_base::{Diagnostic, DiagnosticSource, FileId, Severity, TextRange};
 use gdscript_db::Db;
 use gdscript_scene::{SceneModel, SceneNode};
 use gdscript_syntax::GdNode;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use std::sync::Arc;
@@ -73,6 +73,8 @@ pub enum BindingKind {
 /// A typed local binding — the unit hover + inlay hints read for `var`/param/`for` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
+    /// The binding name (for unused-binding analysis, find-references).
+    pub name: SmolStr,
     /// The name token's range.
     pub name_range: TextRange,
     /// The binding's resolved type. For an untyped `var x = e` this is the gradual `Variant`;
@@ -84,6 +86,9 @@ pub struct Binding {
     pub annotated: bool,
     /// Whether the source used `:=` (inferred-but-hard).
     pub inferred_colon_eq: bool,
+    /// Whether this is a `const` (vs a `var`) — distinguishes `UNUSED_LOCAL_CONSTANT` from
+    /// `UNUSED_VARIABLE`.
+    pub is_const: bool,
     /// What kind of binding this is.
     pub kind: BindingKind,
 }
@@ -130,6 +135,7 @@ pub fn infer(
     class: &ClassScope,
     body: &Body,
     return_ty: Ty,
+    is_func_body: bool,
 ) -> InferenceResult {
     let self_ty = class.self_ty.clone();
     let mut cx = Cx {
@@ -145,6 +151,7 @@ pub fn infer(
         diagnostics: Vec::new(),
         raw_warnings: Vec::new(),
         locals: FxHashMap::default(),
+        used_locals: FxHashSet::default(),
         narrowing: FxHashMap::default(),
         flow: flow::analyze(body),
     };
@@ -153,11 +160,13 @@ pub fn infer(
     for p in &params {
         let ty = cx.param_ty(p);
         cx.bindings.push(Binding {
+            name: p.name.clone(),
             name_range: p.name_range,
             ty: ty.clone(),
             init: None,
             annotated: p.type_ref.is_some(),
             inferred_colon_eq: false,
+            is_const: false,
             kind: BindingKind::Param,
         });
         cx.locals.insert(p.name.clone(), ty);
@@ -167,6 +176,49 @@ pub fn infer(
     }
     let block = body.block.clone();
     cx.infer_block(&block);
+
+    // UNUSED_* — a declared local/param/const never read. Only for a *function* body: a class-field
+    // initializer body would otherwise false-flag every field (the member is read in other methods,
+    // not in its own initializer). `_`-prefixed names + loop/match captures are excluded.
+    if is_func_body {
+        let unused: Vec<(TextRange, WarningCode, String)> = cx
+            .bindings
+            .iter()
+            .filter_map(|b| {
+                if b.name.starts_with('_') || cx.used_locals.contains(&b.name) {
+                    return None;
+                }
+                let (code, what) = match b.kind {
+                    BindingKind::Param => (WarningCode::UnusedParameter, "parameter"),
+                    BindingKind::Var if b.is_const => {
+                        (WarningCode::UnusedLocalConstant, "local constant")
+                    }
+                    BindingKind::Var => (WarningCode::UnusedVariable, "local variable"),
+                    BindingKind::ForVar | BindingKind::MatchBind => return None,
+                };
+                Some((
+                    b.name_range,
+                    code,
+                    format!("The {what} \"{}\" is declared but never used.", b.name),
+                ))
+            })
+            .collect();
+        for (range, code, msg) in unused {
+            cx.warn(range, code, msg);
+        }
+    }
+
+    // UNREACHABLE_CODE — statements after a return/break/continue / exhaustive branch (Workstream 2).
+    let unreachable = cx.flow.unreachable_ranges(body);
+    for range in unreachable {
+        cx.warn(
+            range,
+            WarningCode::UnreachableCode,
+            "Unreachable code (statement after a return, break, continue, or an exhaustive match)."
+                .to_owned(),
+        );
+    }
+
     InferenceResult {
         expr_ty: cx.expr_ty,
         bindings: cx.bindings,
@@ -193,7 +245,7 @@ pub fn infer_func(
     // are nested inside the ParamList, so they are not direct children).
     let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
         .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
-    infer(db, api, root, class, &body, return_ty)
+    infer(db, api, root, class, &body, return_ty, true)
 }
 
 /// One inferred unit of a file: a function body or a class field's initializer, with its
@@ -246,6 +298,15 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
     let mut units = Vec::new();
     let mut diagnostics = Vec::new();
     let mut raw_warnings: Vec<RawWarning> = Vec::new();
+
+    // EMPTY_FILE — a script with no members, no `class_name`, and no `extends` (Workstream 1).
+    if tree.members.is_empty() && tree.class_name.is_none() && tree.extends.is_none() {
+        raw_warnings.push(RawWarning {
+            range: TextRange::new(0, 0),
+            code: WarningCode::EmptyFile,
+            message: "Empty script file.".to_owned(),
+        });
+    }
     let mut member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
     // `self` is the script's OWN class (a self-`ScriptRef`), not just its engine base — so member
     // access on an aliased `self` resolves the file's own members (see `ClassScope::self_ty`).
@@ -359,7 +420,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
             let body = body::body_of_func(&node);
             let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
                 .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
-            let result = infer(db, api, root, &class, &body, return_ty);
+            let result = infer(db, api, root, &class, &body, return_ty, true);
             diagnostics.extend(result.diagnostics.iter().cloned());
             raw_warnings.extend(result.raw_warnings.iter().cloned());
             units.push(Unit {
@@ -480,7 +541,7 @@ fn unit_from_decl(
 ) -> Option<Unit> {
     let node = ptr.to_node(root)?;
     let body = body::body_of_decl_stmt(&node);
-    let result = infer(db, api, root, class, &body, Ty::Variant);
+    let result = infer(db, api, root, class, &body, Ty::Variant, false);
     Some(Unit {
         range,
         body,
@@ -511,6 +572,10 @@ struct Cx<'a> {
     raw_warnings: Vec<RawWarning>,
     /// Function-scoped local bindings (GDScript locals are function-, not block-, scoped).
     locals: FxHashMap<SmolStr, Ty>,
+    /// The names of locals/params that were *read* during the walk — drives the `UNUSED_*` family
+    /// (a declared binding whose name never appears here is unused). Conservative: a write-only use
+    /// also records the name (no false positives, only the occasional missed warning).
+    used_locals: FxHashSet<SmolStr>,
     /// The active narrowing env for the current statement, keyed by a dotted access path. Rebuilt
     /// per statement from [`Cx::flow`] (Workstream 2) — not mutated ad-hoc anymore.
     narrowing: FxHashMap<String, Ty>,
@@ -595,7 +660,75 @@ impl Cx<'_> {
                     ),
                 );
             }
-            Assign::Ok | Assign::OkUnsafe | Assign::IntAsEnum => {}
+            // `int` assigned to an enum slot without an explicit cast (the previously-dead arm).
+            Assign::IntAsEnum => self.warn(
+                range,
+                WarningCode::IntAsEnumWithoutCast,
+                "Integer used when an enum value is expected. Cast the value to the enum type."
+                    .to_owned(),
+            ),
+            Assign::Ok | Assign::OkUnsafe => {}
+        }
+    }
+
+    /// Flag a statement whose expression has no effect: a bare value (`STANDALONE_EXPRESSION`) or a
+    /// ternary used as a statement (`STANDALONE_TERNARY`). A call / await / assignment / `preload`
+    /// has an effect and is never flagged.
+    fn check_standalone(&mut self, e: ExprId) {
+        if self.expr_has_side_effect(e) {
+            return;
+        }
+        match self.body.expr(e) {
+            Expr::Ternary { .. } => self.warn(
+                self.range_of(e),
+                WarningCode::StandaloneTernary,
+                "Standalone ternary conditional: the return value is discarded.".to_owned(),
+            ),
+            // Not value-like statements / forms with subtle effects — never flag.
+            Expr::Missing | Expr::Lambda { .. } | Expr::GetNode { .. } | Expr::Preload { .. } => {}
+            _ => self.warn(
+                self.range_of(e),
+                WarningCode::StandaloneExpression,
+                "Standalone expression (the line has no effect).".to_owned(),
+            ),
+        }
+    }
+
+    /// Whether evaluating an expression may have a side effect — a call, an `await`, a `preload`,
+    /// or an assignment anywhere in the subtree. Used to suppress `STANDALONE_*` on effectful lines.
+    fn expr_has_side_effect(&self, e: ExprId) -> bool {
+        match self.body.expr(e) {
+            Expr::Call { .. }
+            | Expr::Await(_)
+            | Expr::Preload { .. }
+            | Expr::Bin {
+                op: BinOp::Assign, ..
+            } => true,
+            Expr::Bin { lhs, rhs, .. }
+            | Expr::In { lhs, rhs, .. }
+            | Expr::Index {
+                base: lhs,
+                index: rhs,
+            } => self.expr_has_side_effect(*lhs) || self.expr_has_side_effect(*rhs),
+            Expr::Unary { operand, .. }
+            | Expr::Paren(operand)
+            | Expr::Cast { operand, .. }
+            | Expr::Is { operand, .. } => self.expr_has_side_effect(*operand),
+            Expr::Field { receiver, .. } => self.expr_has_side_effect(*receiver),
+            Expr::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr_has_side_effect(*cond)
+                    || self.expr_has_side_effect(*then_branch)
+                    || self.expr_has_side_effect(*else_branch)
+            }
+            Expr::Array(items) => items.iter().any(|&i| self.expr_has_side_effect(i)),
+            Expr::Dict(entries) => entries.iter().any(|(k, v)| {
+                self.expr_has_side_effect(*k) || v.is_some_and(|e| self.expr_has_side_effect(e))
+            }),
+            _ => false,
         }
     }
 
@@ -614,6 +747,7 @@ impl Cx<'_> {
         match self.body.stmt(id).clone() {
             Stmt::Expr(e) => {
                 self.infer_expr(e, &Expectation::None);
+                self.check_standalone(e);
             }
             Stmt::Var(v) => self.infer_local_var(&v),
             Stmt::Return(e) => {
@@ -661,11 +795,13 @@ impl Cx<'_> {
                     |ptr| self.resolve_ptr_ty(*ptr),
                 );
                 self.bindings.push(Binding {
+                    name: f.var.clone(),
                     name_range: f.var_range,
                     ty: var_ty.clone(),
                     init: None,
                     annotated: f.var_type.is_some(),
                     inferred_colon_eq: false,
+                    is_const: false,
                     kind: BindingKind::ForVar,
                 });
                 self.locals.insert(f.var.clone(), var_ty);
@@ -683,11 +819,13 @@ impl Cx<'_> {
                         // it as a local that shadows a same-named member; the type is the Phase-2
                         // `Variant`.
                         self.bindings.push(Binding {
+                            name: b.name.clone(),
                             name_range: b.range,
                             ty: Ty::Variant,
                             init: None,
                             annotated: false,
                             inferred_colon_eq: false,
+                            is_const: false,
                             kind: BindingKind::MatchBind,
                         });
                         self.locals.insert(b.name.clone(), Ty::Variant);
@@ -750,11 +888,13 @@ impl Cx<'_> {
             (None, None) => Ty::Variant,
         };
         self.bindings.push(Binding {
+            name: v.name.clone(),
             name_range: v.name_range,
             ty: binding_ty.clone(),
             init: v.init,
             annotated: v.type_ref.is_some(),
             inferred_colon_eq: v.is_inferred,
+            is_const: v.is_const,
             kind: BindingKind::Var,
         });
         // A (re-)declaration's narrowing invalidation is handled by the flow analysis (Workstream 2).
@@ -807,7 +947,18 @@ impl Cx<'_> {
                 } else if self.is_null(then_branch) {
                     b
                 } else {
-                    self.join(&a, &b)
+                    let r = self.join(&a, &b);
+                    // Both arms informative but with no common type (the join widened to Variant) —
+                    // the ternary's two values are mutually incompatible.
+                    if r.is_variant() && !a.is_uninformative() && !b.is_uninformative() {
+                        self.warn(
+                            self.range_of(id),
+                            WarningCode::IncompatibleTernary,
+                            "The values of the ternary conditional are not mutually compatible."
+                                .to_owned(),
+                        );
+                    }
+                    r
                 }
             }
             Expr::Call { callee, args } => self.infer_call(callee, &args),
@@ -1660,11 +1811,13 @@ impl Cx<'_> {
         for p in params {
             let ty = self.param_ty(p);
             self.bindings.push(Binding {
+                name: p.name.clone(),
                 name_range: p.name_range,
                 ty: ty.clone(),
                 init: None,
                 annotated: p.type_ref.is_some(),
                 inferred_colon_eq: false,
+                is_const: false,
                 kind: BindingKind::Param,
             });
             self.locals.insert(p.name.clone(), ty);
@@ -1686,6 +1839,11 @@ impl Cx<'_> {
     // ---- name resolution (local → class member → inherited → global) ----
 
     fn resolve_name(&mut self, id: ExprId, name: &str) -> Ty {
+        // Record a read of a local/param for the `UNUSED_*` analysis (before the narrowing check,
+        // so a narrowed read still counts as used).
+        if self.locals.contains_key(name) {
+            self.used_locals.insert(SmolStr::new(name));
+        }
         // Flow narrowing wins over the binding's declared type.
         if let Some(key) = self.narrow_key(id)
             && let Some(t) = self.narrowing.get(&key)
@@ -1941,7 +2099,7 @@ mod tests {
         let body = body::body_of_func(&func);
         let return_ty = cst::first_child(&func, |k| k == SyntaxKind::TypeRef)
             .map_or(Ty::Variant, |t| resolve::resolve_type_ref(&db, api, &t));
-        let result = infer(&db, api, &root, &class, &body, return_ty);
+        let result = infer(&db, api, &root, &class, &body, return_ty, true);
         Harness { result, body }
     }
 
@@ -1998,7 +2156,7 @@ mod tests {
 
     #[test]
     fn int_to_float_is_silent() {
-        let h = infer_first_func("func f():\n\tvar x: float = 3\n");
+        let h = infer_first_func("func f():\n\tvar x: float = 3\n\treturn x\n");
         assert!(codes(&h).is_empty(), "{:?}", codes(&h));
     }
 
@@ -2083,6 +2241,71 @@ mod tests {
             codes(&bogus).contains(&UNSAFE_METHOD_ACCESS),
             "missing method in the and-rhs must warn: {:?}",
             codes(&bogus)
+        );
+    }
+
+    // ---- Workstream 1 M1: self-contained checks ----
+
+    #[test]
+    fn empty_file_warns() {
+        assert!(file_codes("").iter().any(|c| c == "EMPTY_FILE"));
+        assert!(
+            file_codes("# just a comment\n")
+                .iter()
+                .any(|c| c == "EMPTY_FILE")
+        );
+        assert!(
+            file_codes("extends Node\n")
+                .iter()
+                .all(|c| c != "EMPTY_FILE")
+        );
+    }
+
+    #[test]
+    fn unused_variable_and_parameter() {
+        let h = infer_first_func("func f(unused_p):\n\tvar unused_v = 1\n");
+        assert!(codes(&h).contains(&"UNUSED_PARAMETER"), "{:?}", codes(&h));
+        assert!(codes(&h).contains(&"UNUSED_VARIABLE"), "{:?}", codes(&h));
+        // A used binding does not warn; a `_`-prefixed one is intentionally ignored.
+        let used = infer_first_func("func f(p):\n\tvar v = p\n\treturn v\n");
+        assert!(codes(&used).iter().all(|c| !c.starts_with("UNUSED")));
+        let underscored = infer_first_func("func f(_ignored):\n\tpass\n");
+        assert!(!codes(&underscored).contains(&"UNUSED_PARAMETER"));
+    }
+
+    #[test]
+    fn standalone_expression_and_ternary() {
+        let expr = infer_first_func("func f(a, b):\n\ta + b\n");
+        assert!(
+            codes(&expr).contains(&"STANDALONE_EXPRESSION"),
+            "{:?}",
+            codes(&expr)
+        );
+        let tern = infer_first_func("func f(c):\n\t1 if c else 2\n");
+        assert!(
+            codes(&tern).contains(&"STANDALONE_TERNARY"),
+            "{:?}",
+            codes(&tern)
+        );
+        // A call statement has an effect — never flagged.
+        let call = infer_first_func("func f(n):\n\tn.queue_free()\n");
+        assert!(codes(&call).iter().all(|c| !c.starts_with("STANDALONE")));
+    }
+
+    #[test]
+    fn unreachable_code_after_return() {
+        let h = infer_first_func("func f():\n\treturn\n\tprint(\"dead\")\n");
+        assert!(codes(&h).contains(&"UNREACHABLE_CODE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn incompatible_ternary_warns() {
+        // `"s" if c else 1` — String vs int, no common type.
+        let h = infer_first_func("func f(c):\n\tvar x = \"s\" if c else 1\n\treturn x\n");
+        assert!(
+            codes(&h).contains(&"INCOMPATIBLE_TERNARY"),
+            "{:?}",
+            codes(&h)
         );
     }
 

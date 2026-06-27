@@ -384,7 +384,7 @@ mod tests {
         change.set_file_path(FileId(0), "res://markup.gd");
         change.change_file(
             FileId(1),
-            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n",
+            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n\treturn n\n",
         );
         change.set_file_path(FileId(1), "res://main.gd");
         host.apply_change(change);
@@ -409,7 +409,10 @@ mod tests {
         let mut change = Change::new();
         change.change_file(FileId(0), "func volume() -> int:\n\treturn 50\n");
         change.set_file_path(FileId(0), "res://audio.gd");
-        change.change_file(FileId(1), "func go():\n\tvar v := Audio.volume()\n");
+        change.change_file(
+            FileId(1),
+            "func go():\n\tvar v := Audio.volume()\n\treturn v\n",
+        );
         change.set_file_path(FileId(1), "res://main.gd");
         change.set_project_config("[autoload]\nAudio=\"*res://audio.gd\"\n");
         host.apply_change(change);
@@ -441,7 +444,7 @@ mod tests {
         change.set_file_path(FileId(0), "res://main.tscn");
         change.change_file(
             FileId(1),
-            "extends Control\nfunc _ready():\n\tvar b := $Btn\n",
+            "extends Control\nfunc _ready():\n\tvar b := $Btn\n\tb.show()\n",
         );
         change.set_file_path(FileId(1), "res://main.gd");
         host.apply_change(change);

@@ -1583,7 +1583,11 @@ mod tests {
         use crate::warnings::{WarnLevel, WarningCode};
 
         let mut db = RootDatabase::default();
-        db.set_file_text(FileId(0), "func f():\n\tvar x = 5 / 2\n", Durability::LOW);
+        db.set_file_text(
+            FileId(0),
+            "func f():\n\tvar x = 5 / 2\n\treturn x\n",
+            Durability::LOW,
+        );
         db.set_file_path(FileId(0), "res://game.gd");
         db.set_project_config(
             "[autoload]\nGame=\"*res://game.gd\"\n[debug]\ngdscript/warnings/integer_division=2\n",

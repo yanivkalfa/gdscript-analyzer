@@ -574,3 +574,72 @@ The "do 1–8" follow-up batch. Each is documented in full under its own Phase s
       prevents false positives, so the current state is safe. (b) **`analyzerProxy.ts` end-to-end
       validation** — needs the napi `.node` build (`libnode.dll`, CI-only), so it is CI-gated. Best done
       AFTER the analyzer's `@gdscript-analyzer/core` `^0.2.0` is published and the guitkx dep is bumped.
+
+---
+
+## Phase 6 — v1.0 (in progress, branch `feat/phase6`)
+
+Driven by `plans/PHASE-6-EXECUTION-OVERVIEW.md` + the seven workstream playbooks. Done so far:
+W1 M0 (the `WarningCode` emit-then-gate seam), W2 M0–M2 (the CFG narrowing dataflow + checker
+wiring + short-circuit), W1 M1 (a self-contained-check subset). W6 (the `#[non_exhaustive]` freeze
++ 1.0 tag) is held for last, by design.
+
+### W1 — warning set: checks deferred from the M1 cut (machinery is DONE; these are additive)
+
+The `WarningCode` catalog + `gate()` + per-code settings already support **all 48** codes; the
+following just need their detection wired (each is purely additive — a new `Cx::warn(...)` site or a
+file-level scan, gated by the existing seam). Landed in M1: `EMPTY_FILE`, `UNUSED_VARIABLE`,
+`UNUSED_LOCAL_CONSTANT`, `UNUSED_PARAMETER`, `STANDALONE_EXPRESSION`, `STANDALONE_TERNARY`,
+`INT_AS_ENUM_WITHOUT_CAST`, `INCOMPATIBLE_TERNARY`, `UNREACHABLE_CODE` (consumes W2 reachability).
+
+- [ ] **`UNTYPED_DECLARATION` / `INFERRED_DECLARATION`** — directly from the binding `annotated` /
+      `inferred_colon_eq` flags. Deferred only to keep the infer-level test suite quiet (they are
+      default-IGNORE opt-in, so they fire on every untyped local under the standalone `--strict`
+      default and would pollute focused fixtures). Trivial to add + gate; needs a `codes()` test
+      helper that filters the opt-in group.
+- [ ] **`SHADOWED_VARIABLE` / `SHADOWED_VARIABLE_BASE_CLASS`** — a local shadowing an outer
+      local/param, or a member shadowing a base member (needs the base item-tree via `script_class`).
+- [ ] **`SHADOWED_GLOBAL_IDENTIFIER` (extend)** — currently fires only for a `class_name` collision
+      (file-level, ungated, direct `Diagnostic`). Godot also fires for a local/member shadowing a
+      global; extend + route through `gate` as a real `WarningCode`.
+- [ ] **`ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE`** — needs the bool *value* of a constant
+      condition; the lowered `Literal::Bool` doesn't carry true/false. Recover it from the CST token
+      at the expr range (like navigation does) or extend `Literal` to carry the value.
+- [ ] **`CONFUSABLE_IDENTIFIER` / `_LOCAL_DECLARATION` / `_LOCAL_USAGE` / `_CAPTURE_REASSIGNMENT` /
+      `_TEMPORARY_MODIFICATION`** — Unicode mixed-script/homoglyph detection; needs a confusables
+      table (`unicode-security` crate or the Unicode confusables data). `_TEMPORARY_MODIFICATION` is
+      master-only (already `since=Master`).
+- [ ] **Deprecated-misuse trio** (`PROPERTY_USED_AS_FUNCTION`, `CONSTANT_USED_AS_FUNCTION`,
+      `FUNCTION_USED_AS_PROPERTY`) — call/property-kind mismatch on a resolved member.
+- [ ] **`NATIVE_METHOD_OVERRIDE`** — overriding a native virtual with an incompatible signature
+      (needs param-type comparison against the engine virtual).
+- [ ] **`STATIC_CALLED_ON_INSTANCE`**, **`MISSING_TOOL`**, **`REDUNDANT_STATIC_UNLOAD`**,
+      **`REDUNDANT_AWAIT`**, **`ENUM_VARIABLE_WITHOUT_DEFAULT`**, **`UNSAFE_VOID_RETURN`**,
+      **`UNSAFE_CAST`**, **`RETURN_VALUE_DISCARDED`**, **`INT_AS_ENUM_WITHOUT_MATCH`**,
+      **`DEPRECATED_KEYWORD`** (`yield` — parser must surface it), **`ONREADY_WITH_EXPORT`** (an
+      annotation pair on one member; needs item-tree annotation info), **`UNPRIVATE…`** etc. — each is
+      a small, self-contained check; sequenced by value after the M1 subset.
+- [ ] **`UNUSED_SIGNAL`**, **`UNUSED_PRIVATE_CLASS_VARIABLE`** — member-level unused analysis (needs
+      a whole-file member-read scan, like the local `used_locals` set but across methods).
+- [ ] **`UNASSIGNED_VARIABLE` / `_OP_ASSIGN`** — read-before-assign of a typed local; needs the W2
+      CFG's definite-assignment pass (a natural W2 extension — reachability is there, definite-assign
+      is not yet).
+- [ ] **`UNUSED_*` precision** — the M1 use-tracking is name-based and counts a *write* as a use
+      (sound: only ever under-warns). A precise read-vs-write split (excluding assignment-LHS, the
+      `ReferenceKind::Write` logic) would catch assigned-but-never-read locals.
+
+### W2 — narrowing: deferred precision (post-1.0 quality, MINOR/PATCH not API breaks)
+
+- [ ] **Assignment re-narrowing** (`x = other` → x: typeof(other)). M1 made flow authoritative, and
+      flow runs pre-inference so it can only *invalidate* on assignment (the sound 1.0 floor), not
+      re-narrow to the assigned value's type. Re-narrowing needs the value's inferred type fed back
+      into the facts — a post-1.0 precision item.
+- [ ] **`match`-arm scrutinee narrowing + `UNREACHABLE_PATTERN`** — the lowered `MatchArm` carries
+      no pattern type/`is_wildcard` info, so a `T():` arm can't yet narrow the scrutinee and an
+      arm-after-wildcard isn't flagged. Needs `body.rs` lowering to capture each arm's pattern
+      `AstPtr` + wildcard flag (the `flow.rs` `Terminator::Match`/`MatchEdge` shape already models it).
+- [ ] **`NotNull` / `Not(T)` consumption** — recorded by the flow pass but not used for typing in
+      1.0 (no null-access diagnostic to drive `NotNull`; `Not(T)` has no positive type). Wire when a
+      null-safety check lands.
+- [ ] **Loop-carried back-edge fixpoints, aliasing, narrowing through call results
+      (`if get_thing() is T:`)** — explicitly out of the 1.0 cut (per the W2 playbook §1 tail).
