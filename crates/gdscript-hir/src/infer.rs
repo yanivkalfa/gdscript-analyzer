@@ -938,7 +938,22 @@ impl Cx<'_> {
                 );
                 fallback
             }
-            // ambiguous miss / escape (`..`/absolute) / into-instance → `Node`, never a false warning
+            // The path descends into an instanced sub-scene (`$Enemy/Sprite`): resolve the tail in
+            // the sub-scene's own tree (`Sprite` typed by `enemy.tscn`). Any failure → `Node`.
+            R::IntoInstance => {
+                let walked = if unique {
+                    ctx.model.resolve_unique_into_instance(path)
+                } else {
+                    ctx.model.resolve_into_instance(ctx.attach, path)
+                };
+                walked
+                    .and_then(|(inst, tail)| {
+                        let inst_node = ctx.model.node(inst)?;
+                        self.resolve_into_instance_ty(&ctx.model, inst_node, &tail, 0)
+                    })
+                    .unwrap_or(fallback)
+            }
+            // ambiguous miss / escape (`..`/absolute) → `Node`, never a false warning
             _ => fallback,
         }
     }
@@ -988,6 +1003,20 @@ impl Cx<'_> {
         if depth >= 16 {
             return None;
         }
+        let (sub, sub_root) = self.instance_subscene(scene, node)?;
+        let root_node = sub.node(sub_root)?;
+        self.scene_node_ty(&sub, root_node, depth + 1)
+    }
+
+    /// The instanced sub-scene's model + its root index, for an instance node (`instance=ExtResource`
+    /// → `res://` path → `FileId` → `scene_model`). The shared resolution step for both
+    /// [`instance_root_ty`](Self::instance_root_ty) (the node's own type) and
+    /// [`resolve_into_instance_ty`](Self::resolve_into_instance_ty) (paths that go *into* it).
+    fn instance_subscene(
+        &self,
+        scene: &SceneModel,
+        node: &SceneNode,
+    ) -> Option<(Arc<SceneModel>, gdscript_scene::NodeIdx)> {
         let inst = node.instance.as_ref()?;
         let path = scene.ext_resources.get(inst)?.path.as_ref()?;
         let root = self.db.source_root()?;
@@ -996,8 +1025,33 @@ impl Cx<'_> {
             .copied()?;
         let ft = self.db.file_text(file)?;
         let sub = crate::queries::scene_model(self.db, ft);
-        let root_node = sub.node(sub.root?)?;
-        self.scene_node_ty(&sub, root_node, depth + 1)
+        let sub_root = sub.root?;
+        Some((sub, sub_root))
+    }
+
+    /// Type a node path that descends INTO an instanced sub-scene: `instance_node` is the boundary
+    /// (an `instance=` node) and `tail` is the remaining path. Resolve `tail` from the sub-scene's
+    /// root, recursing through further instance boundaries inside it. Depth-bounded against an
+    /// instancing cycle. `None` (→ `Node`, no false warning) if the tail genuinely can't be typed.
+    fn resolve_into_instance_ty(
+        &self,
+        scene: &SceneModel,
+        instance_node: &SceneNode,
+        tail: &str,
+        depth: u32,
+    ) -> Option<Ty> {
+        if depth >= 16 {
+            return None;
+        }
+        let (sub, sub_root) = self.instance_subscene(scene, instance_node)?;
+        if let Some(idx) = sub.resolve_path_from(sub_root, tail) {
+            let n = sub.node(idx)?;
+            return self.scene_node_ty(&sub, n, depth + 1);
+        }
+        // The tail crosses a further instance boundary *inside* the sub-scene — keep descending.
+        let (inner, inner_tail) = sub.resolve_into_instance(sub_root, tail)?;
+        let inner_node = sub.node(inner)?;
+        self.resolve_into_instance_ty(&sub, inner_node, &inner_tail, depth + 1)
     }
 
     /// The `ScriptRef` of a node's attached `.gd` script (`script = ExtResource(id)` → its `res://`

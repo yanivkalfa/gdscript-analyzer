@@ -1902,6 +1902,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn path_into_an_instanced_subscene_types_the_inner_node() {
+        // main.tscn: Root(script=main.gd) > Enemy(instance=enemy.tscn). enemy.tscn: Enemy(Node2D) >
+        // Sprite(Sprite2D). M3 typed `$Enemy` itself; this §4b step continues the walk INTO the
+        // sub-scene, so `$Enemy/Sprite` types as `Sprite2D` (the inner node), not bare `Node`.
+        // `$Enemy/Nope` stays `Node` with NO false INVALID_NODE_PATH (binding_labels asserts zero
+        // diagnostics).
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://enemy.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Enemy\" parent=\".\" instance=ExtResource(\"2\")]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar s := $Enemy/Sprite\n\tvar n := $Enemy/Nope\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_file_text(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [node name=\"Enemy\" type=\"Node2D\"]\n\
+             [node name=\"Sprite\" type=\"Sprite2D\" parent=\".\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://enemy.tscn");
+        db.sync_source_root();
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Sprite2D"),
+            "$Enemy/Sprite should type as the sub-scene's Sprite (Sprite2D)",
+        );
+    }
+
     // ---- Phase-4 hunt fixes: `%`-segment paths (no false INVALID_NODE_PATH) ----------------
 
     #[test]
