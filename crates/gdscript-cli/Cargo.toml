@@ -26,6 +26,7 @@ ignore = { workspace = true }
 annotate-snippets = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
