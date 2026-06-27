@@ -44,7 +44,13 @@ gdscript-db = { path = "crates/gdscript-db", version = "0.1.0" }
 gdscript-hir = { path = "crates/gdscript-hir", version = "0.1.0" }
 gdscript-ide = { path = "crates/gdscript-ide", version = "0.1.0" }
 gdscript-scene = { path = "crates/gdscript-scene", version = "0.1.0" }
-gdscript-session = { path = "crates/gdscript-session", version = "0.1.0" }
+# `gdscript-session` is internal-only (`publish = false`) — bundled into the napi/wasm bindings, never
+# sent to crates.io. It is therefore PATH-ONLY (no version requirement): release-plz bumps its package
+# version (via `version.workspace = true`) but does NOT rewrite the version requirement of a
+# publish=false crate, so a pinned `version = "0.1.0"` here makes its (also publish=false) dependents
+# `gdscript-ffi`/`gdscript-wasm` fail to resolve after a workspace bump (cargo: "candidate 0.2.0 didn't
+# match ^0.1.0"). A path-only dep has no version requirement, so the local crate always resolves.
+gdscript-session = { path = "crates/gdscript-session" }
 # Third-party (pinned centrally; actual use grows in later phases).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
