@@ -47,6 +47,11 @@ pub enum ExtendsRef {
     Path(SmolStr),
     /// `extends "res://x.gd"` — a script path literal; `Unknown` in Phase 2.
     ScriptPath(SmolStr),
+    /// `extends "res://x.gd".Inner` — a script path **selecting an inner class**. We can't model the
+    /// inner class yet (see `TECH_DEBT`), so this is the seam (`Unknown`) — never the outer script, which
+    /// would wrongly accept the outer class's members. The path is carried for a future inner-class
+    /// resolver. (`SmolStr` is the path part, sans the trailing `.Inner` selectors.)
+    ScriptPathInner(SmolStr),
 }
 
 /// One class member.
@@ -346,19 +351,26 @@ fn find_extends(container: &GdNode) -> Option<ExtendsRef> {
 
 /// Parse the `extends` target from a node's direct tokens.
 fn parse_extends_tokens(node: &GdNode) -> Option<ExtendsRef> {
-    // A string literal path: `extends "res://x.gd"`.
-    if let Some(s) = cst::child_token_text(node, SyntaxKind::String) {
-        return Some(ExtendsRef::ScriptPath(SmolStr::new(
-            s.trim_matches(['"', '\'']),
-        )));
-    }
-    // Otherwise one or more dotted identifiers: `extends Node` / `extends A.B`.
+    // Identifier tokens after the `extends` keyword: the dotted selectors (`A.B`, or the `.Inner`
+    // trailing a string path).
     let idents: Vec<String> = node
         .children_with_tokens()
         .filter_map(cstree::util::NodeOrToken::into_token)
         .filter(|t| t.kind() == SyntaxKind::Ident)
         .map(|t| t.text().to_owned())
         .collect();
+    // A string literal path: `extends "res://x.gd"` — or `extends "res://x.gd".Inner`, which selects an
+    // inner class we can't model yet → the seam (NOT the outer script, which would wrongly accept the
+    // outer class's members).
+    if let Some(s) = cst::child_token_text(node, SyntaxKind::String) {
+        let path = SmolStr::new(s.trim_matches(['"', '\'']));
+        return Some(if idents.is_empty() {
+            ExtendsRef::ScriptPath(path)
+        } else {
+            ExtendsRef::ScriptPathInner(path)
+        });
+    }
+    // Otherwise one or more dotted identifiers: `extends Node` / `extends A.B`.
     match idents.len() {
         0 => None,
         1 => Some(ExtendsRef::Name(SmolStr::new(&idents[0]))),
@@ -456,6 +468,18 @@ mod tests {
         assert_eq!(
             tree.extends,
             Some(ExtendsRef::ScriptPath(SmolStr::new("res://player.gd")))
+        );
+    }
+
+    #[test]
+    fn extends_script_path_with_inner_class_is_distinguished() {
+        // `extends "res://base.gd".Inner` must NOT collapse to the outer script (which would wrongly
+        // accept the outer class's members); it parses to ScriptPathInner → the seam.
+        let tree = tree_of("extends \"res://base.gd\".Inner\n");
+        assert_eq!(
+            tree.extends,
+            Some(ExtendsRef::ScriptPathInner(SmolStr::new("res://base.gd"))),
+            "the trailing .Inner must be detected, not dropped"
         );
     }
 

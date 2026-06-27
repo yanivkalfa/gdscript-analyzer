@@ -365,6 +365,9 @@ pub fn resolve_base(db: &dyn Db, api: &EngineApi, tree: &ItemTree, anchor: Optio
         },
         // A dotted base (`extends A.B`) is a namespaced name, not a path — the seam.
         Some(ExtendsRef::Path(p)) => resolve_external(db, &ExternalRef::ExtendsPath(p.clone())),
+        // `extends "res://x.gd".Inner` selects an inner class we can't model yet — the seam, never the
+        // outer script (correct-or-refuse: no false member access against the outer class).
+        Some(ExtendsRef::ScriptPathInner(_)) => Ty::Unknown,
     }
 }
 
