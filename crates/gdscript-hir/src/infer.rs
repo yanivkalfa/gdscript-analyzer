@@ -46,6 +46,10 @@ pub const UNSAFE_CALL_ARGUMENT: &str = "UNSAFE_CALL_ARGUMENT";
 /// (only raised when the script attaches to exactly one scene — never on an `..`/absolute path or a
 /// path that descends into an instanced sub-scene we don't see).
 pub const INVALID_NODE_PATH: &str = "INVALID_NODE_PATH";
+/// A declared `class_name` that shadows another global identifier — a duplicate user `class_name`,
+/// an engine/native class, a builtin/utility, a global enum/const, or a `*`-autoload singleton.
+/// Godot's `gdscript_analyzer.cpp` raises this (as an error) so the global namespace stays unique.
+pub const SHADOWED_GLOBAL_IDENTIFIER: &str = "SHADOWED_GLOBAL_IDENTIFIER";
 
 /// What kind of binding a [`Binding`] describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +234,30 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
     // The file's own `res://` path, for anchoring relative `preload`/`extends` to its directory.
     let res_path = db.file_text(file_id).and_then(|ft| ft.res_path(db));
 
+    // A declared `class_name` that collides with another global identifier (W2). Mirrors Godot's
+    // `gdscript_analyzer.cpp` uniqueness check over the global namespace, projected through the
+    // cross-file firewall (`class_name_collisions`) and the offset-free global resolvers — so it
+    // fires only when genuinely shadowing, never on the seam. Emitted once, at the decl's NAME.
+    if let Some(name) = tree.class_name.clone() {
+        let collides = collisions_contains(db, &name)
+            || resolve::resolve_global(api, &name).is_some()
+            || is_autoload_singleton(db, &name);
+        if collides
+            && let Some(range) = class_name_decl_range(root)
+        {
+            diagnostics.push(Diagnostic {
+                range,
+                severity: Severity::Warning,
+                code: SHADOWED_GLOBAL_IDENTIFIER.to_owned(),
+                message: format!(
+                    "The global class \"{name}\" hides a built-in/native/global/autoload."
+                ),
+                source: DiagnosticSource::Type,
+                fixes: Vec::new(),
+            });
+        }
+    }
+
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
     {
@@ -279,6 +307,41 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         units,
         diagnostics,
     }
+}
+
+/// Whether `name` is declared as a `class_name` by more than one file in the project (W2). Reads
+/// the cross-file `class_name_collisions` firewall; `false` (no warning) when no source root is set
+/// — single-file analysis cannot observe a duplicate.
+fn collisions_contains(db: &dyn Db, name: &SmolStr) -> bool {
+    db.source_root()
+        .is_some_and(|root| crate::queries::class_name_collisions(db, root).contains(name))
+}
+
+/// Whether `name` is a `*`-flagged autoload singleton (a bare global). `false` when no
+/// `project.godot` is loaded — the seam, no warning.
+fn is_autoload_singleton(db: &dyn Db, name: &str) -> bool {
+    db.project_config().is_some_and(|config| {
+        crate::queries::autoload_registry(db, config)
+            .resolve_path(name)
+            .is_some()
+    })
+}
+
+/// The NAME range of the file's `class_name` declaration, trimmed to the bare identifier (the
+/// `Name` CST node absorbs leading inter-token trivia). `None` if the file declares no `class_name`
+/// or the decl has no name token. Mirrors `item_tree::trimmed_name_range` / navigation's
+/// `class_decl_target` (which lives in the IDE crate, hence this local CST scan).
+fn class_name_decl_range(root: &GdNode) -> Option<TextRange> {
+    use gdscript_syntax::SyntaxKind;
+    let decl = gdscript_syntax::ast::descendants(root)
+        .into_iter()
+        .find(|n| n.kind() == SyntaxKind::ClassNameDecl)?;
+    let name_node = decl.children().find(|c| c.kind() == SyntaxKind::Name)?;
+    let r = cst::text_range_of(&name_node);
+    let text = name_node.text().to_string();
+    let lead = u32::try_from(text.len() - text.trim_start().len()).unwrap_or(0);
+    let len = u32::try_from(text.trim().len()).unwrap_or(0);
+    Some(TextRange::new(r.start + lead, r.start + lead + len))
 }
 
 /// Infer a class field declaration as a single local-var statement (full annotation checks).

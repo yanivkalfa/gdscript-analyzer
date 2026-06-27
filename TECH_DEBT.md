@@ -327,6 +327,14 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
   navigation + 1 e2e tests (incl. the adversarial same-name set). Reference corpus 57 → 57.
 
 ### Deferred / found
+- [x] **`global_registry` first-wins SILENTLY → collision/shadowing diagnostic — DONE (W2).** A new
+      `class_name_collisions` tracked query mirrors `global_registry`'s firewall (offset-free
+      `file_class_name`, names declared by >1 file); `analyze_file` emits ONE
+      `SHADOWED_GLOBAL_IDENTIFIER` Warning at the `class_name` NAME range when the name is a
+      cross-file duplicate, shadows an engine/native class or builtin/utility/global
+      (`resolve::resolve_global`), or shadows a `*`-autoload singleton. Conservative: no source root
+      (single-file) or no `project.godot` ⇒ the seam, no warning. `file_class_name` stays the
+      firewall projection.
 - [x] **`extends "res://path.gd"` + `preload` need a `res://` → `FileId` map — DONE in M3** (above).
       `load(var)`/`load("lit")` stay opaque by design (D5).
 - [ ] **(M5) Scene/config rewriting deferred → rename refuses.** `.tscn`/`.tres` are not ingested

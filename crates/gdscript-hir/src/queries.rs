@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use gdscript_db::{Db, FileText, ProjectConfig, SourceRoot, parse};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use gdscript_base::FileId;
@@ -88,8 +88,8 @@ pub fn file_class_name(db: &dyn Db, file: FileText) -> Option<SmolStr> {
 
 /// The project-wide global `class_name` registry. Keyed on the [`SourceRoot`] file-set input and
 /// the per-file [`file_class_name`] projections. A duplicate `class_name` keeps the first by
-/// `FileId` order (the file set is sorted), so resolution is deterministic. (Collision
-/// diagnostics are an M1 follow-up.)
+/// `FileId` order (the file set is sorted), so resolution is deterministic. Collision *diagnostics*
+/// (warning at each duplicate declaration) are the separate [`class_name_collisions`] projection.
 #[salsa::tracked]
 pub fn global_registry(db: &dyn Db, root: SourceRoot) -> Arc<GlobalRegistry> {
     let mut classes = FxHashMap::default();
@@ -99,6 +99,25 @@ pub fn global_registry(db: &dyn Db, root: SourceRoot) -> Arc<GlobalRegistry> {
         }
     }
     Arc::new(GlobalRegistry { classes })
+}
+
+/// The set of global `class_name`s declared by **more than one** file in `root` — the shadowing
+/// diagnostic's cross-file half. Mirrors [`global_registry`]'s firewall exactly: it reads only the
+/// offset-free [`file_class_name`] projection of each file (never a body or byte range), so a
+/// keystroke never rebuilds it. `global_registry` keeps the *first* declarer silently; this query
+/// names the duplicates so [`crate::infer::analyze_file`] can warn at each colliding declaration.
+#[salsa::tracked]
+pub fn class_name_collisions(db: &dyn Db, root: SourceRoot) -> Arc<FxHashSet<SmolStr>> {
+    let mut seen: FxHashSet<SmolStr> = FxHashSet::default();
+    let mut dups: FxHashSet<SmolStr> = FxHashSet::default();
+    for &file in root.files(db) {
+        if let Some(name) = file_class_name(db, file) {
+            if !seen.insert(name.clone()) {
+                dups.insert(name);
+            }
+        }
+    }
+    Arc::new(dups)
 }
 
 /// The project-wide `res:// path → FileId` registry (M3): the map `preload("res://x.gd")` and
@@ -542,6 +561,125 @@ mod tests {
             "unexpected diagnostics: {:?}",
             fi.diagnostics
         );
+    }
+
+    // ---- W2: class_name collision / shadowing diagnostics ---------------------------------
+
+    use crate::infer::SHADOWED_GLOBAL_IDENTIFIER;
+
+    fn shadow_codes(fi: &Arc<FileInference>) -> Vec<&str> {
+        fi.diagnostics
+            .iter()
+            .filter(|d| d.code == SHADOWED_GLOBAL_IDENTIFIER)
+            .map(|d| d.code.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn class_name_collisions_names_only_the_duplicates() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "class_name Dup\n", Durability::LOW);
+        db.set_file_text(FileId(1), "class_name Dup\n", Durability::LOW);
+        db.set_file_text(FileId(2), "class_name Unique\n", Durability::LOW);
+        db.sync_source_root();
+        let root = db.source_root().unwrap();
+
+        let cols = class_name_collisions(&db, root);
+        assert!(cols.contains(&SmolStr::new("Dup")));
+        assert!(
+            !cols.contains(&SmolStr::new("Unique")),
+            "a singly-declared class_name is not a collision",
+        );
+        assert_eq!(cols.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_class_name_warns_at_both_declarations() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "class_name Dup\nfunc f():\n\tpass\n", Durability::LOW);
+        db.set_file_text(FileId(1), "class_name Dup\nvar x := 1\n", Durability::LOW);
+        db.sync_source_root();
+
+        for fid in [0, 1] {
+            let fi = analyze_file(&db, db.file_text(FileId(fid)).unwrap());
+            assert!(
+                shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+                "file {fid} should warn on the duplicate class_name: {:?}",
+                fi.diagnostics
+            );
+            // The warning points at the NAME (`Dup` at offset 11), not byte 0 or the keyword.
+            let d = fi
+                .diagnostics
+                .iter()
+                .find(|d| d.code == SHADOWED_GLOBAL_IDENTIFIER)
+                .unwrap();
+            assert_eq!(d.range, gdscript_base::TextRange::new(11, 14));
+        }
+    }
+
+    #[test]
+    fn class_name_shadowing_an_engine_class_warns() {
+        let mut db = RootDatabase::default();
+        // `Node` is an engine class — declaring `class_name Node` shadows it.
+        db.set_file_text(FileId(0), "class_name Node\nfunc f():\n\tpass\n", Durability::LOW);
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(
+            shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "class_name Node must warn (shadows the engine class): {:?}",
+            fi.diagnostics
+        );
+    }
+
+    #[test]
+    fn class_name_shadowing_a_builtin_type_warns() {
+        let mut db = RootDatabase::default();
+        // `Vector2` is a builtin Variant type — a `class_name Vector2` hides it.
+        db.set_file_text(FileId(0), "class_name Vector2\n", Durability::LOW);
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER), "{:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn class_name_shadowing_a_star_autoload_warns() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "class_name Game\nfunc f():\n\tpass\n", Durability::LOW);
+        db.set_file_path(FileId(0), "res://game.gd");
+        // A `*`-singleton named `Game` — the class_name now hides the autoload global.
+        db.set_project_config("[autoload]\nGame=\"*res://other.gd\"\n");
+        db.sync_source_root();
+
+        let fi = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(
+            shadow_codes(&fi).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "class_name Game must warn (shadows the `*Game` autoload): {:?}",
+            fi.diagnostics
+        );
+    }
+
+    #[test]
+    fn unique_non_shadowing_class_name_does_not_warn() {
+        // No false positive: a one-of-a-kind name that is no engine/builtin/autoload symbol.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class_name MyVeryOwnUniquePlayer\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
+        db.set_file_text(FileId(1), "class_name AnotherUniqueEnemy\n", Durability::LOW);
+        db.sync_source_root();
+
+        for fid in [0, 1] {
+            let fi = analyze_file(&db, db.file_text(FileId(fid)).unwrap());
+            assert!(
+                shadow_codes(&fi).is_empty(),
+                "file {fid}: a unique class_name must not warn: {:?}",
+                fi.diagnostics
+            );
+        }
     }
 
     #[test]
