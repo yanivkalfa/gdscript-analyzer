@@ -30,9 +30,10 @@ mod handlers;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use gdscript_base::{Cancellable, FileId};
 use gdscript_ide::{Analysis, AnalysisHost, Change};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
@@ -177,7 +178,14 @@ fn main_loop(conn: &Connection, encoding: PositionEncoding, roots: Vec<Uri>) -> 
     // keeps draining in-flight read responses to the client until `exit` — never leaving a read
     // request unanswered (the client would otherwise hang).
     let mut shutting_down = false;
+    // A channel that never fires — selected when no diagnostics debounce is armed, so the arm is
+    // inert until `diag_timer` is `Some`.
+    let idle = crossbeam_channel::never::<Instant>();
     loop {
+        // Clone the (optional) debounce timer for THIS iteration so the `select!` arm doesn't borrow
+        // `state` (the message arms need `&mut state`). A re-arm on the next edit is picked up next
+        // iteration; a fired-then-disarmed timer reverts to `idle`.
+        let diag_timer = state.diag_timer.clone();
         crossbeam_channel::select! {
             recv(conn.receiver) -> msg => {
                 let Ok(msg) = msg else { return Ok(()) }; // client disconnected — nothing to flush to
@@ -211,6 +219,10 @@ fn main_loop(conn: &Connection, encoding: PositionEncoding, roots: Vec<Uri>) -> 
                     conn.sender.send(msg)?; // a finished read's Response → the client (incl. during shutdown→exit)
                 }
             }
+            recv(diag_timer.as_ref().unwrap_or(&idle)) -> _ => {
+                // The debounce window elapsed → recompute + publish the coalesced diagnostics.
+                state.flush_dirty_diags(conn)?;
+            }
         }
     }
 }
@@ -231,7 +243,18 @@ struct GlobalState {
     /// The scanned project root (the `project.godot` dir) — for computing a `res://` path for a file
     /// created later (a `didChangeWatchedFiles` Created event).
     project_root: Option<PathBuf>,
+    /// Open documents whose diagnostics need (re)publishing, coalesced across rapid `didChange`
+    /// edits and flushed once the debounce timer fires.
+    dirty_diags: HashSet<FileId>,
+    /// The debounce timer for [`dirty_diags`](Self::dirty_diags): (re)armed on each `didChange`, so a
+    /// burst of keystrokes recomputes+publishes diagnostics once, after a short quiescence, rather
+    /// than synchronously on every keystroke. `None` when nothing is pending.
+    diag_timer: Option<Receiver<Instant>>,
 }
+
+/// How long to wait for typing to settle before recomputing diagnostics (debounce window). The
+/// incremental analyzer is fast (<5 ms warm), so this only collapses redundant work during a burst.
+const DIAG_DEBOUNCE: Duration = Duration::from_millis(150);
 
 impl GlobalState {
     fn new(encoding: PositionEncoding, task_tx: Sender<Message>, roots: Vec<Uri>) -> Self {
@@ -244,7 +267,26 @@ impl GlobalState {
             loaded: false,
             with_path: HashSet::new(),
             project_root: None,
+            dirty_diags: HashSet::new(),
+            diag_timer: None,
         }
+    }
+
+    /// Mark `id`'s diagnostics dirty and (re)arm the debounce timer — a burst of edits then yields a
+    /// single recompute once typing settles (see [`DIAG_DEBOUNCE`]).
+    fn mark_diag_dirty(&mut self, id: FileId) {
+        self.dirty_diags.insert(id);
+        self.diag_timer = Some(crossbeam_channel::after(DIAG_DEBOUNCE));
+    }
+
+    /// Recompute + publish diagnostics for every file marked dirty since the last flush, and disarm
+    /// the timer. Called when the debounce window elapses.
+    fn flush_dirty_diags(&mut self, conn: &Connection) -> Result<()> {
+        self.diag_timer = None;
+        for id in std::mem::take(&mut self.dirty_diags) {
+            self.publish_diagnostics(conn, id)?;
+        }
+        Ok(())
     }
 
     /// Scan the workspace roots into the one host: every `.gd`/`.tscn` as a background file (with its
@@ -551,8 +593,10 @@ impl GlobalState {
                 let new_text = self.apply_content_changes(id, &p.content_changes);
                 self.maybe_update_project_config(&uri, &new_text);
                 self.vfs.upsert(&uri, new_text, p.text_document.version);
+                // Commit the text immediately (so reads see it + salsa cancels in-flight reads), but
+                // DEBOUNCE the diagnostics recompute so a burst of keystrokes publishes once.
                 self.commit(id);
-                self.publish_diagnostics(conn, id)?;
+                self.mark_diag_dirty(id);
             }
             "textDocument/didClose" => {
                 let Ok(p) =
@@ -562,6 +606,8 @@ impl GlobalState {
                 };
                 if let Some(id) = self.vfs.id(&p.text_document.uri) {
                     self.vfs.close(id);
+                    // Drop any pending debounced diagnostics for the now-closed doc (we clear them).
+                    self.dirty_diags.remove(&id);
                     // Revert the host to the file's on-disk text (it stays part of the project);
                     // `commit` removes it entirely if it had no disk layer (an ad-hoc open).
                     self.commit(id);
@@ -1056,6 +1102,75 @@ mod tests {
         );
 
         // shutdown / exit.
+        send_req(&client, 2, "shutdown", ());
+        let _ = next_response(&client);
+        send_note(&client, "exit", ());
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn rapid_didchanges_coalesce_and_publish_the_final_state() {
+        // A burst of edits debounces to a single recompute that reflects the LAST edit. The edits are
+        // queued faster than the debounce window, so the server applies all three before the timer
+        // fires → one publish, carrying the final state's INTEGER_DIVISION.
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || run(&server));
+        send_req(&client, 1, "initialize", InitializeParams::default());
+        let _ = next_response(&client);
+        send_note(&client, "initialized", InitializedParams {});
+
+        let doc_uri = uri("file:///main.gd");
+        send_note(
+            &client,
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "gdscript".to_owned(),
+                    version: 1,
+                    text: "func f():\n\tpass\n".to_owned(),
+                },
+            },
+        );
+        let open = next_diagnostics(&client);
+        assert!(
+            open.diagnostics.is_empty(),
+            "clean open: {:?}",
+            open.diagnostics
+        );
+
+        for (v, text) in [
+            (2, "func f():\n\tvar a := 9\n"),
+            (3, "func f():\n\tvar b := 8\n"),
+            (4, "func f():\n\tvar x := 1 / 2\n"),
+        ] {
+            send_note(
+                &client,
+                "textDocument/didChange",
+                DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                        version: v,
+                    },
+                    // A full-document replace (no range) — the whole buffer is `text`.
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: text.to_owned(),
+                    }],
+                },
+            );
+        }
+        let diags = next_diagnostics(&client);
+        assert!(
+            diags
+                .diagnostics
+                .iter()
+                .any(|d| d.code == Some(NumberOrString::String("INTEGER_DIVISION".to_owned()))),
+            "the coalesced publish must reflect the final `1 / 2`: {:?}",
+            diags.diagnostics,
+        );
+
         send_req(&client, 2, "shutdown", ());
         let _ = next_response(&client);
         send_note(&client, "exit", ());

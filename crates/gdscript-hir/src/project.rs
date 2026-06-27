@@ -71,6 +71,56 @@ pub fn parse_autoloads(text: &str) -> Vec<AutoloadEntry> {
     entries
 }
 
+/// Parse the Godot engine `(major, minor)` version from `project.godot`'s `[application]`
+/// `config/features=PackedStringArray("4.3", "Forward Plus", …)` line. Godot writes the engine
+/// version as the first `<major>.<minor>` entry of that array; the rest are rendering/feature tags.
+/// Returns the first version-shaped entry, or `None` if the line is absent or carries none. A
+/// deliberate minimal scan (not a `VariantParser` port); robust to malformed input (never panics).
+#[must_use]
+pub fn parse_engine_version(text: &str) -> Option<(u32, u32)> {
+    let mut in_application = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_application = inner.trim() == "application";
+            continue;
+        }
+        if !in_application {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "config/features" {
+            continue;
+        }
+        // `PackedStringArray("4.3", "Forward Plus")` → the parenthesized list (tolerate a bare
+        // quoted value, and the Godot-3.x `PoolStringArray` name, defensively).
+        let value = value.trim();
+        let inner = value
+            .strip_prefix("PackedStringArray(")
+            .or_else(|| value.strip_prefix("PoolStringArray("))
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(value);
+        return inner
+            .split(',')
+            .find_map(|part| parse_major_minor(dequote(part.trim())));
+    }
+    None
+}
+
+/// Parse a `<major>.<minor>` string (ignoring any trailing `.patch`) into `(major, minor)`.
+/// `None` for any non-numeric or single-component string (e.g. a feature tag like `"Vulkan"`).
+fn parse_major_minor(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
 /// Strip one layer of matching surrounding quotes (`"…"` / `'…'`), else return as-is.
 fn dequote(s: &str) -> &str {
     let bytes = s.as_bytes();
@@ -134,5 +184,52 @@ mod tests {
     fn empty_or_no_autoload_section_is_empty() {
         assert!(parse_autoloads("").is_empty());
         assert!(parse_autoloads("[application]\nconfig/name=\"X\"\n").is_empty());
+    }
+
+    #[test]
+    fn parses_engine_version_from_config_features() {
+        let src = "config_version=5\n\
+            [application]\n\
+            config/name=\"Demo\"\n\
+            config/features=PackedStringArray(\"4.3\", \"Forward Plus\")\n";
+        assert_eq!(parse_engine_version(src), Some((4, 3)));
+    }
+
+    #[test]
+    fn engine_version_picks_the_version_shaped_entry_anywhere_in_the_array() {
+        // The version need not be first; feature tags (rendering, etc.) are skipped.
+        let src = "[application]\nconfig/features=PackedStringArray(\"Forward Plus\", \"4.6\", \"Mobile\")\n";
+        assert_eq!(parse_engine_version(src), Some((4, 6)));
+    }
+
+    #[test]
+    fn engine_version_ignores_patch_and_tolerates_bare_value() {
+        assert_eq!(
+            parse_engine_version("[application]\nconfig/features=PackedStringArray(\"4.2.1\")\n"),
+            Some((4, 2)),
+        );
+        assert_eq!(
+            parse_engine_version("[application]\nconfig/features=\"4.5\"\n"),
+            Some((4, 5)),
+        );
+    }
+
+    #[test]
+    fn engine_version_none_when_absent_or_no_version_entry() {
+        assert_eq!(parse_engine_version(""), None);
+        assert_eq!(
+            parse_engine_version("[application]\nconfig/name=\"X\"\n"),
+            None
+        );
+        // config/features outside [application] is not the engine version.
+        assert_eq!(
+            parse_engine_version("[rendering]\nconfig/features=PackedStringArray(\"4.6\")\n"),
+            None,
+        );
+        // A features array with no version-shaped entry → None (not a panic).
+        assert_eq!(
+            parse_engine_version("[application]\nconfig/features=PackedStringArray(\"Vulkan\")\n"),
+            None,
+        );
     }
 }
