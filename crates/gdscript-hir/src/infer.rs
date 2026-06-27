@@ -39,10 +39,21 @@ pub const INTEGER_DIVISION: &str = "INTEGER_DIVISION";
 pub const UNSAFE_PROPERTY_ACCESS: &str = "UNSAFE_PROPERTY_ACCESS";
 /// A method missing on a statically-known base.
 pub const UNSAFE_METHOD_ACCESS: &str = "UNSAFE_METHOD_ACCESS";
+/// An argument whose static type needs an unsafe implicit cast (`Variant` / a downcast) into the
+/// resolved parameter type — Godot's per-argument value-prop warning.
+pub const UNSAFE_CALL_ARGUMENT: &str = "UNSAFE_CALL_ARGUMENT";
 /// A `$Path`/`%Unique`/`get_node("…")` whose literal path is genuinely absent in the owning scene
 /// (only raised when the script attaches to exactly one scene — never on an `..`/absolute path or a
 /// path that descends into an instanced sub-scene we don't see).
 pub const INVALID_NODE_PATH: &str = "INVALID_NODE_PATH";
+/// A declared `class_name` that shadows another global identifier — a duplicate user `class_name`,
+/// an engine/native class, a builtin/utility, a global enum/const, or a `*`-autoload singleton.
+/// Godot's `gdscript_analyzer.cpp` raises this (as an error) so the global namespace stays unique.
+pub const SHADOWED_GLOBAL_IDENTIFIER: &str = "SHADOWED_GLOBAL_IDENTIFIER";
+/// A genuine `extends` cycle: a file's base chain transitively returns to itself (`A extends B`,
+/// `B extends A`). Illegal in Godot (`gdscript_analyzer.cpp` raises it). Only the `extends`
+/// inheritance chain cycles — a `preload`/`load` cycle is legal at runtime and is NOT reported.
+pub const CYCLIC_INHERITANCE: &str = "CYCLIC_INHERITANCE";
 
 /// What kind of binding a [`Binding`] describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,31 +235,101 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
     // `self` is the script's OWN class (a self-`ScriptRef`), not just its engine base — so member
     // access on an aliased `self` resolves the file's own members (see `ClassScope::self_ty`).
     let self_ref = Ty::ScriptRef(ScriptRefId(file_id.0));
+    // The file's own `res://` path, for anchoring relative `preload`/`extends` to its directory.
+    let res_path = db.file_text(file_id).and_then(|ft| ft.res_path(db));
+
+    // A declared `class_name` that collides with another global identifier (W2). Mirrors Godot's
+    // `gdscript_analyzer.cpp` uniqueness check over the global namespace, projected through the
+    // cross-file firewall (`class_name_collisions`) and the offset-free global resolvers — so it
+    // fires only when genuinely shadowing, never on the seam. Emitted once, at the decl's NAME.
+    if let Some(name) = tree.class_name.clone() {
+        let collides = collisions_contains(db, &name)
+            || resolve::resolve_global(api, &name).is_some()
+            || is_autoload_singleton(db, &name);
+        if collides && let Some(range) = class_name_decl_range(root) {
+            diagnostics.push(Diagnostic {
+                range,
+                severity: Severity::Warning,
+                code: SHADOWED_GLOBAL_IDENTIFIER.to_owned(),
+                message: format!(
+                    "The global class \"{name}\" hides a built-in/native/global/autoload."
+                ),
+                source: DiagnosticSource::Type,
+                fixes: Vec::new(),
+            });
+        }
+    }
+
+    // A genuine `extends` cycle (D7): walk THIS file's base chain by `FileId`; if it returns to the
+    // start, the inheritance is cyclic (illegal in Godot). Reported once, at the file's own `extends`
+    // decl range. Only `extends` cycles are walked here (member lookup is the only thing that loops);
+    // `preload`/`load` cycles are legal at runtime and never reach this resolver. We start by stepping
+    // ONTO the user base — if the very first base is the start file (`extends "res://self.gd"`, or two
+    // files A↔B), the revisit-of-start check fires; a deep but ACYCLIC chain bottoms out at an engine
+    // `Object`/`Unknown` and never revisits, so it does not false-fire.
+    if extends_chain_is_cyclic(db, file_id)
+        && let Some(range) = extends_decl_range(root)
+    {
+        diagnostics.push(Diagnostic {
+            range,
+            severity: Severity::Warning,
+            code: CYCLIC_INHERITANCE.to_owned(),
+            message: "Cyclic class hierarchy: this class's `extends` chain returns to itself."
+                .to_owned(),
+            source: DiagnosticSource::Type,
+            fixes: Vec::new(),
+        });
+    }
 
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
+    //
+    // A field initializer may reference an *earlier* field (`var a := 1` then `var b := a + 1`),
+    // so a single shallow round sees the referent as `Variant`/seam. We run a BOUNDED fixpoint:
+    // each round re-infers every field against the prior round's `member_types`, until the map
+    // stops changing or we hit the round cap. Cheap (fields are few, types settle in a round or
+    // two) and deterministic. Only the final round's units/diagnostics are kept — earlier rounds
+    // are throwaway probes feeding the seed.
     {
-        let mut class = ClassScope::new(db, api, &tree);
-        class.self_ty = self_ref.clone();
-        for m in &tree.members {
-            let (ptr, range) = match m {
-                Member::Var(v) => (v.ptr, v.range),
-                Member::Const(c) => (c.ptr, c.range),
-                _ => continue,
-            };
-            if let Some(unit) = unit_from_decl(db, api, root, &class, ptr, range) {
-                if let (Some(name), Some(b)) = (m.name(), unit.result.bindings.first()) {
-                    member_types.insert(SmolStr::new(name), b.ty.clone());
+        // Bound the iteration: a linear `a -> b -> c -> …` chain settles in O(n) rounds, but a
+        // small constant is enough in practice (the corpus settles in ≤2) and guarantees
+        // termination even if a type oscillated.
+        const MAX_ROUNDS: usize = 4;
+        let mut final_units: Vec<Unit> = Vec::new();
+        let mut final_diagnostics: Vec<Diagnostic> = Vec::new();
+        for _ in 0..MAX_ROUNDS {
+            let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
+            class.self_ty = self_ref.clone();
+            class.member_types.clone_from(&member_types);
+            let mut next_member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
+            final_units = Vec::new();
+            final_diagnostics = Vec::new();
+            for m in &tree.members {
+                let (ptr, range) = match m {
+                    Member::Var(v) => (v.ptr, v.range),
+                    Member::Const(c) => (c.ptr, c.range),
+                    _ => continue,
+                };
+                if let Some(unit) = unit_from_decl(db, api, root, &class, ptr, range) {
+                    if let (Some(name), Some(b)) = (m.name(), unit.result.bindings.first()) {
+                        next_member_types.insert(SmolStr::new(name), b.ty.clone());
+                    }
+                    final_diagnostics.extend(unit.result.diagnostics.iter().cloned());
+                    final_units.push(unit);
                 }
-                diagnostics.extend(unit.result.diagnostics.iter().cloned());
-                units.push(unit);
             }
+            if next_member_types == member_types {
+                break;
+            }
+            member_types = next_member_types;
         }
+        diagnostics.extend(final_diagnostics);
+        units.extend(final_units);
     }
 
     // Pass 2 — functions, against a scope carrying the seeded field types.
     {
-        let mut class = ClassScope::new(db, api, &tree);
+        let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
         class.member_types = member_types;
         class.self_ty = self_ref.clone();
         for m in &tree.members {
@@ -274,6 +355,97 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         units,
         diagnostics,
     }
+}
+
+/// Whether `name` is declared as a `class_name` by more than one file in the project (W2). Reads
+/// the cross-file `class_name_collisions` firewall; `false` (no warning) when no source root is set
+/// — single-file analysis cannot observe a duplicate.
+fn collisions_contains(db: &dyn Db, name: &SmolStr) -> bool {
+    db.source_root()
+        .is_some_and(|root| crate::queries::class_name_collisions(db, root).contains(name))
+}
+
+/// Whether `name` is a `*`-flagged autoload singleton (a bare global). `false` when no
+/// `project.godot` is loaded — the seam, no warning.
+fn is_autoload_singleton(db: &dyn Db, name: &str) -> bool {
+    db.project_config().is_some_and(|config| {
+        crate::queries::autoload_registry(db, config)
+            .resolve_path(name)
+            .is_some()
+    })
+}
+
+/// The NAME range of the file's `class_name` declaration, trimmed to the bare identifier (the
+/// `Name` CST node absorbs leading inter-token trivia). `None` if the file declares no `class_name`
+/// or the decl has no name token. Mirrors `item_tree::trimmed_name_range` / navigation's
+/// `class_decl_target` (which lives in the IDE crate, hence this local CST scan).
+fn class_name_decl_range(root: &GdNode) -> Option<TextRange> {
+    use gdscript_syntax::SyntaxKind;
+    let decl = gdscript_syntax::ast::descendants(root)
+        .into_iter()
+        .find(|n| n.kind() == SyntaxKind::ClassNameDecl)?;
+    let name_node = decl.children().find(|c| c.kind() == SyntaxKind::Name)?;
+    let r = cst::text_range_of(name_node);
+    let text = name_node.text().to_string();
+    let lead = u32::try_from(text.len() - text.trim_start().len()).unwrap_or(0);
+    let len = u32::try_from(text.trim().len()).unwrap_or(0);
+    Some(TextRange::new(r.start + lead, r.start + lead + len))
+}
+
+/// The byte range of the file's top-level `extends` declaration — the anchor for `CYCLIC_INHERITANCE`.
+/// Two surface forms: a standalone `extends Target` (an [`ExtendsClause`] child of the `SourceFile`),
+/// or the inline `class_name Name extends Target` (the `extends` keyword + target inside the
+/// [`ClassNameDecl`]). Scans only the `SourceFile`'s DIRECT children, so an inner class's `extends`
+/// (nested under `Class`/`ClassBody`) is never mistaken for the file's own. `None` if the file has no
+/// top-level `extends`.
+fn extends_decl_range(root: &GdNode) -> Option<TextRange> {
+    use gdscript_syntax::SyntaxKind;
+    for child in root.children() {
+        match child.kind() {
+            // Standalone `extends Target` — the whole clause is the anchor.
+            SyntaxKind::ExtendsClause => return Some(cst::text_range_of(child)),
+            // Inline `class_name Name extends Target` — anchor the `extends` keyword onward.
+            SyntaxKind::ClassNameDecl => {
+                if let Some(kw) = child.children().find(|c| c.kind() == SyntaxKind::ExtendsKw) {
+                    let start = cst::text_range_of(kw).start;
+                    let end = cst::text_range_of(child).end;
+                    return Some(TextRange::new(start, end));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the file's `extends` inheritance chain transitively returns to itself (a genuine cycle).
+/// Walks base-by-base by `FileId` from `start`, stepping only across user `ScriptRef` bases (an
+/// engine `Object`/`Unknown` base ends the chain). A `FileId` revisit means a cycle. We stop as soon
+/// as we either revisit a file (cycle) or hit a non-script base (acyclic) — a deep but acyclic chain
+/// terminates without a revisit and is NOT flagged. Depth is also hard-capped as belt-and-suspenders
+/// (the visited set already guarantees termination).
+fn extends_chain_is_cyclic(db: &dyn Db, start: FileId) -> bool {
+    use std::collections::HashSet;
+    let mut visited: HashSet<FileId> = HashSet::new();
+    visited.insert(start);
+    let mut current = start;
+    for _ in 0..=64 {
+        let Some(file) = db.file_text(current) else {
+            return false;
+        };
+        let base = crate::queries::script_class(db, file).base().clone();
+        let Ty::ScriptRef(next) = base else {
+            return false; // engine `Object` / `Unknown` base — chain ends, no cycle.
+        };
+        let next_id = FileId(next.0);
+        if !visited.insert(next_id) {
+            // Revisiting an already-seen file closes a cycle. We report the cycle for every file ON
+            // it (each file's own `extends` is genuinely cyclic), so no need to special-case `start`.
+            return true;
+        }
+        current = next_id;
+    }
+    false
 }
 
 /// Infer a class field declaration as a single local-var statement (full annotation checks).
@@ -625,10 +797,16 @@ impl Cx<'_> {
                 self.bool_ty()
             }
             Expr::Await(operand) => {
-                self.infer_expr(operand, &Expectation::None);
-                // The awaited result (a signal's args / a coroutine's return) is not tracked in
-                // Phase 2 — use the seam, not `Variant`, so `var x := await f()` never warns.
-                Ty::Unknown
+                let operand_ty = self.infer_expr(operand, &Expectation::None);
+                // `await coroutine()` yields the call's value, so await is **identity** on the operand
+                // type (`await f()` for `func f() -> int` is `int`) — recovered here. `await signal`
+                // instead yields the signal's emitted payload, which needs the Phase-3+ signal-signature
+                // table; until then it's the seam (never `Variant`, so `var x := await sig` never warns).
+                if matches!(operand_ty, Ty::Signal(_)) {
+                    Ty::Unknown
+                } else {
+                    operand_ty
+                }
             }
             Expr::Array(elems) => {
                 // Checking mode: an expected `Array[T]` is pushed down onto the literal (so
@@ -677,8 +855,17 @@ impl Cx<'_> {
                 // usual `ScriptRef` walk). A non-constant argument (`preload(var)`) — which Godot
                 // itself rejects — stays the seam, never a false diagnostic.
                 match path {
+                    // Anchor a relative `preload("sibling.gd")` to the importing file's directory
+                    // before resolving (Godot anchors relative resource paths); absolute paths pass
+                    // through, and a relative path with no anchor stays the seam.
                     Some(p) => {
-                        resolve::resolve_external(self.db, &resolve::ExternalRef::Preload(p))
+                        match resolve::anchor_res_path(self.self_res_path().as_deref(), &p) {
+                            Some(abs) => resolve::resolve_external(
+                                self.db,
+                                &resolve::ExternalRef::Preload(abs),
+                            ),
+                            None => Ty::Unknown,
+                        }
                     }
                     None => Ty::Unknown,
                 }
@@ -765,6 +952,15 @@ impl Cx<'_> {
         };
         let ft = self.db.file_text(FileId(sref.0))?;
         crate::queries::scene_context(self.db, ft)
+    }
+
+    /// The importing file's own `res://` path (from `self_ty`), for anchoring relative
+    /// `preload`/`extends` paths to its directory. `None` when the file has no resource path.
+    fn self_res_path(&self) -> Option<SmolStr> {
+        let Ty::ScriptRef(sref) = &self.self_ty else {
+            return None;
+        };
+        self.db.file_text(FileId(sref.0))?.res_path(self.db)
     }
 
     /// The concrete `Ty` of a scene node, by precedence: an attached script's own class (most
@@ -902,7 +1098,7 @@ impl Cx<'_> {
         for &a in args {
             self.infer_expr(a, &Expectation::None);
         }
-        match self.body.expr(callee).clone() {
+        let ret = match self.body.expr(callee).clone() {
             Expr::Field {
                 receiver,
                 name,
@@ -922,7 +1118,99 @@ impl Cx<'_> {
                 self.infer_expr(callee, &Expectation::None);
                 Ty::Unknown
             }
+        };
+        // UNSAFE_CALL_ARGUMENT (Phase-2 §5): args + receiver are now inferred (in `expr_ty`), so
+        // check each argument against the statically-resolved callee's parameter types.
+        self.check_call_args(callee, args);
+        ret
+    }
+
+    /// Raise `UNSAFE_CALL_ARGUMENT` for each argument whose static type needs an unsafe implicit
+    /// cast (`Variant` / a downcast) into the resolved parameter type — Godot's per-argument
+    /// value-prop warning. Only fires when the callee resolves to a concrete signature here; an
+    /// uninformative argument (the cross-file seam) is `Assign::Ok` and correctly silent, and an
+    /// untyped parameter accepts anything.
+    fn check_call_args(&mut self, callee: ExprId, args: &[ExprId]) {
+        let Some(params) = self.call_param_tys(callee) else {
+            return;
+        };
+        for (i, &arg) in args.iter().enumerate() {
+            let Some(param_ty) = params.get(i) else {
+                break; // a vararg tail or an arity mismatch — not an argument-type concern
+            };
+            if param_ty.is_uninformative() || param_ty.is_variant() {
+                continue; // an untyped parameter accepts anything safely
+            }
+            // A missing arg type defaults to the seam (never warns), not `Variant` (would warn).
+            let arg_ty = self.expr_ty.get(&arg).cloned().unwrap_or(Ty::Unknown);
+            if ty::is_assignable(self.api, &arg_ty, param_ty) == Assign::OkUnsafe {
+                let pl = param_ty.label(self.api).unwrap_or_else(|| "?".to_owned());
+                let al = arg_ty.label(self.api).unwrap_or_else(|| "?".to_owned());
+                self.emit(
+                    self.range_of(arg),
+                    Severity::Warning,
+                    UNSAFE_CALL_ARGUMENT,
+                    format!(
+                        "The argument {} requires a value of type \"{pl}\" but is passed \"{al}\", which is unsafe.",
+                        i + 1
+                    ),
+                );
+            }
         }
+    }
+
+    /// Parameter types of a statically-resolved callee, for [`Self::check_call_args`]. `None` when
+    /// the callee isn't concretely resolvable here (a cross-file script method — params aren't
+    /// modeled —, a builtin/utility, a `Callable` value): those raise no argument warning.
+    fn call_param_tys(&self, callee: ExprId) -> Option<Vec<Ty>> {
+        match self.body.expr(callee) {
+            Expr::Name(name) => self.name_call_param_tys(name),
+            Expr::Field { receiver, name, .. } => match self.expr_ty.get(receiver)? {
+                Ty::Object(class) => match self.api.lookup_member(*class, name)? {
+                    MemberRef::Method(sig) => Some(
+                        sig.params
+                            .iter()
+                            .map(|p| ty::resolve_tyref(self.api, &p.ty))
+                            .collect(),
+                    ),
+                    _ => None,
+                },
+                // ScriptRef / builtin / seam receivers: params not uniformly modeled — skip.
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Parameter types for a bare-name call (`foo(...)` / an inherited `method(...)`): an own `func`
+    /// first, then the `self` engine base's method. Utilities/builtins are skipped (looser, often
+    /// variadic typing — out of the conservative MVP slice).
+    fn name_call_param_tys(&self, name: &str) -> Option<Vec<Ty>> {
+        if let Some(item) = self.class.lookup(name)
+            && let Some(Member::Func(f)) = self.class.member(item)
+        {
+            return Some(
+                f.params
+                    .iter()
+                    .map(|p| {
+                        p.type_ref.as_deref().map_or(Ty::Variant, |t| {
+                            resolve::resolve_type_name(self.db, self.api, t)
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        if let Ty::Object(base) = self.class.base
+            && let Some(MemberRef::Method(sig)) = self.api.lookup_member(base, name)
+        {
+            return Some(
+                sig.params
+                    .iter()
+                    .map(|p| ty::resolve_tyref(self.api, &p.ty))
+                    .collect(),
+            );
+        }
+        None
     }
 
     /// Resolve a bare-name call (`foo(...)`): own method → utility/builtin fn → constructor.
@@ -1534,7 +1822,7 @@ mod tests {
         let db = gdscript_db::RootDatabase::default();
         let root = parse(src).syntax_node();
         let tree = item_tree(&root);
-        let class = ClassScope::new(&db, api, &tree);
+        let class = ClassScope::new(&db, api, &tree, None);
         let func = gdscript_syntax::ast::descendants(&root)
             .into_iter()
             .find(|n| n.kind() == SyntaxKind::FuncDecl)
@@ -1552,6 +1840,16 @@ mod tests {
             .iter()
             .map(|d| d.code.as_str())
             .collect()
+    }
+
+    /// Run the whole-file pass (Pass 1 field fixpoint + Pass 2 functions) and collect every
+    /// diagnostic code. Drives `analyze_file` directly so the bounded member fixpoint runs.
+    fn file_codes(src: &str) -> Vec<String> {
+        let api = gdscript_api::bundled();
+        let db = gdscript_db::RootDatabase::default();
+        let root = parse(src).syntax_node();
+        let fi = analyze_file(&db, api, &root, FileId(0));
+        fi.diagnostics.iter().map(|d| d.code.clone()).collect()
     }
 
     #[test]
@@ -1645,10 +1943,73 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_call_argument_on_variant_into_typed_param() {
+        // Passing an untyped (Variant) value to a typed own-method parameter needs an unsafe cast.
+        let h = infer_first_func("func f(p):\n\ttake(p)\nfunc take(n: Node2D):\n\tpass\n");
+        assert!(
+            codes(&h).contains(&UNSAFE_CALL_ARGUMENT),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn unsafe_call_argument_silent_on_safe_and_untyped() {
+        // A subtype arg (upcast) is safe; an untyped parameter accepts anything — neither warns.
+        let upcast =
+            infer_first_func("func f(n: Node2D):\n\ttake(n)\nfunc take(n: Node):\n\tpass\n");
+        assert!(
+            !codes(&upcast).contains(&UNSAFE_CALL_ARGUMENT),
+            "upcast is safe: {:?}",
+            upcast.result.diagnostics
+        );
+        let untyped = infer_first_func("func f(p):\n\ttake(p)\nfunc take(n):\n\tpass\n");
+        assert!(
+            !codes(&untyped).contains(&UNSAFE_CALL_ARGUMENT),
+            "untyped param accepts anything: {:?}",
+            untyped.result.diagnostics
+        );
+    }
+
+    #[test]
     fn inference_on_variant() {
         // `:=` from an untyped (Variant) param.
         let h = infer_first_func("func f(x):\n\tvar y := x\n");
         assert!(codes(&h).contains(&INFERENCE_ON_VARIANT));
+    }
+
+    #[test]
+    fn field_inferred_from_earlier_field_is_typed() {
+        // W2-MEMBER-FIXPOINT: `b`'s initializer references the earlier field `a`. A single shallow
+        // field pass would see `a` as `Variant` (seam) and fire INFERENCE_ON_VARIANT on `:= a`; the
+        // bounded fixpoint seeds `a: int` so `a + 1` is `int` and `:=` is precise — no warning.
+        let codes = file_codes("var a := 1\nvar b := a + 1\n");
+        assert!(
+            !codes.iter().any(|c| c == INFERENCE_ON_VARIANT),
+            "field `b` from earlier field `a` should type as int, not Variant: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn field_forward_reference_is_seamed_not_warned() {
+        // A field referencing a *later* field still resolves through the fixpoint (both rounds
+        // see each other's seeded type), and at worst lands on the conservative seam — never a
+        // false INFERENCE_ON_VARIANT. (`b` precedes `a` lexically here.)
+        let codes = file_codes("var b := a\nvar a := 1\n");
+        assert!(
+            !codes.iter().any(|c| c == INFERENCE_ON_VARIANT),
+            "forward field reference must not false-warn: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_inferred_field_unchanged() {
+        // No-regression: a self-contained inferred field still types from its literal, no warning.
+        let codes = file_codes("var n := 0\n");
+        assert!(
+            codes.is_empty(),
+            "a literal-initialised field should produce no diagnostics: {codes:?}"
+        );
     }
 
     #[test]
@@ -1701,6 +2062,44 @@ mod tests {
             !codes(&h).contains(&INFERENCE_ON_VARIANT),
             "seam branch should keep the ternary on the seam: {:?}",
             h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn await_a_coroutine_call_recovers_its_return_type() {
+        // `await f()` yields the call's value, so await is identity on a non-signal operand:
+        // `await make()` for `func make() -> int` types `x` as int (was the seam before).
+        let src = "func g() -> int:\n\tvar x := await make()\n\treturn x\nfunc make() -> int:\n\treturn 5\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "no false variant warning: {:?}",
+            h.result.diagnostics
+        );
+        let api = gdscript_api::bundled();
+        let x = &h.result.bindings[0];
+        assert!(
+            matches!(&x.ty, Ty::Builtin(b) if api.builtin(*b).name == "int"),
+            "await make() should recover int, got {:?}",
+            x.ty
+        );
+    }
+
+    #[test]
+    fn await_a_signal_stays_the_seam() {
+        // `await sig` yields the signal's payload (needs the Phase-3+ sig table) — must stay the seam,
+        // never the Signal type itself, and never a false INFERENCE_ON_VARIANT.
+        let src = "func f():\n\tvar x := await get_tree().process_frame\n\treturn x\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "awaiting a signal must not warn: {:?}",
+            h.result.diagnostics
+        );
+        assert!(
+            matches!(&h.result.bindings[0].ty, Ty::Unknown),
+            "awaiting a signal stays the seam, got {:?}",
+            h.result.bindings[0].ty
         );
     }
 

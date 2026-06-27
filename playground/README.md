@@ -12,12 +12,16 @@ See [plans/PHASE-5-CLIENTS-AND-DISTRIBUTION.md](../plans/PHASE-5-CLIENTS-AND-DIS
 - **The WASM binding is done + verified** (`bindings/wasm`, a thin `#[wasm_bindgen]` wrapper over the
   fully-tested `gdscript-session`; compiles + clippy-clean for `wasm32-unknown-unknown` in CI). It
   exposes the full URI-keyed query surface + `loadEngineApi`.
-- **`index.html` is a minimal, build-less playground** (a textarea + diagnostics/hover/completions),
-  which also serves as the binding's usage example. It owns the **UTF-8 byte ↔ UTF-16** conversion
-  (the analyzer speaks byte offsets; the editor speaks UTF-16) — see the helpers in the page.
-- **Pending (needs the local wasm toolchain / a browser to validate end-to-end):** the `pkg/` build
-  (below) and a polished **Monaco/CodeMirror 6** editor (Playbook §4.1 — the textarea is the
-  robust-but-plain stand-in; the editor is swappable without touching the analyzer glue).
+- **`index.html` is a build-less playground with a real [Monaco](https://microsoft.github.io/monaco-editor/)
+  editor** (loaded from a CDN via Monaco's AMD loader — no bundler, so the GitHub-Pages deploy stays a
+  static copy). It registers live **diagnostics** (inline squiggles via `setModelMarkers` + a side panel),
+  a **hover** provider (the analyzer's inferred type + docs), a **completion** provider (triggered on
+  `.`/`$`/`%` and Ctrl-Space), and **signature help** — all calling the WASM `Analyzer` directly. It owns
+  the **UTF-8 byte ↔ UTF-16** conversion (the analyzer speaks byte offsets; Monaco speaks UTF-16) via the
+  helpers in the page. The editor is swappable without touching the analyzer glue.
+- **Verify in a browser** (the wasm calls are unit-tested in `gdscript-session`, but the Monaco glue —
+  providers, the worker proxy, position conversion — is browser-only): build `pkg/` (below), serve, and
+  exercise hover/completion/diagnostics. The live site is the Pages deploy.
 
 ## Build & serve
 

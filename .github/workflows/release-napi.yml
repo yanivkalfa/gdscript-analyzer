@@ -11,7 +11,11 @@ name: release-napi
 #   native (mac/win)          : napi build --platform --release --target <triple>
 #   linux aarch64 gnu (cross) : … --use-napi-cross
 # The matrix MUST match `bindings/node/package.json`'s `napi.targets` (drives `napi prepublish`).
-# (wasm32-wasip1-threads, musl/zigbuild, armv7, win-arm64 are deferred to a follow-up once proven.)
+# Native targets: x64/arm64 macOS + Windows (incl. win-arm64, a native MSVC cross), x64/arm64 Linux
+# gnu (cross via --use-napi-cross). STILL DEFERRED (each needs a CI-verified toolchain step):
+#   - x86_64/aarch64-unknown-linux-musl : zigbuild — add `cargo-zigbuild` + `ziglang` setup, build `-x`
+#   - armv7-unknown-linux-gnueabihf     : cross-compile (--use-napi-cross or zigbuild)
+#   - wasm32-wasip1-threads (WASI fallback) : emnapi runtime deps + WASI-SDK link step (unproven)
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
@@ -50,6 +54,9 @@ jobs:
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             build: npm run build -- --target x86_64-pc-windows-msvc
+          - host: windows-latest
+            target: aarch64-pc-windows-msvc
+            build: npm run build -- --target aarch64-pc-windows-msvc
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             build: npm run build -- --target x86_64-unknown-linux-gnu --use-napi-cross

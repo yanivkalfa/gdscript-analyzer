@@ -47,6 +47,11 @@ pub enum ExtendsRef {
     Path(SmolStr),
     /// `extends "res://x.gd"` — a script path literal; `Unknown` in Phase 2.
     ScriptPath(SmolStr),
+    /// `extends "res://x.gd".Inner` — a script path **selecting an inner class**. We can't model the
+    /// inner class yet (see `TECH_DEBT`), so this is the seam (`Unknown`) — never the outer script, which
+    /// would wrongly accept the outer class's members. The path is carried for a future inner-class
+    /// resolver. (`SmolStr` is the path part, sans the trailing `.Inner` selectors.)
+    ScriptPathInner(SmolStr),
 }
 
 /// One class member.
@@ -139,6 +144,12 @@ pub struct ConstItem {
     pub name: SmolStr,
     /// The written type annotation (unresolved text), if any.
     pub type_ref: Option<SmolStr>,
+    /// The `res://` (or relative) path of a `const X = preload("…")` initializer — read at the
+    /// **signature** level (the initializer is directly a `preload` of a string literal). Lets a
+    /// cross-file reference (`other.X`) resolve the const to the preloaded script's `ScriptRef`, which
+    /// the offset-free `script_class` projection otherwise can't (it drops initializers). Firewall-safe:
+    /// a `const` declaration is not a function body, so a body edit leaves it unchanged.
+    pub preload_path: Option<SmolStr>,
     /// Pointer to the `ConstDecl` node, for value inference.
     pub ptr: AstPtr,
     /// The whole declaration's range.
@@ -266,10 +277,26 @@ fn lower_const(d: &ast::ConstDecl) -> ConstItem {
     ConstItem {
         name: decl_name(d.name()).unwrap_or_default(),
         type_ref,
+        preload_path: const_preload_path(node),
         ptr: AstPtr::of(node),
         range: cst::text_range_of(node),
         name_range: name_range(d.name(), node),
     }
+}
+
+/// The `res://` (or relative) path a `const X = preload("…")` aliases, read at the signature level.
+/// The initializer must be **directly** a `preload` of a string literal (so the const aliases exactly
+/// one preloaded script — not a `preload` nested in an array/expression). Mirrors the body lowering's
+/// `PreloadExpr` extraction.
+fn const_preload_path(const_decl: &GdNode) -> Option<SmolStr> {
+    let preload = cst::first_child(const_decl, |k| k == SyntaxKind::PreloadExpr)?;
+    let arg = cst::first_child(&preload, |k| k == SyntaxKind::ArgList)
+        .and_then(|al| cst::first_child_expr(&al))?;
+    if arg.kind() != SyntaxKind::Literal {
+        return None;
+    }
+    cst::child_token_text(&arg, SyntaxKind::String)
+        .map(|s| SmolStr::new(s.trim_matches(['"', '\''])))
 }
 
 fn lower_signal(d: &ast::SignalDecl) -> SignalItem {
@@ -346,19 +373,26 @@ fn find_extends(container: &GdNode) -> Option<ExtendsRef> {
 
 /// Parse the `extends` target from a node's direct tokens.
 fn parse_extends_tokens(node: &GdNode) -> Option<ExtendsRef> {
-    // A string literal path: `extends "res://x.gd"`.
-    if let Some(s) = cst::child_token_text(node, SyntaxKind::String) {
-        return Some(ExtendsRef::ScriptPath(SmolStr::new(
-            s.trim_matches(['"', '\'']),
-        )));
-    }
-    // Otherwise one or more dotted identifiers: `extends Node` / `extends A.B`.
+    // Identifier tokens after the `extends` keyword: the dotted selectors (`A.B`, or the `.Inner`
+    // trailing a string path).
     let idents: Vec<String> = node
         .children_with_tokens()
         .filter_map(cstree::util::NodeOrToken::into_token)
         .filter(|t| t.kind() == SyntaxKind::Ident)
         .map(|t| t.text().to_owned())
         .collect();
+    // A string literal path: `extends "res://x.gd"` — or `extends "res://x.gd".Inner`, which selects an
+    // inner class we can't model yet → the seam (NOT the outer script, which would wrongly accept the
+    // outer class's members).
+    if let Some(s) = cst::child_token_text(node, SyntaxKind::String) {
+        let path = SmolStr::new(s.trim_matches(['"', '\'']));
+        return Some(if idents.is_empty() {
+            ExtendsRef::ScriptPath(path)
+        } else {
+            ExtendsRef::ScriptPathInner(path)
+        });
+    }
+    // Otherwise one or more dotted identifiers: `extends Node` / `extends A.B`.
     match idents.len() {
         0 => None,
         1 => Some(ExtendsRef::Name(SmolStr::new(&idents[0]))),
@@ -456,6 +490,18 @@ mod tests {
         assert_eq!(
             tree.extends,
             Some(ExtendsRef::ScriptPath(SmolStr::new("res://player.gd")))
+        );
+    }
+
+    #[test]
+    fn extends_script_path_with_inner_class_is_distinguished() {
+        // `extends "res://base.gd".Inner` must NOT collapse to the outer script (which would wrongly
+        // accept the outer class's members); it parses to ScriptPathInner → the seam.
+        let tree = tree_of("extends \"res://base.gd\".Inner\n");
+        assert_eq!(
+            tree.extends,
+            Some(ExtendsRef::ScriptPathInner(SmolStr::new("res://base.gd"))),
+            "the trailing .Inner must be detected, not dropped"
         );
     }
 

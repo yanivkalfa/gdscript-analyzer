@@ -152,6 +152,27 @@ Once steps 1–4 are done (and the GA pipeline PR is merged to `master`):
 > Expect a **red check or two on the first `v0.1.0`** — paste me the failing log and I'll fix it on a
 > branch, same as we've been doing. This is normal release shakeout, not a design problem.
 
+### crates.io first-publish gotchas (lessons from `v0.1.0`)
+
+Two crates.io rules bite the **very first** publish of a fresh workspace — neither recurs once the
+crates exist:
+
+- **A verified email is required.** crates.io rejects publishing with
+  `403 … A verified email address is required` until your account email is set **and verified** at
+  <https://crates.io/settings/profile>. Do this *before* cutting the first release.
+- **New-crate rate limit: a burst of 5, then 1 every 10 minutes.** Publishing a workspace with **>5
+  brand-new crate names** (we have 7) returns `429 Too Many Requests: published too many new crates`
+  partway through. This applies only to new crate **names** — publishing new *versions* of existing
+  crates is generous, so it **never recurs** after the first release.
+
+**Recovery (what we did for `v0.1.0`):** the `release` job is **idempotent** — it checks crates.io and
+skips already-published crates. On a 429, wait until the reset time printed in the error (~10 min) and
+**re-run the failed job** (Actions → the run → *Re-run failed jobs*); it resumes from the first
+unpublished crate. Repeat until all are up.
+
+**To skip the wait** on a release that adds **many new crate names**, email **help@crates.io**
+beforehand for a one-off rate-limit increase (routinely granted for multi-crate workspaces).
+
 ---
 
 ## 6. Verify it worked

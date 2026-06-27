@@ -73,6 +73,56 @@ fn warning_is_non_fatal_but_gateable() {
 }
 
 #[test]
+fn config_toml_gates_warnings_and_no_config_ignores_it() {
+    let dir = temp_project();
+    write(
+        &dir,
+        "scripts/main.gd",
+        "func f() -> int:\n\tvar x = 5 / 2\n\treturn x\n",
+    );
+    // A discovered gdscript-analyzer.toml sets the project floor: warnings fail.
+    write(&dir, "gdscript-analyzer.toml", "error_on_warning = true\n");
+    let path = dir.to_str().unwrap();
+    assert_eq!(
+        code(&run(&["check", path])),
+        1,
+        "config error_on_warning=true gates the warning"
+    );
+    assert_eq!(
+        code(&run(&["check", "--no-config", path])),
+        0,
+        "--no-config ignores the discovered config"
+    );
+    // An inline override reaches the same gate without a file.
+    write(&dir, "gdscript-analyzer.toml", "error_on_warning = false\n");
+    assert_eq!(
+        code(&run(&["check", "--config", "error_on_warning=true", path])),
+        1,
+        "inline --config override gates the warning"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_config_file_exits_2() {
+    let dir = temp_project();
+    write(&dir, "scripts/main.gd", "func f() -> int:\n\treturn 1\n");
+    let path = dir.to_str().unwrap();
+    let missing = dir.join("nope.toml");
+    assert_eq!(
+        code(&run(&[
+            "check",
+            "--config",
+            missing.to_str().unwrap(),
+            path
+        ])),
+        2,
+        "an unreadable explicit --config file is a usage/config error"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn parse_error_exits_1() {
     let dir = temp_project();
     write(&dir, "scripts/bad.gd", "var x = )\n");
