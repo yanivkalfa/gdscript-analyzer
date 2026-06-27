@@ -27,3 +27,10 @@ console_error_panic_hook = { workspace = true }
 
 [lints]
 workspace = true
+
+# Size optimization for the published @gdscript-analyzer/wasm bundle + the web playground. wasm-pack's
+# `--release` builds with the shared `release` cargo profile (kept fast for the native LSP/CLI — it
+# can't select the `wasm-release` profile), so the size lever wasm-pack DOES consume is its wasm-opt
+# pass: `-Oz` (aggressive size) instead of the default. This is the dominant lever for the .wasm size.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz"]
