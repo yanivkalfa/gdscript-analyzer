@@ -146,9 +146,14 @@ fn print_load_errors(project: &Project) {
     }
 }
 
-/// Resolve whether to colorize: `--no-color`/`NO_COLOR` off, `CLICOLOR_FORCE` on, else by tty.
+/// Resolve whether to colorize, honoring the de-facto env conventions in precedence order:
+/// `--no-color`/`NO_COLOR`/`CLICOLOR=0` force off, `CLICOLOR_FORCE` (≠0) forces on, else by tty.
 fn resolve_color(no_color: bool) -> bool {
     if no_color || std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    // `CLICOLOR=0` explicitly disables (the plain CLICOLOR convention); any other value is advisory.
+    if std::env::var("CLICOLOR").is_ok_and(|v| v == "0") {
         return false;
     }
     if std::env::var("CLICOLOR_FORCE").is_ok_and(|v| v != "0") {
