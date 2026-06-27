@@ -1,0 +1,27 @@
+name: Sync labels
+
+# Labels-as-code (Phase-6 Workstream 7): keep GitHub's label set in sync with
+# `.github/labels.yml`. Runs when that file (or this workflow) changes on master,
+# or on demand. `skip-delete` keeps any labels not listed here (non-destructive).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/labels.yml"
+      - ".github/workflows/labels.yml"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crazy-max/ghaction-github-labeler@v5
+        with:
+          yaml-file: .github/labels.yml
+          skip-delete: true
+          dry-run: ${{ github.event_name == 'pull_request' }}
