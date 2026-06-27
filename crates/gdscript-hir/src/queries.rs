@@ -248,7 +248,28 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
         let sig = match m {
             Member::Func(f) => MemberSig::Method(resolve_ann(f.return_type.as_deref())),
             Member::Var(v) => MemberSig::Field(resolve_ann(v.type_ref.as_deref())),
-            Member::Const(c) => MemberSig::Field(resolve_ann(c.type_ref.as_deref())),
+            // `const X = preload("res://…")` (no annotation) resolves cross-file to the preloaded
+            // script's `ScriptRef` (the SCRIPT meta-type) — the same resolution the declaring file does
+            // same-file, which the offset-free projection otherwise drops. A relative path is anchored
+            // to this file's dir. An explicit annotation wins.
+            Member::Const(c) => MemberSig::Field(
+                c.type_ref
+                    .is_none()
+                    .then_some(c.preload_path.as_deref())
+                    .flatten()
+                    .and_then(|raw| {
+                        crate::resolve::anchor_res_path(file.res_path(db).as_deref(), raw)
+                    })
+                    .map_or_else(
+                        || resolve_ann(c.type_ref.as_deref()),
+                        |abs| {
+                            crate::resolve::resolve_external(
+                                db,
+                                &crate::resolve::ExternalRef::Preload(abs),
+                            )
+                        },
+                    ),
+            ),
             Member::Signal(_) => MemberSig::Signal,
             // Enums + inner classes aren't modeled as instance members yet (M2+).
             Member::Enum(_) | Member::Class(_) => continue,
@@ -938,6 +959,49 @@ mod tests {
             matches!(unit.result.bindings[1].ty, Ty::ScriptRef(_)),
             "W.new() should be a script instance, got {:?}",
             unit.result.bindings[1].ty
+        );
+        assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn cross_file_preload_const_member_resolves() {
+        // The xfile-preload-const fix: another file reading `Holder.W` where
+        // `const W = preload("res://widget.gd")` resolves W to the preloaded script. Previously the
+        // offset-free script_class projection saw only the const's (absent) annotation → Variant.
+        let mut db = RootDatabase::default();
+        set_with_path(
+            &mut db,
+            0,
+            "res://widget.gd",
+            "class_name Widget\nfunc make() -> int:\n\treturn 5\n",
+        );
+        set_with_path(
+            &mut db,
+            1,
+            "res://holder.gd",
+            "class_name Holder\nconst W = preload(\"res://widget.gd\")\n",
+        );
+        set_with_path(
+            &mut db,
+            2,
+            "res://user.gd",
+            "func use_it():\n\tvar a := Holder.W.make()\n",
+        );
+        db.sync_source_root();
+        let api = db.engine().unwrap();
+
+        let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
+        let unit = fi
+            .units
+            .iter()
+            .find(|u| !u.result.bindings.is_empty())
+            .expect("use_it unit");
+        // Holder.W → Widget's ScriptRef → .make() → int (cross-file, through the const).
+        assert_eq!(
+            unit.result.bindings[0].ty.label(api).as_deref(),
+            Some("int"),
+            "Holder.W.make() should resolve cross-file to int, got {:?}",
+            unit.result.bindings[0].ty
         );
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
     }
