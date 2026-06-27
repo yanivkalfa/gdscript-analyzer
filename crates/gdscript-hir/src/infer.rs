@@ -50,6 +50,10 @@ pub const INVALID_NODE_PATH: &str = "INVALID_NODE_PATH";
 /// an engine/native class, a builtin/utility, a global enum/const, or a `*`-autoload singleton.
 /// Godot's `gdscript_analyzer.cpp` raises this (as an error) so the global namespace stays unique.
 pub const SHADOWED_GLOBAL_IDENTIFIER: &str = "SHADOWED_GLOBAL_IDENTIFIER";
+/// A genuine `extends` cycle: a file's base chain transitively returns to itself (`A extends B`,
+/// `B extends A`). Illegal in Godot (`gdscript_analyzer.cpp` raises it). Only the `extends`
+/// inheritance chain cycles — a `preload`/`load` cycle is legal at runtime and is NOT reported.
+pub const CYCLIC_INHERITANCE: &str = "CYCLIC_INHERITANCE";
 
 /// What kind of binding a [`Binding`] describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +262,27 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         }
     }
 
+    // A genuine `extends` cycle (D7): walk THIS file's base chain by `FileId`; if it returns to the
+    // start, the inheritance is cyclic (illegal in Godot). Reported once, at the file's own `extends`
+    // decl range. Only `extends` cycles are walked here (member lookup is the only thing that loops);
+    // `preload`/`load` cycles are legal at runtime and never reach this resolver. We start by stepping
+    // ONTO the user base — if the very first base is the start file (`extends "res://self.gd"`, or two
+    // files A↔B), the revisit-of-start check fires; a deep but ACYCLIC chain bottoms out at an engine
+    // `Object`/`Unknown` and never revisits, so it does not false-fire.
+    if extends_chain_is_cyclic(db, file_id)
+        && let Some(range) = extends_decl_range(root)
+    {
+        diagnostics.push(Diagnostic {
+            range,
+            severity: Severity::Warning,
+            code: CYCLIC_INHERITANCE.to_owned(),
+            message: "Cyclic class hierarchy: this class's `extends` chain returns to itself."
+                .to_owned(),
+            source: DiagnosticSource::Type,
+            fixes: Vec::new(),
+        });
+    }
+
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
     //
@@ -367,6 +392,65 @@ fn class_name_decl_range(root: &GdNode) -> Option<TextRange> {
     let lead = u32::try_from(text.len() - text.trim_start().len()).unwrap_or(0);
     let len = u32::try_from(text.trim().len()).unwrap_or(0);
     Some(TextRange::new(r.start + lead, r.start + lead + len))
+}
+
+/// The byte range of the file's top-level `extends` declaration — the anchor for `CYCLIC_INHERITANCE`.
+/// Two surface forms: a standalone `extends Target` (an [`ExtendsClause`] child of the `SourceFile`),
+/// or the inline `class_name Name extends Target` (the `extends` keyword + target inside the
+/// [`ClassNameDecl`]). Scans only the `SourceFile`'s DIRECT children, so an inner class's `extends`
+/// (nested under `Class`/`ClassBody`) is never mistaken for the file's own. `None` if the file has no
+/// top-level `extends`.
+fn extends_decl_range(root: &GdNode) -> Option<TextRange> {
+    use gdscript_syntax::SyntaxKind;
+    for child in root.children() {
+        match child.kind() {
+            // Standalone `extends Target` — the whole clause is the anchor.
+            SyntaxKind::ExtendsClause => return Some(cst::text_range_of(&child)),
+            // Inline `class_name Name extends Target` — anchor the `extends` keyword onward.
+            SyntaxKind::ClassNameDecl => {
+                if let Some(kw) = child
+                    .children()
+                    .find(|c| c.kind() == SyntaxKind::ExtendsKw)
+                {
+                    let start = cst::text_range_of(&kw).start;
+                    let end = cst::text_range_of(&child).end;
+                    return Some(TextRange::new(start, end));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the file's `extends` inheritance chain transitively returns to itself (a genuine cycle).
+/// Walks base-by-base by `FileId` from `start`, stepping only across user `ScriptRef` bases (an
+/// engine `Object`/`Unknown` base ends the chain). A `FileId` revisit means a cycle. We stop as soon
+/// as we either revisit a file (cycle) or hit a non-script base (acyclic) — a deep but acyclic chain
+/// terminates without a revisit and is NOT flagged. Depth is also hard-capped as belt-and-suspenders
+/// (the visited set already guarantees termination).
+fn extends_chain_is_cyclic(db: &dyn Db, start: FileId) -> bool {
+    use std::collections::HashSet;
+    let mut visited: HashSet<FileId> = HashSet::new();
+    visited.insert(start);
+    let mut current = start;
+    for _ in 0..=64 {
+        let Some(file) = db.file_text(current) else {
+            return false;
+        };
+        let base = crate::queries::script_class(db, file).base().clone();
+        let Ty::ScriptRef(next) = base else {
+            return false; // engine `Object` / `Unknown` base — chain ends, no cycle.
+        };
+        let next_id = FileId(next.0);
+        if !visited.insert(next_id) {
+            // Revisiting an already-seen file closes a cycle. We report the cycle for every file ON
+            // it (each file's own `extends` is genuinely cyclic), so no need to special-case `start`.
+            return true;
+        }
+        current = next_id;
+    }
+    false
 }
 
 /// Infer a class field declaration as a single local-var statement (full annotation checks).

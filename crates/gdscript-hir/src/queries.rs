@@ -752,11 +752,14 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_extends_terminates() {
+    fn cyclic_extends_flags_each_cycle_member_and_terminates() {
+        use crate::infer::CYCLIC_INHERITANCE;
         let mut db = RootDatabase::default();
-        // A extends B extends A — illegal in Godot, but the member walk must not loop.
+        // A extends B extends A — illegal in Godot. The member walk must not loop, AND each file on
+        // the cycle must be flagged `CYCLIC_INHERITANCE` at its own `extends` decl.
         db.set_file_text(FileId(0), "class_name A\nextends B\n", Durability::LOW);
         db.set_file_text(FileId(1), "class_name B\nextends A\n", Durability::LOW);
+        // A third, ACYCLIC file that merely USES `A` — it is not on the cycle, so it must stay clean.
         db.set_file_text(
             FileId(2),
             "func use_it():\n\tvar a: A\n\tvar x := a.nope()\n",
@@ -764,9 +767,63 @@ mod tests {
         );
         db.sync_source_root();
 
-        // Must terminate (depth cap) — a.nope() walks A->B->A->… and bottoms out at the seam.
+        // Each cycle member is flagged exactly once, at its own `extends`.
+        for id in [FileId(0), FileId(1)] {
+            let fi = analyze_file(&db, db.file_text(id).unwrap());
+            let cyclic: Vec<_> = fi
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == CYCLIC_INHERITANCE)
+                .collect();
+            assert_eq!(cyclic.len(), 1, "file {id:?}: {:?}", fi.diagnostics);
+        }
+
+        // The user file is off the cycle — `a.nope()` walks A->B->A->… and bottoms out at the seam
+        // (no panic/hang, no diagnostic on this file).
         let fi = analyze_file(&db, db.file_text(FileId(2)).unwrap());
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn cyclic_extends_via_res_path_two_files_flags_no_hang() {
+        use crate::infer::CYCLIC_INHERITANCE;
+        let mut db = RootDatabase::default();
+        // a.gd extends "res://b.gd"; b.gd extends "res://a.gd" — a 2-file `res://` path cycle.
+        set_with_path(&mut db, 0, "res://a.gd", "extends \"res://b.gd\"\n");
+        set_with_path(&mut db, 1, "res://b.gd", "extends \"res://a.gd\"\n");
+        db.sync_source_root();
+
+        for id in [FileId(0), FileId(1)] {
+            let fi = analyze_file(&db, db.file_text(id).unwrap());
+            assert!(
+                fi.diagnostics.iter().any(|d| d.code == CYCLIC_INHERITANCE),
+                "file {id:?} expected CYCLIC_INHERITANCE: {:?}",
+                fi.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn deep_acyclic_extends_chain_does_not_false_fire() {
+        use crate::infer::CYCLIC_INHERITANCE;
+        let mut db = RootDatabase::default();
+        // A 5-deep ACYCLIC chain bottoming out at an engine base: C0 -> C1 -> ... -> C4 -> Node.
+        // None revisits the start, so NONE may be flagged `CYCLIC_INHERITANCE`.
+        db.set_file_text(FileId(0), "class_name C0\nextends C1\n", Durability::LOW);
+        db.set_file_text(FileId(1), "class_name C1\nextends C2\n", Durability::LOW);
+        db.set_file_text(FileId(2), "class_name C2\nextends C3\n", Durability::LOW);
+        db.set_file_text(FileId(3), "class_name C3\nextends C4\n", Durability::LOW);
+        db.set_file_text(FileId(4), "class_name C4\nextends Node\n", Durability::LOW);
+        db.sync_source_root();
+
+        for id in (0..5).map(FileId) {
+            let fi = analyze_file(&db, db.file_text(id).unwrap());
+            assert!(
+                !fi.diagnostics.iter().any(|d| d.code == CYCLIC_INHERITANCE),
+                "file {id:?} false-fired CYCLIC_INHERITANCE: {:?}",
+                fi.diagnostics
+            );
+        }
     }
 
     // ---- M3: res:// path map + preload / extends "res://…" const-aliasing -----------------
