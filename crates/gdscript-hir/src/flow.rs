@@ -356,6 +356,13 @@ impl Analyzer<'_> {
         for (p, t) in self.derive_facts(cond, truthy) {
             out.insert(p, t);
         }
+        // An opaque call in the condition may run *after* a narrowing test (e.g. the rhs of an
+        // `and`, or `if mutate() and self.x is T:`) and mutate `self`'s members, so no `self`-rooted
+        // narrowing from this edge is trustworthy — drop it (mirrors `after_expr_stmt`). Local
+        // narrowing is unaffected (a callee cannot reassign a caller's local). Soundness > precision.
+        if self.expr_contains_call(cond) {
+            out.invalidate_self_rooted();
+        }
         out
     }
 
@@ -473,30 +480,58 @@ impl Analyzer<'_> {
                 }
                 Stmt::Var(v) => facts.invalidate_assigned(&Place::Local(v.name.clone())),
                 Stmt::If {
+                    cond,
                     then_branch,
                     elifs,
                     else_branch,
-                    ..
                 } => {
+                    // A call in a guard (run every iteration when this `if` is inside the loop) may
+                    // mutate `self` — account for it alongside the branch bodies.
+                    if self.expr_contains_call(*cond) {
+                        facts.invalidate_self_rooted();
+                    }
                     self.scan_invalidations(facts, then_branch);
-                    for (_, b) in elifs {
+                    for (econd, b) in elifs {
+                        if self.expr_contains_call(*econd) {
+                            facts.invalidate_self_rooted();
+                        }
                         self.scan_invalidations(facts, b);
                     }
                     if let Some(eb) = else_branch {
                         self.scan_invalidations(facts, eb);
                     }
                 }
-                Stmt::While { body, .. } => self.scan_invalidations(facts, body),
+                Stmt::While { cond, body } => {
+                    if self.expr_contains_call(*cond) {
+                        facts.invalidate_self_rooted();
+                    }
+                    self.scan_invalidations(facts, body);
+                }
                 Stmt::For(f) => {
                     facts.invalidate_assigned(&Place::Local(f.var.clone()));
+                    if self.expr_contains_call(f.iter) {
+                        facts.invalidate_self_rooted();
+                    }
                     self.scan_invalidations(facts, &f.body);
                 }
-                Stmt::Match { arms, .. } => {
+                Stmt::Match { scrutinee, arms } => {
+                    if self.expr_contains_call(*scrutinee) {
+                        facts.invalidate_self_rooted();
+                    }
                     for arm in arms {
                         self.scan_invalidations(facts, &arm.body);
                     }
                 }
-                Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Pass | Stmt::Assert(_) => {}
+                Stmt::Assert(Some(c)) => {
+                    if self.expr_contains_call(*c) {
+                        facts.invalidate_self_rooted();
+                    }
+                }
+                Stmt::Return(_)
+                | Stmt::Break
+                | Stmt::Continue
+                | Stmt::Pass
+                | Stmt::Assert(None) => {}
             }
         }
     }
@@ -645,6 +680,20 @@ mod tests {
         };
         let at_use = a.facts_before(then_branch[1]).expect("facts");
         assert_eq!(at_use.get(&Place::SelfMember("node".into())), None);
+    }
+
+    #[test]
+    fn opaque_call_in_guard_invalidates_self_member_narrowing() {
+        // A call in the guard itself (`mutate()` in the `and`) may reassign self.node *after* the
+        // `is` test, so self.node must NOT be narrowed in the then-branch — the soundness invariant.
+        let body =
+            func_body("func f():\n\tif self.node is Node2D and mutate():\n\t\tself.node.foo()\n");
+        let a = analyze(&body);
+        let Stmt::If { then_branch, .. } = body.stmt(body.block[0]) else {
+            panic!("if")
+        };
+        let inner = a.facts_before(then_branch[0]).expect("then facts");
+        assert_eq!(inner.get(&Place::SelfMember("node".into())), None);
     }
 
     #[test]
