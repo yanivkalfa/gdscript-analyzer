@@ -297,6 +297,97 @@ impl WarningCode {
         self.as_str().to_ascii_lowercase()
     }
 
+    /// A one-line human description — the source of truth for the generated Warning Reference
+    /// (Workstream 5). Kept terse and stable; an exhaustive `match` so a new code must add one.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::UnassignedVariable => "A typed local is read before it is assigned a value.",
+            Self::UnassignedVariableOpAssign => {
+                "A compound assignment (`+=`, …) is applied to a still-unassigned local."
+            }
+            Self::UnusedVariable => "A local variable is declared but never read.",
+            Self::UnusedLocalConstant => "A local constant is declared but never read.",
+            Self::UnusedPrivateClassVariable => {
+                "A `_`-prefixed class member is never read within the class."
+            }
+            Self::UnusedParameter => "A function parameter is never used (prefix it with `_`).",
+            Self::UnusedSignal => "A signal is never emitted or connected in the file.",
+            Self::ShadowedVariable => "A local shadows an outer local or parameter.",
+            Self::ShadowedVariableBaseClass => "A member shadows a member of a base class.",
+            Self::ShadowedGlobalIdentifier => {
+                "A `class_name`, member, or local shadows a global identifier."
+            }
+            Self::UnreachableCode => {
+                "A statement follows an unconditional `return`/`break`/`continue` (or an exhaustive `match`)."
+            }
+            Self::UnreachablePattern => {
+                "A `match` pattern can never match (it follows a wildcard)."
+            }
+            Self::StandaloneExpression => "An expression statement has no effect.",
+            Self::StandaloneTernary => {
+                "A ternary conditional is used as a statement; its value is discarded."
+            }
+            Self::IncompatibleTernary => {
+                "The two values of a ternary conditional have no common type."
+            }
+            Self::UnsafeVoidReturn => "A `Variant` value is returned from a `-> void` function.",
+            Self::StaticCalledOnInstance => "A static method is called through an instance.",
+            Self::MissingTool => "A class extends a `@tool` class but is not itself `@tool`.",
+            Self::RedundantStaticUnload => {
+                "`@static_unload` is used on a class with no static variables."
+            }
+            Self::RedundantAwait => "`await` is applied to a non-coroutine, non-signal value.",
+            Self::AssertAlwaysTrue => "An `assert(...)` condition is always true.",
+            Self::AssertAlwaysFalse => "An `assert(...)` condition is always false.",
+            Self::IntegerDivision => "Integer division discards the fractional part.",
+            Self::NarrowingConversion => "A `float` is stored into an `int`, losing precision.",
+            Self::IntAsEnumWithoutCast => "An integer is assigned to an enum value without a cast.",
+            Self::IntAsEnumWithoutMatch => "An integer is compared to an enum value in a `match`.",
+            Self::EnumVariableWithoutDefault => {
+                "An enum-typed variable has no explicit default value."
+            }
+            Self::EmptyFile => "The script file has no members, `class_name`, or `extends`.",
+            Self::DeprecatedKeyword => "A deprecated keyword (e.g. `yield`) is used.",
+            Self::ConfusableIdentifier => {
+                "An identifier mixes scripts / uses confusable characters."
+            }
+            Self::ConfusableLocalDeclaration => "A local is declared after a same-name outer use.",
+            Self::ConfusableLocalUsage => {
+                "A local shadowing a member is used before its declaration."
+            }
+            Self::ConfusableCaptureReassignment => {
+                "A captured variable is reassigned inside a lambda."
+            }
+            Self::ConfusableTemporaryModification => "A temporary value is modified in place.",
+            Self::PropertyUsedAsFunction => "A property is called as if it were a function.",
+            Self::ConstantUsedAsFunction => "A constant is called as if it were a function.",
+            Self::FunctionUsedAsProperty => "A function is accessed as if it were a property.",
+            Self::UntypedDeclaration => "A declaration has no type annotation.",
+            Self::InferredDeclaration => "A declaration uses an inferred type (`:=`).",
+            Self::UnsafePropertyAccess => {
+                "A property is not present on the inferred type (but may be on a subtype)."
+            }
+            Self::UnsafeMethodAccess => {
+                "A method is not present on the inferred type (but may be on a subtype)."
+            }
+            Self::UnsafeCast => "A value is cast through `Variant`, which is unsafe.",
+            Self::UnsafeCallArgument => {
+                "An argument needs an unsafe implicit cast into the parameter type."
+            }
+            Self::ReturnValueDiscarded => "A non-`void` call's return value is discarded.",
+            Self::MissingAwait => "An awaitable call's result is not awaited.",
+            Self::InferenceOnVariant => "A type is inferred from a statically-`Variant` value.",
+            Self::NativeMethodOverride => {
+                "A native virtual method is overridden with an incompatible signature."
+            }
+            Self::GetNodeDefaultWithoutOnready => {
+                "A `get_node(...)` default initializer should be `@onready`."
+            }
+            Self::OnreadyWithExport => "`@onready` and `@export` are used together on one member.",
+        }
+    }
+
     /// Godot's `default_warning_levels[]` entry for this code.
     #[must_use]
     pub fn default_level(self) -> WarnLevel {
@@ -598,6 +689,48 @@ pub fn gate(
     })
 }
 
+/// Render the Markdown **Warning Reference** page from the [`WarningCode`] catalog (Workstream 5
+/// docgen). The single source of truth — a test asserts the committed page matches this output, so
+/// the docs can never drift from the code (regenerate with `GDSCRIPT_UPDATE_DOCS=1`).
+#[must_use]
+pub fn render_warning_reference() -> String {
+    use std::fmt::Write as _;
+    let mut codes: Vec<WarningCode> = WarningCode::ALL.to_vec();
+    codes.sort_by_key(|c| c.as_str());
+
+    let mut s = String::new();
+    s.push_str("<!-- @generated by `gdscript-hir` (warnings::render_warning_reference); do not edit by hand. -->\n");
+    s.push_str("<!-- Regenerate: `GDSCRIPT_UPDATE_DOCS=1 cargo test -p gdscript-hir warning_reference_doc_is_current` -->\n\n");
+    s.push_str("# Warning Reference\n\n");
+    s.push_str(
+        "Every gateable GDScript warning the analyzer can emit, with its `project.godot` setting key, \
+         engine-default level, and the earliest Godot version it applies to. Configure these under \
+         `[debug]` as `gdscript/warnings/<key>` (`0` = ignore, `1` = warn, `2` = error), or suppress \
+         inline with `@warning_ignore(\"<key>\")`. See [Configuration](./configuration.md).\n\n",
+    );
+    s.push_str("| Code | Setting key | Default | Since | Description |\n");
+    s.push_str("|---|---|---|---|---|\n");
+    for c in codes {
+        let default = match c.default_level() {
+            WarnLevel::Ignore => "Ignore",
+            WarnLevel::Warn => "Warn",
+            WarnLevel::Error => "Error",
+        };
+        let since = match c.since() {
+            Since::V4_3 => "4.3",
+            Since::Master => "master",
+        };
+        let _ = writeln!(
+            s,
+            "| `{}` | `{}` | {default} | {since} | {} |",
+            c.as_str(),
+            c.setting_name(),
+            c.description(),
+        );
+    }
+    s
+}
+
 /// Whether `path` is under a `res://addons/**` directory (the `exclude_addons` scope).
 fn is_addon_path(path: &str) -> bool {
     path.starts_with("res://addons/") || path.contains("/addons/")
@@ -633,6 +766,29 @@ mod tests {
 
     fn off(src: &str, needle: &str) -> u32 {
         u32::try_from(src.find(needle).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn warning_reference_doc_is_current() {
+        // The committed Warning Reference is generated from the catalog — keep them in lockstep.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/src/reference/warnings.md"
+        );
+        let generated = render_warning_reference();
+        if std::env::var("GDSCRIPT_UPDATE_DOCS").is_ok() {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, &generated).unwrap();
+            return;
+        }
+        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            on_disk, generated,
+            "docs/src/reference/warnings.md is stale — regenerate with \
+             `GDSCRIPT_UPDATE_DOCS=1 cargo test -p gdscript-hir warning_reference_doc_is_current`",
+        );
     }
 
     #[test]
