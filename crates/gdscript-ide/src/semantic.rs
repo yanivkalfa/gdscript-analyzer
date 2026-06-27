@@ -813,4 +813,24 @@ mod tests {
             "enable=false must suppress gateable warnings",
         );
     }
+
+    #[test]
+    fn warning_ignore_annotation_suppresses_through_diagnostics() {
+        let ignored =
+            "func f():\n\t@warning_ignore(\"integer_division\")\n\tvar x = 5 / 2\n\treturn x\n";
+        let (db, ft) = db_ft(ignored);
+        assert!(
+            type_diagnostics(&db, ft)
+                .iter()
+                .all(|d| d.code != "INTEGER_DIVISION"),
+            "@warning_ignore must suppress the decorated statement's warning",
+        );
+        // Without the annotation, the same code fires.
+        let (db2, ft2) = db_ft("func f():\n\tvar x = 5 / 2\n\treturn x\n");
+        assert!(
+            type_diagnostics(&db2, ft2)
+                .iter()
+                .any(|d| d.code == "INTEGER_DIVISION"),
+        );
+    }
 }

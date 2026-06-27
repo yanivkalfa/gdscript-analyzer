@@ -11,8 +11,9 @@
 //! `Diagnostic.code` stays a stable `String` (via [`WarningCode::as_str`]) so the wire contract
 //! is unchanged — the enum is internal to `gdscript-hir`.
 
+use cstree::util::NodeOrToken;
 use gdscript_base::{Diagnostic, DiagnosticSource, Severity, TextRange};
-use gdscript_syntax::GdNode;
+use gdscript_syntax::{GdNode, SyntaxKind};
 use rustc_hash::FxHashMap;
 
 /// A gateable Godot GDScript warning code (research/04 §2.2). Internal to `gdscript-hir`; the
@@ -433,11 +434,111 @@ impl SuppressionMap {
     }
 }
 
-/// Build the per-file suppression map from the parsed CST. M0 returns the empty map; the
-/// `@warning_ignore` CST walk lands in W1 M2.
+/// Build the per-file suppression map from the parsed CST (Workstream 1 M2): each
+/// `@warning_ignore("code", …)` suppresses the listed codes over the **single following
+/// statement/declaration**, and a `@warning_ignore_start("code")` … `@warning_ignore_restore("code")`
+/// pair suppresses a region (EOF-terminated if unrestored). Unknown code names are skipped (the
+/// unknown-name meta-diagnostic is deferred — see `TECH_DEBT.md`).
 #[must_use]
-pub fn build_suppression_map(_root: &GdNode) -> SuppressionMap {
-    SuppressionMap::default()
+pub fn build_suppression_map(root: &GdNode) -> SuppressionMap {
+    let mut map = SuppressionMap::default();
+    // Annotations in source order.
+    let mut anns: Vec<GdNode> = gdscript_syntax::ast::descendants(root)
+        .into_iter()
+        .filter(|n| n.kind() == SyntaxKind::Annotation)
+        .collect();
+    anns.sort_by_key(|n| u32::from(n.text_range().start()));
+
+    // Open region starts for `_start`/`_restore`, by code (most-recent-wins on restore).
+    let mut open: Vec<(WarningCode, u32)> = Vec::new();
+    let eof = u32::from(root.text_range().end());
+
+    for ann in &anns {
+        let Some(name) = annotation_name(ann) else {
+            continue;
+        };
+        let codes = annotation_warning_codes(ann);
+        if codes.is_empty() {
+            continue; // not a `@warning_ignore*` with a recognized code
+        }
+        match name.as_str() {
+            "warning_ignore" => {
+                if let Some(target) = next_decorated_sibling(ann) {
+                    let r = target.text_range();
+                    map.push(
+                        TextRange::new(u32::from(r.start()), u32::from(r.end())),
+                        codes,
+                    );
+                }
+            }
+            "warning_ignore_start" => {
+                let start = u32::from(ann.text_range().end());
+                for c in codes {
+                    open.push((c, start));
+                }
+            }
+            "warning_ignore_restore" => {
+                let end = u32::from(ann.text_range().start());
+                for c in &codes {
+                    if let Some(pos) = open.iter().rposition(|(oc, _)| oc == c) {
+                        let (oc, start) = open.remove(pos);
+                        map.push(TextRange::new(start, end), vec![oc]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Unrestored regions run to end of file.
+    for (c, start) in open {
+        map.push(TextRange::new(start, eof), vec![c]);
+    }
+    map
+}
+
+/// The annotation's name token (the identifier after `@`).
+fn annotation_name(ann: &GdNode) -> Option<String> {
+    ann.children_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .find(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| t.text().to_owned())
+}
+
+/// The recognized warning codes named by a `@warning_ignore*` annotation's string arguments.
+fn annotation_warning_codes(ann: &GdNode) -> Vec<WarningCode> {
+    let Some(arglist) = ann.children().find(|c| c.kind() == SyntaxKind::ArgList) else {
+        return Vec::new();
+    };
+    let mut codes = Vec::new();
+    for lit in arglist
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::Literal)
+    {
+        for tok in lit
+            .children_with_tokens()
+            .filter_map(NodeOrToken::into_token)
+        {
+            if tok.kind() == SyntaxKind::String
+                && let Some(c) =
+                    WarningCode::from_setting_name(tok.text().trim_matches(['"', '\'']))
+            {
+                codes.push(c);
+            }
+        }
+    }
+    codes
+}
+
+/// The single statement/declaration a `@warning_ignore` decorates — the next sibling node that is
+/// not itself an annotation (annotations stack: `@onready @warning_ignore("…") var x`).
+fn next_decorated_sibling(ann: &GdNode) -> Option<GdNode> {
+    let parent = ann.parent()?;
+    let after = ann.text_range().start();
+    parent
+        .children()
+        .filter(|c| c.text_range().start() > after && c.kind() != SyntaxKind::Annotation)
+        .min_by_key(|c| u32::from(c.text_range().start()))
+        .cloned()
 }
 
 /// Resolve one [`RawWarning`] into a final [`Diagnostic`], or drop it. The **only** place
@@ -527,7 +628,33 @@ fn parse_major_minor(s: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gdscript_syntax::parse;
     use std::collections::HashSet;
+
+    fn off(src: &str, needle: &str) -> u32 {
+        u32::try_from(src.find(needle).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn warning_ignore_suppresses_the_next_statement() {
+        let src = "func f():\n\t@warning_ignore(\"integer_division\")\n\tvar x = 5 / 2\n";
+        let map = build_suppression_map(&parse(src).syntax_node());
+        let at = off(src, "5 / 2");
+        assert!(map.is_suppressed(WarningCode::IntegerDivision, TextRange::new(at, at + 5)));
+        // A different code at the same place is not suppressed.
+        assert!(!map.is_suppressed(WarningCode::NarrowingConversion, TextRange::new(at, at + 5)));
+    }
+
+    #[test]
+    fn warning_ignore_start_restore_suppresses_a_region() {
+        let src = "@warning_ignore_start(\"unused_variable\")\nfunc f():\n\tvar a = 1\n@warning_ignore_restore(\"unused_variable\")\nfunc g():\n\tvar b = 2\n";
+        let map = build_suppression_map(&parse(src).syntax_node());
+        let a = off(src, "var a");
+        let b = off(src, "var b");
+        assert!(map.is_suppressed(WarningCode::UnusedVariable, TextRange::new(a, a + 1)));
+        // After the restore, the same code is no longer suppressed.
+        assert!(!map.is_suppressed(WarningCode::UnusedVariable, TextRange::new(b, b + 1)));
+    }
 
     fn raw(code: WarningCode) -> RawWarning {
         RawWarning {
