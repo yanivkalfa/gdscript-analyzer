@@ -238,10 +238,14 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       tests: `multiline_lambda_does_not_absorb_following_paren_line`,
       `inline_lambda_still_chains_postfix` (parser), `multiline_lambda_then_paren_line_no_false_warning`
       (hir).
-- [ ] **Member field types are seeded by a shallow first pass.** `analyze_file` infers field
-      initializers once (empty `member_types`) to seed the function pass, so a field whose
-      initializer references *another* field (`var b := a + 1`) sees `a` as `Variant`/seam
-      rather than its real type. No fixpoint iteration — rare; revisit if it surfaces.
+- [x] **Member field types — bounded fixpoint (W2-MEMBER-FIXPOINT).** `analyze_file` Pass 1 now
+      re-infers every field initializer against the prior round's `member_types` until the map
+      stops changing or 4 rounds elapse (cheap, deterministic, throwaway probe rounds — only the
+      converged round's units/diagnostics are kept). A field whose initializer references an
+      *earlier* field (`var a := 1` then `var b := a + 1`) now types `b` as `int` instead of
+      seeing `a` as `Variant`/seam — no false `INFERENCE_ON_VARIANT`. Tests:
+      `field_inferred_from_earlier_field_is_typed`, `field_forward_reference_is_seamed_not_warned`,
+      `standalone_inferred_field_unchanged` (no-regression).
 - [ ] **`await` and inner-class member types resolve to the seam (`Unknown`).** Conservative
       (never a false positive), but imprecise: `await sig` doesn't recover the signal's arg
       type, and `inner_instance.field` isn't typed. Refine with the project graph (P3).

@@ -260,23 +260,48 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
 
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
+    //
+    // A field initializer may reference an *earlier* field (`var a := 1` then `var b := a + 1`),
+    // so a single shallow round sees the referent as `Variant`/seam. We run a BOUNDED fixpoint:
+    // each round re-infers every field against the prior round's `member_types`, until the map
+    // stops changing or we hit the round cap. Cheap (fields are few, types settle in a round or
+    // two) and deterministic. Only the final round's units/diagnostics are kept — earlier rounds
+    // are throwaway probes feeding the seed.
     {
-        let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
-        class.self_ty = self_ref.clone();
-        for m in &tree.members {
-            let (ptr, range) = match m {
-                Member::Var(v) => (v.ptr, v.range),
-                Member::Const(c) => (c.ptr, c.range),
-                _ => continue,
-            };
-            if let Some(unit) = unit_from_decl(db, api, root, &class, ptr, range) {
-                if let (Some(name), Some(b)) = (m.name(), unit.result.bindings.first()) {
-                    member_types.insert(SmolStr::new(name), b.ty.clone());
+        // Bound the iteration: a linear `a -> b -> c -> …` chain settles in O(n) rounds, but a
+        // small constant is enough in practice (the corpus settles in ≤2) and guarantees
+        // termination even if a type oscillated.
+        const MAX_ROUNDS: usize = 4;
+        let mut final_units: Vec<Unit> = Vec::new();
+        let mut final_diagnostics: Vec<Diagnostic> = Vec::new();
+        for _ in 0..MAX_ROUNDS {
+            let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
+            class.self_ty = self_ref.clone();
+            class.member_types = member_types.clone();
+            let mut next_member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
+            final_units = Vec::new();
+            final_diagnostics = Vec::new();
+            for m in &tree.members {
+                let (ptr, range) = match m {
+                    Member::Var(v) => (v.ptr, v.range),
+                    Member::Const(c) => (c.ptr, c.range),
+                    _ => continue,
+                };
+                if let Some(unit) = unit_from_decl(db, api, root, &class, ptr, range) {
+                    if let (Some(name), Some(b)) = (m.name(), unit.result.bindings.first()) {
+                        next_member_types.insert(SmolStr::new(name), b.ty.clone());
+                    }
+                    final_diagnostics.extend(unit.result.diagnostics.iter().cloned());
+                    final_units.push(unit);
                 }
-                diagnostics.extend(unit.result.diagnostics.iter().cloned());
-                units.push(unit);
             }
+            if next_member_types == member_types {
+                break;
+            }
+            member_types = next_member_types;
         }
+        diagnostics.extend(final_diagnostics);
+        units.extend(final_units);
     }
 
     // Pass 2 — functions, against a scope carrying the seeded field types.
@@ -1729,6 +1754,16 @@ mod tests {
             .collect()
     }
 
+    /// Run the whole-file pass (Pass 1 field fixpoint + Pass 2 functions) and collect every
+    /// diagnostic code. Drives `analyze_file` directly so the bounded member fixpoint runs.
+    fn file_codes(src: &str) -> Vec<String> {
+        let api = gdscript_api::bundled();
+        let db = gdscript_db::RootDatabase::default();
+        let root = parse(src).syntax_node();
+        let fi = analyze_file(&db, api, &root, FileId(0));
+        fi.diagnostics.iter().map(|d| d.code.clone()).collect()
+    }
+
     #[test]
     fn integer_division_warns() {
         let h = infer_first_func("func f():\n\tvar x = 5 / 2\n");
@@ -1854,6 +1889,40 @@ mod tests {
         // `:=` from an untyped (Variant) param.
         let h = infer_first_func("func f(x):\n\tvar y := x\n");
         assert!(codes(&h).contains(&INFERENCE_ON_VARIANT));
+    }
+
+    #[test]
+    fn field_inferred_from_earlier_field_is_typed() {
+        // W2-MEMBER-FIXPOINT: `b`'s initializer references the earlier field `a`. A single shallow
+        // field pass would see `a` as `Variant` (seam) and fire INFERENCE_ON_VARIANT on `:= a`; the
+        // bounded fixpoint seeds `a: int` so `a + 1` is `int` and `:=` is precise — no warning.
+        let codes = file_codes("var a := 1\nvar b := a + 1\n");
+        assert!(
+            !codes.iter().any(|c| c == INFERENCE_ON_VARIANT),
+            "field `b` from earlier field `a` should type as int, not Variant: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn field_forward_reference_is_seamed_not_warned() {
+        // A field referencing a *later* field still resolves through the fixpoint (both rounds
+        // see each other's seeded type), and at worst lands on the conservative seam — never a
+        // false INFERENCE_ON_VARIANT. (`b` precedes `a` lexically here.)
+        let codes = file_codes("var b := a\nvar a := 1\n");
+        assert!(
+            !codes.iter().any(|c| c == INFERENCE_ON_VARIANT),
+            "forward field reference must not false-warn: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_inferred_field_unchanged() {
+        // No-regression: a self-contained inferred field still types from its literal, no warning.
+        let codes = file_codes("var n := 0\n");
+        assert!(
+            codes.is_empty(),
+            "a literal-initialised field should produce no diagnostics: {codes:?}"
+        );
     }
 
     #[test]
