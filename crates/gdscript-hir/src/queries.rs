@@ -179,6 +179,27 @@ pub fn autoload_registry(db: &dyn Db, config: ProjectConfig) -> Arc<AutoloadRegi
     Arc::new(AutoloadRegistry { singletons })
 }
 
+/// The Godot engine `(major, minor)` declared by `project.godot`'s `[application]`
+/// `config/features`, or `None` if unspecified. Keyed on [`ProjectConfig`] alone (MEDIUM
+/// durability), so it backdates across `.gd` body edits — the same cross-file firewall as
+/// [`autoload_registry`].
+///
+/// Phase-5 plumbing: the value is exposed for engine-API-model selection, but only ONE engine model
+/// is bundled today (`gdscript_api::GODOT_VERSION`), so it is currently informational. Phase 6
+/// (multi-version bundling via the Godot-sync job) will use it to pick the matching `ApiInput`,
+/// snapping to the nearest bundled minor and defaulting to the newest when absent.
+#[salsa::tracked]
+pub fn engine_version(db: &dyn Db, config: ProjectConfig) -> Option<(u32, u32)> {
+    crate::project::parse_engine_version(config.project_godot_text(db))
+}
+
+/// Convenience over [`engine_version`]: the project's declared engine `(major, minor)`, or `None`
+/// when there is no `project.godot` or it declares no version.
+#[must_use]
+pub fn project_engine_version(db: &dyn Db) -> Option<(u32, u32)> {
+    engine_version(db, db.project_config()?)
+}
+
 /// One member of a script class, as a cross-file reference sees it (a resolved type, never a
 /// byte range).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1383,6 +1404,26 @@ mod tests {
             "Audio.volume() should resolve via the scene's script_class= shortcut",
         );
         assert!(fi.diagnostics.is_empty(), "diags: {:?}", fi.diagnostics);
+    }
+
+    #[test]
+    fn engine_version_from_project_config_is_firewalled_against_body_edits() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "func f():\n\tpass\n", Durability::LOW);
+        db.set_file_path(FileId(0), "res://main.gd");
+        db.set_project_config("[application]\nconfig/features=PackedStringArray(\"4.6\")\n");
+        db.sync_source_root();
+        assert_eq!(project_engine_version(&db), Some((4, 6)));
+
+        // A `.gd` body edit must NOT change the project's declared engine version (the query is
+        // keyed on ProjectConfig alone — the cross-file firewall).
+        db.set_file_text(FileId(0), "func f():\n\tvar x := 1\n", Durability::LOW);
+        db.sync_source_root();
+        assert_eq!(project_engine_version(&db), Some((4, 6)));
+
+        // No `project.godot` → no declared version.
+        let empty = RootDatabase::default();
+        assert_eq!(project_engine_version(&empty), None);
     }
 
     #[test]
