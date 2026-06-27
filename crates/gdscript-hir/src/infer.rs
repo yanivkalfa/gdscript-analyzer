@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::body::{self, BinOp, Body, Expr, ExprId, Literal, ParamBinding, Stmt, UnOp};
 use crate::cst::{self, AstPtr};
+use crate::flow::{self, FlowAnalysis, NarrowedTy, Place};
 use crate::item_tree::{ItemTree, Member, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
 use crate::ty::{self, Assign, EnumRef, ScriptRefId, Ty};
@@ -145,6 +146,7 @@ pub fn infer(
         raw_warnings: Vec::new(),
         locals: FxHashMap::default(),
         narrowing: FxHashMap::default(),
+        flow: flow::analyze(body),
     };
     // Parameters bind first (their defaults can reference earlier params).
     let params = body.params.clone();
@@ -509,8 +511,12 @@ struct Cx<'a> {
     raw_warnings: Vec<RawWarning>,
     /// Function-scoped local bindings (GDScript locals are function-, not block-, scoped).
     locals: FxHashMap<SmolStr, Ty>,
-    /// Flow-scoped `is`/`as` narrowing facts, keyed by a dotted access path.
+    /// The active narrowing env for the current statement, keyed by a dotted access path. Rebuilt
+    /// per statement from [`Cx::flow`] (Workstream 2) — not mutated ad-hoc anymore.
     narrowing: FxHashMap<String, Ty>,
+    /// The precomputed per-body control-flow narrowing facts (Workstream 2). The checker consults
+    /// `facts_before(stmt)` to build [`Cx::narrowing`]; it survives `else`/early-return/`and`-`or`.
+    flow: FlowAnalysis,
 }
 
 impl Cx<'_> {
@@ -602,6 +608,9 @@ impl Cx<'_> {
     }
 
     fn infer_stmt(&mut self, id: body::StmtId) {
+        // Install the narrowing in force *before* this statement (Workstream 2). Recomputed per
+        // statement from the precomputed flow facts — replaces the old ad-hoc `in_branch` frames.
+        self.narrowing = self.facts_to_narrowing(id);
         match self.body.stmt(id).clone() {
             Stmt::Expr(e) => {
                 self.infer_expr(e, &Expectation::None);
@@ -626,25 +635,24 @@ impl Cx<'_> {
                 elifs,
                 else_branch,
             } => {
+                // The branch narrowing now lives in the flow facts, so each sub-statement installs
+                // its own via `infer_stmt`. Restore the if-level facts before each guard (a block
+                // walk overwrites `self.narrowing`).
+                let at_if = self.narrowing.clone();
                 self.infer_expr(cond, &Expectation::None);
-                self.in_branch(|cx| {
-                    cx.apply_narrowing(cond);
-                    cx.infer_block(&then_branch);
-                });
+                self.infer_block(&then_branch);
                 for (econd, eblock) in elifs {
+                    self.narrowing.clone_from(&at_if);
                     self.infer_expr(econd, &Expectation::None);
-                    self.in_branch(|cx| {
-                        cx.apply_narrowing(econd);
-                        cx.infer_block(&eblock);
-                    });
+                    self.infer_block(&eblock);
                 }
                 if let Some(eb) = else_branch {
-                    self.in_branch(|cx| cx.infer_block(&eb));
+                    self.infer_block(&eb);
                 }
             }
             Stmt::While { cond, body } => {
                 self.infer_expr(cond, &Expectation::None);
-                self.in_branch(|cx| cx.infer_block(&body));
+                self.infer_block(&body);
             }
             Stmt::For(f) => {
                 let iter_ty = self.infer_expr(f.iter, &Expectation::None);
@@ -661,31 +669,33 @@ impl Cx<'_> {
                     kind: BindingKind::ForVar,
                 });
                 self.locals.insert(f.var.clone(), var_ty);
-                self.in_branch(|cx| cx.infer_block(&f.body));
+                self.infer_block(&f.body);
             }
             Stmt::Match { scrutinee, arms } => {
+                let at_match = self.narrowing.clone();
                 self.infer_expr(scrutinee, &Expectation::None);
                 for arm in arms {
-                    self.in_branch(|cx| {
-                        for b in &arm.binds {
-                            // Record the capture as a binding so navigation (find-refs / rename)
-                            // sees it as a local that shadows a same-named member; the type is the
-                            // Phase-2 `Variant`.
-                            cx.bindings.push(Binding {
-                                name_range: b.range,
-                                ty: Ty::Variant,
-                                init: None,
-                                annotated: false,
-                                inferred_colon_eq: false,
-                                kind: BindingKind::MatchBind,
-                            });
-                            cx.locals.insert(b.name.clone(), Ty::Variant);
-                        }
-                        if let Some(g) = arm.guard {
-                            cx.infer_expr(g, &Expectation::None);
-                        }
-                        cx.infer_block(&arm.body);
-                    });
+                    // Restore the match-level facts before each arm's guard (a prior arm's body
+                    // walk overwrote `self.narrowing`).
+                    self.narrowing.clone_from(&at_match);
+                    for b in &arm.binds {
+                        // Record the capture as a binding so navigation (find-refs / rename) sees
+                        // it as a local that shadows a same-named member; the type is the Phase-2
+                        // `Variant`.
+                        self.bindings.push(Binding {
+                            name_range: b.range,
+                            ty: Ty::Variant,
+                            init: None,
+                            annotated: false,
+                            inferred_colon_eq: false,
+                            kind: BindingKind::MatchBind,
+                        });
+                        self.locals.insert(b.name.clone(), Ty::Variant);
+                    }
+                    if let Some(g) = arm.guard {
+                        self.infer_expr(g, &Expectation::None);
+                    }
+                    self.infer_block(&arm.body);
                 }
             }
             Stmt::Break | Stmt::Continue | Stmt::Pass => {}
@@ -747,7 +757,7 @@ impl Cx<'_> {
             inferred_colon_eq: v.is_inferred,
             kind: BindingKind::Var,
         });
-        self.narrowing.remove(v.name.as_str());
+        // A (re-)declaration's narrowing invalidation is handled by the flow analysis (Workstream 2).
         self.locals.insert(v.name.clone(), binding_ty);
     }
 
@@ -1131,15 +1141,8 @@ impl Cx<'_> {
         if !slot.is_uninformative() {
             self.check_assign(&value, &slot, self.range_of(rhs));
         }
-        // Assignment narrowing: bound the narrowed type by the declared slot.
-        if let Some(key) = self.narrow_key(lhs) {
-            let narrowed = if slot.is_uninformative() {
-                value.clone()
-            } else {
-                slot.clone()
-            };
-            self.narrowing.insert(key, narrowed);
-        }
+        // Assignment *invalidates* the place's narrowing (handled by the flow analysis, Workstream
+        // 2); re-narrowing from the assigned value's type is a post-1.0 precision item.
         slot
     }
 
@@ -1760,34 +1763,41 @@ impl Cx<'_> {
 
     // ---- narrowing ----
 
-    /// Apply the narrowing implied by an `if`/`elif` condition to the current (cloned) branch.
+    /// Build the narrowing env for a statement from the precomputed flow facts (Workstream 2).
     ///
-    /// `is`-narrowing is a deliberate divergence from upstream Godot (whose `is` does **not**
-    /// flow-narrow); we add it as a UX improvement but keep it **widen-only** so it never produces
-    /// a type Godot's checker would reject: narrow only when the tested type is a strict downcast
-    /// of the operand's current type, or the operand is uninformative. If the operand is already a
-    /// subtype of the test (`d: Derived; if d is Base`), keep it — do not un-narrow. The
-    /// `is_uninformative` guard also stays: never narrow to a type we couldn't resolve.
-    fn apply_narrowing(&mut self, cond: ExprId) {
-        let Expr::Is {
-            operand,
-            ty: Some(ptr),
-            negated: false,
-        } = self.body.expr(cond).clone()
-        else {
-            return;
+    /// Only `Is` facts contribute a type (`NotNull`/`Not` are recorded by the flow pass but not yet
+    /// consumed for typing — the 1.0 cut). The **widen-only + `is_uninformative`** soundness gate is
+    /// preserved verbatim from the old `apply_narrowing`: `is`-narrowing is a deliberate divergence
+    /// from upstream Godot (whose `is` does not flow-narrow), kept widen-only so it never produces a
+    /// type Godot would reject — narrow only when the tested type is a downcast of the place's
+    /// declared type, or the declared type is uninformative; never un-narrow a known subtype
+    /// (`d: Derived; if d is Base` keeps `Derived`), never narrow to a type we couldn't resolve.
+    fn facts_to_narrowing(&self, id: body::StmtId) -> FxHashMap<String, Ty> {
+        let mut out = FxHashMap::default();
+        let Some(facts) = self.flow.facts_before(id) else {
+            return out;
         };
-        let Some(key) = self.narrow_key(operand) else {
-            return;
-        };
-        let narrowed = self.resolve_ptr_ty(ptr);
-        if narrowed.is_uninformative() {
-            return;
+        for (place, nt) in facts.iter() {
+            let NarrowedTy::Is(ptr) = nt else {
+                continue;
+            };
+            let narrowed = self.resolve_ptr_ty(*ptr);
+            if narrowed.is_uninformative() {
+                continue;
+            }
+            // Widen-only, gated against the place's declared type. We can look that up directly for
+            // a local/param; for `self`-members / field chains the `is_uninformative` check above is
+            // the soundness floor (we never assert a member the un-narrowed type couldn't justify).
+            if let Place::Local(n) = place
+                && let Some(cur) = self.locals.get(n)
+                && !cur.is_uninformative()
+                && !self.is_subtype(&narrowed, cur)
+            {
+                continue;
+            }
+            out.insert(place.dotted_key(), narrowed);
         }
-        let cur = self.expr_ty.get(&operand).cloned().unwrap_or(Ty::Variant);
-        if cur.is_uninformative() || self.is_subtype(&narrowed, &cur) {
-            self.narrowing.insert(key, narrowed);
-        }
+        out
     }
 
     /// A dotted access-path key for narrowing (`x`, `self.field`, `a.b.c`), or `None` for a
@@ -1840,14 +1850,6 @@ impl Cx<'_> {
             return a.clone();
         }
         Ty::Variant
-    }
-
-    /// Run a closure within a branch-scoped narrowing frame (clone on enter, restore on exit).
-    fn in_branch<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let saved = self.narrowing.clone();
-        let r = f(self);
-        self.narrowing = saved;
-        r
     }
 }
 

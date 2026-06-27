@@ -77,6 +77,17 @@ impl Place {
         }
     }
 
+    /// The dotted access-path key for this place (`x`, `self.field`, `a.b.c`) — the format the
+    /// checker's `narrow_key` produces, so the two agree when the checker consults a fact.
+    #[must_use]
+    pub fn dotted_key(&self) -> String {
+        match self {
+            Place::Local(n) => n.to_string(),
+            Place::SelfMember(m) => format!("self.{m}"),
+            Place::Field(base, name) => format!("{}.{name}", base.dotted_key()),
+        }
+    }
+
     /// Whether this place is rooted at `self` (a `self.member` or a field chain under it) — the
     /// places an opaque call may have mutated.
     #[must_use]
@@ -119,6 +130,11 @@ impl FlowFacts {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Iterate the `(place, narrowed-type)` facts.
+    pub fn iter(&self) -> impl Iterator<Item = (&Place, &NarrowedTy)> {
+        self.0.iter()
     }
 
     /// Install a fact, preferring the stronger of an existing `Is` over a new `NotNull` (an `Is`
@@ -192,6 +208,14 @@ pub fn analyze(body: &Body) -> FlowAnalysis {
         unreachable_anchors: Vec::new(),
     };
     a.block(FlowFacts::default(), &body.block);
+    // Each lambda body is a fresh scope — analyze it independently (its statements share the body's
+    // arena, so their entry facts merge into the same map). A single pass over the expression arena
+    // catches every lambda, including nested ones.
+    for expr in &body.exprs {
+        if let Expr::Lambda { body: lbody, .. } = expr {
+            a.block(FlowFacts::default(), lbody);
+        }
+    }
     FlowAnalysis {
         entry_facts: a.entry_facts,
         unreachable_anchors: a.unreachable_anchors,
