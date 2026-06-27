@@ -12,6 +12,7 @@
 pub mod body;
 mod cst;
 pub mod def;
+pub mod flow;
 pub mod infer;
 pub mod item_tree;
 pub mod project;
