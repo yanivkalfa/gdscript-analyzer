@@ -8,16 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 new feature is a patch).
 ## [0.3.0] - 2026-06-28
 
+### Added
 
+- **fmt:** W3 — gdscript-fmt formatter crate + Analysis::format
 
-## [0.2.1] - 2026-06-27
+### Fixed
 
-
-
-## [0.2.0] - 2026-06-27
-
-### Documentation
-
-- Client-facing READMEs + accurate v0.1 package metadata
+- **hir,fmt:** §1 bug-hunt — 5 confirmed Phase-6 defects
 
 
