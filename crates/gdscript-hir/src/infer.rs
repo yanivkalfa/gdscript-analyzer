@@ -910,21 +910,45 @@ impl Cx<'_> {
             ),
             None => false,
         };
-        if self.is_func_body && (shadows_param || shadows_member) {
+        if self.is_func_body {
             let what = if v.is_const { "constant" } else { "variable" };
-            let outer = if shadows_param {
-                "parameter"
-            } else {
-                "class member"
-            };
-            self.warn(
-                v.name_range,
-                WarningCode::ShadowedVariable,
-                format!(
-                    "The local {what} \"{}\" shadows a {outer} of the same name.",
-                    v.name
-                ),
-            );
+            if shadows_param || shadows_member {
+                let outer = if shadows_param {
+                    "parameter"
+                } else {
+                    "class member"
+                };
+                self.warn(
+                    v.name_range,
+                    WarningCode::ShadowedVariable,
+                    format!(
+                        "The local {what} \"{}\" shadows a {outer} of the same name.",
+                        v.name
+                    ),
+                );
+            } else if self.engine_base_has_value_member(&v.name) {
+                // An own-member shadow already won above; only a *base*-member shadow reaches here.
+                self.warn(
+                    v.name_range,
+                    WarningCode::ShadowedVariableBaseClass,
+                    format!(
+                        "The local {what} \"{}\" shadows a member of a base class.",
+                        v.name
+                    ),
+                );
+            }
+            // ENUM_VARIABLE_WITHOUT_DEFAULT — a local typed as an enum with no initializer (the
+            // implicit `0` may not name a valid enum value). Only an explicit `Ty::Enum` annotation.
+            if v.init.is_none() && matches!(annotated.as_ref(), Some(Ty::Enum(_))) {
+                self.warn(
+                    v.name_range,
+                    WarningCode::EnumVariableWithoutDefault,
+                    format!(
+                        "The enum variable \"{}\" has no default value (it defaults to 0, which may not be a valid enum value).",
+                        v.name
+                    ),
+                );
+            }
         }
         self.bindings.push(Binding {
             name: v.name.clone(),
@@ -1564,6 +1588,7 @@ impl Cx<'_> {
                     // e.g. GDScript, also carry a modeled `new` member — the constructor wins).
                     recv_ty.clone()
                 } else if let Some(m) = self.api.lookup_member(*class, name) {
+                    self.check_member_kind_misuse(&m, as_method, name, name_range);
                     self.member_ref_ty(&m, as_method)
                 } else if let Some(t) = self.class_enum_value(*class, name) {
                     // A statically-accessed enum value (`Control.PRESET_FULL_RECT`).
@@ -1705,6 +1730,61 @@ impl Cx<'_> {
             )
         };
         self.warn(range, code, message);
+    }
+
+    /// Whether the class's RESOLVED **engine** base declares a *value* member (var/const/signal)
+    /// named `name` — the sound floor for `SHADOWED_VARIABLE_BASE_CLASS`. Only the engine base is
+    /// consulted: an unresolved base (the cross-file seam) returns `false` (no warning), and the
+    /// cross-file *user*-base `MemberSig` is lossy (no kind detail) so user-base shadowing stays
+    /// deferred (see `TECH_DEBT.md`). Methods are excluded (matches the own-member shadow rule).
+    fn engine_base_has_value_member(&self, name: &str) -> bool {
+        let Ty::Object(base) = &self.class.base else {
+            return false;
+        };
+        matches!(
+            self.api.lookup_member(*base, name),
+            Some(MemberRef::Property(_) | MemberRef::Const(_) | MemberRef::Signal(_))
+        )
+    }
+
+    /// Flag a deprecated member-kind misuse on a statically-resolved engine member:
+    /// `PROPERTY_USED_AS_FUNCTION` / `CONSTANT_USED_AS_FUNCTION` when a property/const is *called*.
+    /// Guarded against a Callable/Signal/uninformative-typed member (those can legitimately be
+    /// invoked). `FUNCTION_USED_AS_PROPERTY` is intentionally NOT emitted — a bare `obj.method` is an
+    /// idiomatic `Callable` reference (every signal `.connect`), indistinguishable from a misuse
+    /// without call-context, so it would false-positive everywhere (see `TECH_DEBT.md`).
+    fn check_member_kind_misuse(
+        &mut self,
+        m: &MemberRef,
+        as_method: bool,
+        name: &str,
+        range: TextRange,
+    ) {
+        if !as_method {
+            return;
+        }
+        let (code, kind, ty) = match m {
+            MemberRef::Property(p) => (
+                WarningCode::PropertyUsedAsFunction,
+                "property",
+                ty::resolve_tyref(self.api, &p.ty),
+            ),
+            MemberRef::Const(c) => (
+                WarningCode::ConstantUsedAsFunction,
+                "constant",
+                ty::resolve_tyref(self.api, &c.ty),
+            ),
+            _ => return,
+        };
+        // A Callable/Signal-typed (or uninformative) member can be invoked — never flag it.
+        if ty.is_uninformative() || matches!(ty, Ty::Callable | Ty::Signal(_)) {
+            return;
+        }
+        self.warn(
+            range,
+            code,
+            format!("The {kind} \"{name}\" is being called as if it were a function."),
+        );
     }
 
     fn member_ref_ty(&self, m: &MemberRef, as_method: bool) -> Ty {
@@ -2224,6 +2304,95 @@ mod tests {
     fn non_shadowing_local_does_not_warn_shadowed_variable() {
         let h = infer_first_func("func f(x):\n\tvar y = 1\n\treturn x + y\n");
         assert!(!codes(&h).contains(&"SHADOWED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn local_shadowing_a_base_member_warns_base_class() {
+        // `position` is a Node2D property; a local of that name shadows the base member.
+        let h =
+            infer_first_func("extends Node2D\nfunc f():\n\tvar position = 1\n\treturn position\n");
+        assert!(
+            codes(&h).contains(&"SHADOWED_VARIABLE_BASE_CLASS"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn shadowing_an_unresolved_base_is_silent() {
+        // No false positive when the base can't be resolved (the cross-file seam).
+        let h = infer_first_func(
+            "extends SomeUnknownThirdPartyClass\nfunc f():\n\tvar position = 1\n\treturn position\n",
+        );
+        assert!(
+            !codes(&h).contains(&"SHADOWED_VARIABLE_BASE_CLASS"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn enum_local_without_default_warns() {
+        let h = infer_first_func("func f():\n\tvar m: Tween.TweenProcessMode\n");
+        assert!(
+            codes(&h).contains(&"ENUM_VARIABLE_WITHOUT_DEFAULT"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn enum_local_with_default_does_not_warn() {
+        let h = infer_first_func(
+            "func f():\n\tvar m: Tween.TweenProcessMode = Tween.TWEEN_PROCESS_IDLE\n\treturn m\n",
+        );
+        assert!(
+            !codes(&h).contains(&"ENUM_VARIABLE_WITHOUT_DEFAULT"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn property_called_as_function_warns() {
+        // `n.name` is a Node property; calling it is PROPERTY_USED_AS_FUNCTION.
+        let h = infer_first_func("func f(n: Node):\n\tn.name()\n");
+        assert!(
+            codes(&h).contains(&"PROPERTY_USED_AS_FUNCTION"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn constant_called_as_function_warns() {
+        // `NOTIFICATION_READY` is a Node constant; calling it is CONSTANT_USED_AS_FUNCTION.
+        let h = infer_first_func("func f(n: Node):\n\tn.NOTIFICATION_READY()\n");
+        assert!(
+            codes(&h).contains(&"CONSTANT_USED_AS_FUNCTION"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn calling_a_real_method_is_not_a_kind_misuse() {
+        let h = infer_first_func("func f(n: Node):\n\tn.get_parent()\n");
+        assert!(
+            codes(&h).iter().all(|c| !c.ends_with("_USED_AS_FUNCTION")),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn reading_a_property_as_a_value_is_not_a_kind_misuse() {
+        let h = infer_first_func("func f(n: Node):\n\tvar s = n.name\n\treturn s\n");
+        assert!(
+            codes(&h).iter().all(|c| !c.ends_with("_USED_AS_FUNCTION")),
+            "{:?}",
+            codes(&h)
+        );
     }
 
     #[test]
