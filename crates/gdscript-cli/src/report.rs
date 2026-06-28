@@ -306,6 +306,7 @@ mod tests {
             display: display.into(),
             line_index: LineIndex::new(text),
             text: text.into(),
+            path: None,
         }
     }
 

@@ -90,5 +90,35 @@ fn bench(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench);
+/// Warm-keystroke incremental re-analysis (Phase-6 W4): after a cold analysis, a one-token edit to
+/// a single body should re-run only that file's `analyze_file` (flow + gate included), not the
+/// cross-file firewalled queries. This is the load-bearing incrementality the salsa graph + the W1
+/// gating seam (downstream of `analyze_file`) + the W2 flow pass (inside `analyze_file`) must keep
+/// fast. Target: flat, well under the cold cost.
+fn bench_keystroke(c: &mut Criterion) {
+    let file = FileId(0);
+    // Two bodies differing by one token — toggling them is a realistic single-keystroke edit to a
+    // field initializer (a body change, not a signature change → the cross-file firewall holds).
+    let a = sample_script();
+    let b_src = a.replacen("var count := 0", "var count := 1", 1);
+
+    let mut host = AnalysisHost::new();
+    let mut change = Change::new();
+    change.change_file(file, a.as_str());
+    host.apply_change(change);
+    let _ = host.analysis().diagnostics(file).unwrap(); // warm the engine model + first analysis
+
+    let mut toggle = false;
+    c.bench_function("warm_keystroke_diagnostics_~300loc", |bencher| {
+        bencher.iter(|| {
+            let mut ch = Change::new();
+            ch.change_file(file, if toggle { b_src.as_str() } else { a.as_str() });
+            toggle = !toggle;
+            host.apply_change(ch);
+            black_box(host.analysis().diagnostics(black_box(file)).unwrap());
+        });
+    });
+}
+
+criterion_group!(benches, bench, bench_keystroke);
 criterion_main!(benches);

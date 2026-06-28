@@ -12,11 +12,13 @@
 pub mod body;
 mod cst;
 pub mod def;
+pub mod flow;
 pub mod infer;
 pub mod item_tree;
 pub mod project;
 pub mod queries;
 pub mod resolve;
 pub mod ty;
+pub mod warnings;
 
 pub use cst::AstPtr;

@@ -97,7 +97,8 @@ pub enum Command {
     Check(PathsArg),
     /// Diagnostics filtered to the warning/lint subset (non-error severities).
     Lint(PathsArg),
-    /// Format GDScript. **Phase 5 is a passthrough**; the real formatter is Phase 6.
+    /// Format GDScript (normalize indentation + whitespace). `--check` reports without writing;
+    /// `--write` rewrites in place; default streams the formatted text to stdout.
     Format(FormatArgs),
     /// Dump each file's document symbols as JSON.
     Symbols(PathsArg),

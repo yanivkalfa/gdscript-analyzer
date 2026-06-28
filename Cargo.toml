@@ -15,6 +15,7 @@ default-members = [
     "crates/gdscript-db",
     "crates/gdscript-hir",
     "crates/gdscript-ide",
+    "crates/gdscript-fmt",
     "crates/gdscript-scene",
     "crates/gdscript-session",
     "crates/gdscript-lsp",
@@ -24,7 +25,7 @@ default-members = [
 
 # Shared metadata inherited by every crate via `*.workspace = true`.
 [workspace.package]
-version = "0.1.0" # single shared version across crates.io + npm
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88.0" # MSRV = napi-rs v3 floor (asserted by the `msrv` CI job)
 license = "MIT OR Apache-2.0"
@@ -37,13 +38,14 @@ keywords = ["gdscript", "godot", "analyzer", "lsp", "language-server"]
 # Single source of truth for dependency versions; crates opt in with `{ workspace = true }`.
 [workspace.dependencies]
 # Internal crates (path + version so they publish correctly).
-gdscript-base = { path = "crates/gdscript-base", version = "0.1.0" }
-gdscript-syntax = { path = "crates/gdscript-syntax", version = "0.1.0" }
-gdscript-api = { path = "crates/gdscript-api", version = "0.1.0" }
-gdscript-db = { path = "crates/gdscript-db", version = "0.1.0" }
-gdscript-hir = { path = "crates/gdscript-hir", version = "0.1.0" }
-gdscript-ide = { path = "crates/gdscript-ide", version = "0.1.0" }
-gdscript-scene = { path = "crates/gdscript-scene", version = "0.1.0" }
+gdscript-base = { path = "crates/gdscript-base", version = "0.2.1" }
+gdscript-syntax = { path = "crates/gdscript-syntax", version = "0.2.1" }
+gdscript-api = { path = "crates/gdscript-api", version = "0.2.1" }
+gdscript-db = { path = "crates/gdscript-db", version = "0.2.1" }
+gdscript-hir = { path = "crates/gdscript-hir", version = "0.2.1" }
+gdscript-ide = { path = "crates/gdscript-ide", version = "0.2.1" }
+gdscript-fmt = { path = "crates/gdscript-fmt", version = "0.2.1" }
+gdscript-scene = { path = "crates/gdscript-scene", version = "0.2.1" }
 # `gdscript-session` is internal-only (`publish = false`) — bundled into the napi/wasm bindings, never
 # sent to crates.io. It is therefore PATH-ONLY (no version requirement): release-plz bumps its package
 # version (via `version.workspace = true`) but does NOT rewrite the version requirement of a

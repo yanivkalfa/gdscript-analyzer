@@ -19,6 +19,7 @@ violate an invariant without knowing it was deliberate.
 | [0001](./0001-rust-library-not-server.md) | Rust + library-not-server | Accepted |
 | [0002](./0002-handwritten-parser-treesitter-oracle.md) | Hand-written parser, tree-sitter as oracle | Accepted |
 | [0003](./0003-napi-rs-v3-dual-target.md) | napi-rs v3 dual-target binding | Accepted |
+| [0004](./0004-rfc-graduation-trigger.md) | Lightweight RFC process + graduation trigger | Accepted |
 
 ## The process
 

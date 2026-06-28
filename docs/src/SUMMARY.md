@@ -1,6 +1,7 @@
 # Summary
 
 - [Introduction](README.md)
+- [Roadmap](roadmap.md)
 - [User Guide]()
   - [Install](guide/install.md)
   - [Quickstart](guide/quickstart.md)
@@ -10,6 +11,9 @@
   - [From the Browser](consume/browser.md)
 - [Editor / LSP Client Integration]()
   - [Overview](clients/overview.md)
+- [Reference]()
+  - [Configuration](reference/configuration.md)
+  - [Warning Reference](reference/warnings.md)
 - [Contributing]()
   - [Architecture](contributing/architecture.md)
   - [Crate layout](contributing/crates.md)
@@ -19,3 +23,4 @@
   - [ADR-0001: Rust + library-not-server](adr/0001-rust-library-not-server.md)
   - [ADR-0002: Hand-written parser, tree-sitter as oracle](adr/0002-handwritten-parser-treesitter-oracle.md)
   - [ADR-0003: napi-rs v3 dual-target binding](adr/0003-napi-rs-v3-dual-target.md)
+  - [ADR-0004: Lightweight RFC process + graduation trigger](adr/0004-rfc-graduation-trigger.md)

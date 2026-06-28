@@ -72,8 +72,8 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
             let cfg = resolve_config(g, &p.paths)?;
             run_diagnostics(p, g, DiagFilter::WarningsOnly, &cfg)
         }
-        // `symbols` (data) and `format` (Phase-5 passthrough) don't consume config options, but an
-        // explicit `--config <bad file>` must still surface as a config error (exit 2) — so validate it.
+        // `symbols` (data) and `format` don't consume the lint config options, but an explicit
+        // `--config <bad file>` must still surface as a config error (exit 2) — so validate it.
         Command::Symbols(p) => {
             resolve_config(g, &p.paths)?;
             run_symbols(p, g)
@@ -144,24 +144,71 @@ fn run_symbols(paths: &PathsArg, g: &GlobalArgs) -> anyhow::Result<i32> {
     Ok(EXIT_OK)
 }
 
-/// `format`: Phase 5 is a passthrough (identity) — no file is ever changed. `--check`/`--write` are
-/// accepted plumbing; the real formatter is Phase 6.
+/// `format`: normalize each file via [`gdscript_fmt`]. Default streams to stdout; `--check` reports
+/// + exits 1 on any change; `--write` rewrites changed files in place.
 fn run_format(args: &FormatArgs, g: &GlobalArgs) -> i32 {
     let project = Project::load(&args.paths.paths);
     print_load_errors(&project);
-    if !g.quiet {
-        let mode = if args.check {
-            " (--check)"
+    let cfg = gdscript_fmt::FmtConfig::default();
+
+    // Default mode streams the formatted text to the output sink (stdout / `--output-file`).
+    let mut writer = if args.check || args.write {
+        None
+    } else {
+        match open_writer(g) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                eprintln!("gdscript: {e}");
+                return EXIT_USAGE;
+            }
+        }
+    };
+
+    let mut unformatted = 0usize;
+    let mut write_errors = 0usize;
+    for f in &project.files {
+        let formatted = gdscript_fmt::format(&f.text, &cfg);
+        let changed = formatted != *f.text;
+        if args.check {
+            if changed {
+                unformatted += 1;
+                if !g.quiet {
+                    eprintln!("would reformat: {}", f.display);
+                }
+            }
         } else if args.write {
-            " (--write)"
-        } else {
-            ""
-        };
-        eprintln!(
-            "gdscript format{mode}: the formatter is not yet implemented (Phase 6); \
-             {} file(s) inspected, none changed.",
-            project.files.len()
-        );
+            if changed {
+                if let Some(p) = &f.path {
+                    if let Err(e) = std::fs::write(p, &formatted) {
+                        eprintln!("gdscript: cannot write {}: {e}", f.display);
+                        write_errors += 1;
+                    } else if !g.quiet {
+                        eprintln!("formatted: {}", f.display);
+                    }
+                } else {
+                    eprintln!(
+                        "gdscript: cannot write {} in place (no on-disk path)",
+                        f.display
+                    );
+                    write_errors += 1;
+                }
+            }
+        } else if let Some(w) = writer.as_mut() {
+            let _ = w.write_all(formatted.as_bytes());
+        }
+    }
+    if let Some(w) = writer.as_mut() {
+        let _ = w.flush();
+    }
+
+    if write_errors > 0 {
+        return EXIT_INTERNAL;
+    }
+    if args.check && unformatted > 0 {
+        if !g.quiet {
+            eprintln!("{unformatted} file(s) would be reformatted.");
+        }
+        return EXIT_DIAGNOSTICS;
     }
     EXIT_OK
 }

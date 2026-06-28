@@ -85,6 +85,22 @@ pub fn inlay_hints(a: &Analysis, ctx: &DocCtx) -> Cancellable<Vec<lsp::InlayHint
         .collect())
 }
 
+/// `textDocument/formatting` — a single whole-document edit replacing the file with its formatted
+/// text. `None` (no edits) when the file is already formatted or the formatter left it unchanged.
+pub fn formatting(a: &Analysis, ctx: &DocCtx) -> Cancellable<Option<Vec<lsp::TextEdit>>> {
+    let Some(formatted) = a.format(ctx.file)? else {
+        return Ok(None);
+    };
+    if formatted == *ctx.text {
+        return Ok(None);
+    }
+    let whole = TextRange::new(0, u32::try_from(ctx.text.len()).unwrap_or(u32::MAX));
+    Ok(Some(vec![lsp::TextEdit {
+        range: convert::range_to_lsp(&ctx.line_index, &ctx.text, whole, ctx.encoding),
+        new_text: formatted,
+    }]))
+}
+
 /// `textDocument/semanticTokens/full` — the whole file's tokens, 5-int relative-encoded.
 pub fn semantic_tokens(
     a: &Analysis,

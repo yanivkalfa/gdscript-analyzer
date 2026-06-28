@@ -130,6 +130,8 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
         })),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        // Phase-6 W3: whole-document formatting.
+        document_formatting_provider: Some(OneOf::Left(true)),
         ..Default::default()
     }
 }
@@ -331,6 +333,7 @@ impl GlobalState {
             "textDocument/documentSymbol" => self.spawn_file(req, handlers::document_symbols),
             "textDocument/foldingRange" => self.spawn_file(req, handlers::folding_ranges),
             "textDocument/inlayHint" => self.spawn_file(req, handlers::inlay_hints),
+            "textDocument/formatting" => self.spawn_file(req, handlers::formatting),
             "textDocument/semanticTokens/full" => {
                 self.spawn_file(req, handlers::semantic_tokens);
             }
