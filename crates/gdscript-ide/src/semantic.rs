@@ -56,10 +56,20 @@ pub fn type_diagnostics(db: &dyn Db, file: FileText) -> Vec<Diagnostic> {
     // `analyze_file` already yields an empty result with no engine model (wasm32), so the
     // diagnostics are naturally empty there — no separate guard needed.
     let inf = queries::analyze_file(db, file);
-    let settings = db.project_config().map_or_else(
+    let base = db.project_config().map_or_else(
         || Arc::new(WarningSettings::analyzer_default()),
         |c| queries::warning_settings(db, c),
     );
+    // A host-level `--strict`/`--engine-defaults` override flips only the opt-in-group promotion on
+    // the resolved settings (preserving the project's explicit per-code levels). Read from a plain,
+    // non-salsa `Db` field, so it never enters the tracked query graph — the W1 firewall holds.
+    let settings = match db.warning_override() {
+        gdscript_db::WarningOverride::None => base,
+        gdscript_db::WarningOverride::Strict => Arc::new((*base).clone().with_strict_opt_in(true)),
+        gdscript_db::WarningOverride::EngineDefaults => {
+            Arc::new((*base).clone().with_strict_opt_in(false))
+        }
+    };
     let ignores = queries::suppression_map(db, file);
     let path = file.res_path(db);
     let mut out: Vec<Diagnostic> = inf.diagnostics.clone();
@@ -811,6 +821,46 @@ mod tests {
                 .iter()
                 .all(|d| d.code != "INTEGER_DIVISION"),
             "enable=false must suppress gateable warnings",
+        );
+    }
+
+    #[test]
+    fn warning_override_engine_defaults_silences_the_opt_in_group() {
+        let src = "extends Node\nfunc f(n: Node):\n\tn.not_a_real_method()\n";
+        // Standalone (no project.godot) defaults to strict → the opt-in UNSAFE_* group fires.
+        let (db, ft) = db_ft(src);
+        assert!(
+            type_diagnostics(&db, ft)
+                .iter()
+                .any(|d| d.code == "UNSAFE_METHOD_ACCESS")
+        );
+        // `--engine-defaults` forces the opt-in group back to IGNORE even in standalone mode.
+        let (mut db2, ft2) = db_ft(src);
+        db2.set_warning_override(crate::WarningOverride::EngineDefaults);
+        assert!(
+            type_diagnostics(&db2, ft2)
+                .iter()
+                .all(|d| d.code != "UNSAFE_METHOD_ACCESS"),
+            "--engine-defaults must silence the opt-in group",
+        );
+    }
+
+    #[test]
+    fn warning_override_strict_respects_an_explicit_project_ignore() {
+        let src = "extends Node\nfunc f(n: Node):\n\tn.not_a_real_method()\n";
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), src, Durability::LOW);
+        // The project explicitly ignores unsafe_method_access.
+        db.set_project_config("[debug]\ngdscript/warnings/unsafe_method_access=0\n");
+        db.sync_source_root();
+        db.set_warning_override(crate::WarningOverride::Strict);
+        let ft = db.file_text(FileId(0)).unwrap();
+        // `--strict` promotes the opt-in group, but an explicit per-code Ignore still wins.
+        assert!(
+            type_diagnostics(&db, ft)
+                .iter()
+                .all(|d| d.code != "UNSAFE_METHOD_ACCESS"),
+            "an explicit per-code ignore must beat --strict",
         );
     }
 

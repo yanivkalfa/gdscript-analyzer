@@ -365,6 +365,49 @@ pub struct MatchArm {
     pub guard: Option<ExprId>,
     /// The arm body.
     pub body: Block,
+    /// The arm's byte range (the `UNREACHABLE_PATTERN` anchor).
+    pub range: TextRange,
+    /// Whether this arm is an **unconditional catch-all** — its sole top-level pattern is `_` or a
+    /// `var x` bind, with no `when` guard. Every arm *after* a catch-all is `UNREACHABLE_PATTERN`.
+    pub is_catch_all: bool,
+}
+
+/// Whether a `match` arm is an UNCONDITIONAL catch-all — its **sole top-level** pattern is `_` (a
+/// `PatternLiteral`/`PatternWildcard` whose only token is `_`) or a `var x` bind (`PatternBind`),
+/// and it has no `when` guard. Conservative: a multi-pattern arm (`1, _:`), a `_`/`var` nested in an
+/// array/dict pattern, or a guarded arm is NOT a catch-all — we under-warn `UNREACHABLE_PATTERN`
+/// rather than risk flagging a reachable arm (a false positive on valid code).
+fn arm_is_unconditional_catch_all(arm: &GdNode) -> bool {
+    use SyntaxKind as K;
+    if cst::first_child(arm, |k| k == K::PatternGuard).is_some() {
+        return false;
+    }
+    let patterns: Vec<&GdNode> = arm
+        .children()
+        .filter(|c| {
+            matches!(
+                c.kind(),
+                K::PatternBind
+                    | K::PatternLiteral
+                    | K::PatternWildcard
+                    | K::PatternArray
+                    | K::PatternDict
+                    | K::PatternRest
+            )
+        })
+        .collect();
+    let [only] = patterns.as_slice() else {
+        return false;
+    };
+    match only.kind() {
+        K::PatternBind | K::PatternWildcard => true,
+        // `_` parses as a `PatternLiteral` wrapping the identifier expr `_` (a `NameRef` node), so
+        // the `_` token is nested one level down — check the inner expr's first token.
+        K::PatternLiteral => cst::first_child_expr(only)
+            .and_then(|e| cst::first_token(&e))
+            .is_some_and(|t| t.text() == "_"),
+        _ => false,
+    }
 }
 
 /// A lowered statement.
@@ -864,7 +907,13 @@ impl Lowerer {
                     .and_then(|g| cst::first_child_expr(&g))
                     .map(|e| self.lower_expr(&e));
                 let body = self.lower_child_block(arm);
-                MatchArm { binds, guard, body }
+                MatchArm {
+                    binds,
+                    guard,
+                    body,
+                    range: cst::text_range_of(arm),
+                    is_catch_all: arm_is_unconditional_catch_all(arm),
+                }
             })
             .collect();
         Stmt::Match { scrutinee, arms }

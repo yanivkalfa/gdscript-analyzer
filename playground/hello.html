@@ -51,17 +51,19 @@ class Inner:
     <pre id="diagnostics"></pre>
 
     <script type="module">
-      import init, { WasmAnalysis } from "./pkg/gdscript.js";
+      // The URI-keyed Analyzer: push documents by URI, query by URI. Queries return native JS
+      // values (no JSON.parse) — the wasm binding converts the analyzer's results directly.
+      import init, { Analyzer } from "./pkg/gdscript.js";
 
       await init();
-      const analysis = new WasmAnalysis();
-      const FILE = 0;
+      const az = new Analyzer();
+      const URI = "inmemory://player.gd";
 
       function render() {
         const src = document.getElementById("src").value;
-        analysis.applyChange(FILE, src);
+        az.changeDocument(URI, src); // unknown URI ⇒ upsert, so no prior open needed
 
-        const symbols = JSON.parse(analysis.documentSymbols(FILE));
+        const symbols = az.documentSymbols(URI); // native array
         const out = document.getElementById("symbols");
         out.innerHTML = "";
         const walk = (sym, depth) => {
@@ -74,7 +76,7 @@ class Inner:
         };
         symbols.forEach((s) => walk(s, 0));
 
-        const diags = JSON.parse(analysis.diagnostics(FILE));
+        const diags = az.diagnostics(URI); // native array
         document.getElementById("diagnostics").textContent =
           diags.length === 0 ? "(no parse errors)" : JSON.stringify(diags, null, 2);
       }

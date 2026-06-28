@@ -24,6 +24,10 @@ crate-type = ["cdylib", "rlib"]
 gdscript-session = { workspace = true }
 wasm-bindgen = { workspace = true }
 console_error_panic_hook = { workspace = true }
+# Convert each `serde_json::Value` query result into a native JS object (json-compatible mode, so
+# objects are plain objects not JS `Map`s). `serde` provides the `Serialize` bound on the helper.
+serde = { workspace = true }
+serde-wasm-bindgen = { workspace = true }
 
 [lints]
 workspace = true

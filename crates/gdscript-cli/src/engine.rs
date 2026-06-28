@@ -163,6 +163,13 @@ impl Project {
         }
     }
 
+    /// Apply a CLI `--strict` / `--engine-defaults` warning-strictness override before any
+    /// `diagnostics()` snapshot. A plain host field (not a salsa input), so it only affects the
+    /// downstream gate, never re-running inference.
+    pub fn set_warning_override(&mut self, ov: gdscript_ide::WarningOverride) {
+        self.host.set_warning_override(ov);
+    }
+
     /// Run `diagnostics(file)` for every file, in parallel over per-worker snapshot clones. Results
     /// are sorted by `(display path, start offset)` for deterministic output regardless of
     /// scheduling. `Analysis` is `Send + Clone` but not `Sync`, so `map_with` hands each rayon

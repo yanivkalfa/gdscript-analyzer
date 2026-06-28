@@ -101,7 +101,8 @@ fn run_diagnostics(
     filter: DiagFilter,
     cfg: &Config,
 ) -> anyhow::Result<i32> {
-    let project = Project::load(&paths.paths);
+    let mut project = Project::load(&paths.paths);
+    project.set_warning_override(g.warning_override());
     print_load_errors(&project);
     let mut results = project.diagnostics();
     if let DiagFilter::WarningsOnly = filter {

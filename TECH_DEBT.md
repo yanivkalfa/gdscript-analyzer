@@ -221,13 +221,17 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
 ## Phase 2 — deferred / known limitations
 
 ### Deliberately phased (NOT shortcuts — scoped per the roadmap)
-- [ ] **guitkx napi `analyzerProxy.ts` validation (Playbook §5.1, conditional).** The
-      end-to-end check that the napi build answers guitkx's embedded-GDScript
-      completion/hover with no Godot editor running. Needs the napi `.node` build
-      (`libnode.dll`, CI-only — see Phase 1) + the guitkx LSP server at
-      `…/ReactiveUI-Gadot/ide-extensions/lsp-server`. Everything it depends on (the
-      analyzer answering completion/hover headless) is built and proven against the corpus;
-      this is the integration wiring, deferred to the Phase-5 client work.
+- [~] **guitkx adapter migration to the typed binding — MIGRATED + VALIDATED locally; ship gated on
+      publish.** The adapter (`…/ReactiveUI-Gadot/ide-extensions/lsp-server/src/analyzerAdapter.ts`)
+      was migrated to the typed contract: dropped the four `JSON.parse(...)` calls
+      (`completions`/`hover`/`diagnostics`/`gotoDefinition`), now reads the result's `d.uri` field,
+      and **deleted** the `fileIds`/`nextId`/`track()` id↔uri mirror (`docs` collapsed to `uri→text`).
+      Validated by `npm link`-ing the locally-built `.node` into the LSP server: `tsc` clean + all
+      **32 tests green**, incl. the cross-file-goto test (now driven by the binding's `uri`, not a
+      mirror). **Only the SHIP is gated:** committing it needs `@gdscript-analyzer/core` published at
+      the new version + a `package.json` dep bump, else a clean `npm install` of guitkx pulls the old
+      0.2.x and the typed-contract adapter crashes. So: hold the guitkx commit until this branch
+      merges → releases → publishes, then bump the dep and land the (already-validated) adapter diff.
 - [ ] **Cross-file resolution → Phase 3.** `class_name` globals, autoloads, `preload`,
       script `extends`, and `as`/`is` against user types all funnel through
       `resolve_external() -> Ty::Unknown` (the seam). Correct + non-cascading today; Phase 3
@@ -277,9 +281,26 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       ignores by default (§5). Broaden to the Godot demo-projects corpus before v1.
 
 ### FFI ergonomics
-- [ ] **Bindings return JSON strings,** not typed `#[napi(object)]` / `serde-wasm-bindgen`
-      objects. Works and is minimal; consider typed results for better TS/JS DX once the
-      result shapes stabilize.
+- [x] **Bindings return native JS values, not JSON strings — DONE (Phase 3, `feat/w1-warnings`).**
+      `gdscript-session` now returns `serde_json::Value` (was a JSON `String`); the napi binding
+      converts it directly via the `serde-json` feature and the wasm binding via
+      `serde_wasm_bindgen` (`Serializer::json_compatible()` — REQUIRED, else `Value::Object`
+      serializes as a JS `Map`, breaking `result.field`). No client-side `JSON.parse`. The single
+      source of truth stays the `gdscript-base` POD (no `#[napi(object)]`/POD re-declaration in the
+      binding crates — the `Value` route keeps them trivial delegators). Verified locally: 15
+      `gdscript-session` unit tests + the wasm32 build/clippy + the full `xtask ci` gate, **plus an
+      end-to-end napi run**: the `.node` builds with the MSVC toolset and `bindings/node/hello.mjs`
+      confirms native-object returns + a cross-file goto target carrying its `uri`. (A generic
+      contributor still needs the VS C++ workload to build the `.node` locally — otherwise it is
+      CI-built; `hello.mjs` runs in the CI node-smoke job.)
+  - [x] **Mirror-free navigation.** The session injects a `"uri"` next to every `"file"` id in a
+        serialized result (a generic walk over `NavTarget`/`Reference`/`FileEdit`/`WouldCollide`),
+        so a client (guitkx) resolves cross-file targets without maintaining its own `FileId`→URI
+        mirror. Zero false-positive surface (every `gdscript-base` `file` field is a `FileId`).
+  - [ ] **Fully-typed TS surface (deferred, low value).** napi `serde_json::Value` types as `any`
+        in the generated `.d.ts`. Real TS types would need `#[napi(object)]` POD re-declaration (or
+        a generated-types step), trading the single-source-of-truth for DX. The client (guitkx) owns
+        its own TS interfaces today; revisit only if a published `.d.ts` becomes a requirement.
 
 ### Validation
 - [ ] **Differential corpus is small + error-agreement only.** The tree-sitter oracle
@@ -633,9 +654,11 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       real value (the `UNSAFE_*` codes) already ships. Adding them also needs a `codes()` test helper
       that filters the opt-in group (else they pollute every focused infer fixture).
 - [x] **`SHADOWED_VARIABLE` — DONE (§1 pass).** A local `var`/`const` shadowing a param or own
-      value-member (var/const/signal/anon-enum). **`SHADOWED_VARIABLE_BASE_CLASS`** (a member
-      shadowing a *base*-class member) stays deferred — it needs the base item-tree walk via
-      `script_class` (engine base via `api.lookup_member`, user base via the `ScriptRef` chain).
+      value-member (var/const/signal/anon-enum). **`SHADOWED_VARIABLE_BASE_CLASS` — DONE engine-base
+      (Phase 1):** a local shadowing a value member of the resolved ENGINE base
+      (`engine_base_has_value_member`), silent on an unresolved base. The **user-base** slice (a
+      member shadowing a base declared by another script) stays deferred — the cross-file `MemberSig`
+      is lossy (no kind/params), so a sound user-base walk needs it enriched first.
 - [ ] **`SHADOWED_GLOBAL_IDENTIFIER` (extend)** — currently fires only for a `class_name` collision
       (file-level, ungated, direct `Diagnostic`). Godot also fires for a local/member shadowing a
       global; extend + route through `gate` as a real `WarningCode`.
@@ -646,27 +669,36 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       `_TEMPORARY_MODIFICATION`** — Unicode mixed-script/homoglyph detection; needs a confusables
       table (`unicode-security` crate or the Unicode confusables data). `_TEMPORARY_MODIFICATION` is
       master-only (already `since=Master`).
-- [ ] **Deprecated-misuse trio** (`PROPERTY_USED_AS_FUNCTION`, `CONSTANT_USED_AS_FUNCTION`,
-      `FUNCTION_USED_AS_PROPERTY`) — call/property-kind mismatch on a resolved member.
-- [ ] **`NATIVE_METHOD_OVERRIDE`** — overriding a native virtual with an incompatible signature
-      (needs param-type comparison against the engine virtual).
-- [ ] **`STATIC_CALLED_ON_INSTANCE`**, **`MISSING_TOOL`**, **`REDUNDANT_STATIC_UNLOAD`**,
-      **`REDUNDANT_AWAIT`**, **`ENUM_VARIABLE_WITHOUT_DEFAULT`**, **`UNSAFE_VOID_RETURN`**,
-      **`UNSAFE_CAST`**, **`RETURN_VALUE_DISCARDED`**, **`INT_AS_ENUM_WITHOUT_MATCH`**,
-      **`DEPRECATED_KEYWORD`** (`yield` — parser must surface it), **`ONREADY_WITH_EXPORT`** (an
-      annotation pair on one member; needs item-tree annotation info), **`UNPRIVATE…`** etc. — each is
-      a small, self-contained check; sequenced by value after the M1 subset.
-- [ ] **`UNUSED_SIGNAL`**, **`UNUSED_PRIVATE_CLASS_VARIABLE`** — member-level unused analysis (needs
-      a whole-file member-read scan, like the local `used_locals` set but across methods).
-- [ ] **`UNASSIGNED_VARIABLE` / `_OP_ASSIGN`** — read-before-assign of a typed local; needs the W2
-      CFG's definite-assignment pass (a natural W2 extension — reachability is there, definite-assign
-      is not yet). **Deferred from the §1 pass (FP risk):** a sound, no-false-positive version must
-      resolve two subtleties first — (a) a *typed* local is auto-default-initialised in GDScript
-      (`var x: int` reads `0`), so reading-before-assign is not a runtime error, only a lint; and
-      (b) the may-vs-must question (warn on *possibly*-unassigned like Godot, or only *definitely*-
-      unassigned to stay conservative?). Resolving these needs a short Godot-semantics validation +
-      its own bug-hunt; rushing it pre-freeze risks false positives. Build it as a definite-assignment
-      lattice in `flow.rs` (per-statement `assigned: Set<Place>`, intersect at joins).
+- [x] **Deprecated-misuse trio — `PROPERTY_USED_AS_FUNCTION` / `CONSTANT_USED_AS_FUNCTION` DONE
+      (Phase 1, `feat/w1-warnings`).** Calling a statically-resolved engine property/const as a
+      function, guarded against Callable/Signal/uninformative members. **`FUNCTION_USED_AS_PROPERTY`
+      stays deferred** — a bare `obj.method` is an idiomatic `Callable` reference (every signal
+      `.connect`), indistinguishable from a misuse without call-context, so it would false-positive
+      everywhere. Needs the value-vs-call-context distinction the current `as_method` flag can't make.
+- [x] **`NATIVE_METHOD_OVERRIDE` — DONE engine-base (Phase 1), conservative.** Warns (ERROR-default)
+      only on a *definite type clash* at an overlapping typed param (both resolve to known engine
+      types, mutually non-assignable, neither an enum). Arity/defaults/vararg/variance + the
+      **user-base** override (needs the lossy cross-file `MemberSig` enriched with is_virtual/params)
+      under-warn — deferred.
+- [x] **`STATIC_CALLED_ON_INSTANCE` + `ENUM_VARIABLE_WITHOUT_DEFAULT` — DONE (Phase 1).** Static-on-
+      instance fires only for a typed local instance (skips a type-aliased local). Enum-without-
+      default fires for a local OR member field. Still deferred: **`MISSING_TOOL`**,
+      **`REDUNDANT_STATIC_UNLOAD`**, **`ONREADY_WITH_EXPORT`** (all need the item-tree to capture
+      annotations — `@tool`/`@static_unload`/`@onready`/`@export` are sibling CST nodes today),
+      **`REDUNDANT_AWAIT`**, **`UNSAFE_VOID_RETURN`**, **`UNSAFE_CAST`**, **`RETURN_VALUE_DISCARDED`**,
+      **`INT_AS_ENUM_WITHOUT_MATCH`**, **`DEPRECATED_KEYWORD`** (`yield` — parser must surface it).
+- [x] **`UNUSED_SIGNAL` — DONE (Phase 1, same-file).** A signal never referenced anywhere in its own
+      file (a whole-file `NameUses` identifier + string-literal scan). Same-file only, like Godot — a
+      signal connected purely from a scene/other file is invisible (the Godot-parity limitation).
+      **`UNUSED_PRIVATE_CLASS_VARIABLE`** still deferred (the same `NameUses` scan now exists to build
+      it on).
+- [x] **`UNASSIGNED_VARIABLE` — DONE (Phase 2, `feat/w1-warnings`).** A read of a typed-no-init local
+      not definitely assigned on every path, via a new `flow::analyze_assigned` definite-assignment
+      lattice (grow-only, intersect-at-merge, params seeded, lambda bodies unchecked) consulted at each
+      read in `resolve_name` (excluding the assignment LHS). Matches Godot's may-unassigned; verified 0
+      false positives on 545 real `.gd` (the 20 demo hits are genuine read-before-assign). The cosmetic
+      **`_OP_ASSIGN`** variant stays deferred — compound-assign collapses to `BinOp::Assign` in lowering,
+      so it can't be distinguished without the un-collapsed CST op.
 - [ ] **`UNUSED_*` precision** — the M1 use-tracking is name-based and counts a *write* as a use
       (sound: only ever under-warns). A precise read-vs-write split (excluding assignment-LHS, the
       `ReferenceKind::Write` logic) would catch assigned-but-never-read locals.
@@ -677,16 +709,14 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       flow runs pre-inference so it can only *invalidate* on assignment (the sound 1.0 floor), not
       re-narrow to the assigned value's type. Re-narrowing needs the value's inferred type fed back
       into the facts — a post-1.0 precision item.
-- [ ] **`match`-arm scrutinee narrowing + `UNREACHABLE_PATTERN`** — the lowered `MatchArm` carries
-      no pattern type/`is_wildcard` info, so a `T():` arm can't yet narrow the scrutinee and an
-      arm-after-wildcard isn't flagged. Needs `body.rs` lowering to capture each arm's pattern
-      `AstPtr` + wildcard flag (the `flow.rs` `Terminator::Match`/`MatchEdge` shape already models it).
-      **Deferred from the §1 pass (FP risk):** a sound `UNREACHABLE_PATTERN` must detect an
-      *unconditional catch-all* arm with certainty — the `_` wildcard parses as a `PatternLiteral`
-      (identifier `_`), and `var x` as a `PatternBind`, and only when either is the arm's *sole*
-      top-level pattern with no `when` guard. Misdetecting flags a reachable arm (a false positive on
-      valid code), so this needs careful per-pattern CST work + its own bug-hunt rather than a rushed
-      pre-freeze add.
+- [x] **`UNREACHABLE_PATTERN` — DONE (Phase 2).** `body.rs` `MatchArm` now carries a `range` +
+      `is_catch_all` (`arm_is_unconditional_catch_all`: sole top-level `_`/`var x`, no `when` guard);
+      `flow.rs` records every arm after a catch-all; `infer.rs` emits it. Conservative (a multi-pattern
+      `1, _:`, a nested `_`, and a guarded arm are NOT catch-alls — under-warn, 0 false positives on
+      545 files). **`match`-arm scrutinee narrowing — N/A (not deferred, removed from scope):** GDScript
+      `match` has **no type patterns** (patterns are literals/constants, `_`, `var x`, array, dict), so
+      `match x: Node2D:` matches `x == Node2D` (a value compare), not `x is Node2D` — there is no
+      scrutinee type to narrow, and doing so would be an *incorrect* (false) narrowing.
 - [ ] **`NotNull` / `Not(T)` consumption** — recorded by the flow pass but not used for typing in
       1.0 (no null-access diagnostic to drive `NotNull`; `Not(T)` has no positive type). Wire when a
       null-safety check lands.
@@ -710,4 +740,8 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       the established `format()` API + safety net.
 - [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
-- [ ] **CLI `--strict` / `--engine-defaults` override.** Today the strictness is chosen by `project.godot` presence (standalone = strict, project = engine defaults). An explicit CLI flag to force either mode regardless needs a host-level settings override (the gate's settings selection is in `type_diagnostics`, keyed on `project_config()`); thread a "force strict" toggle through the `Db` or inject a synthetic `WarningSettings`.
+- [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
+      (non-salsa) `WarningOverride` field on the `Db` (read only by the downstream `type_diagnostics`,
+      so the W1 firewall holds), `WarningSettings::with_strict_opt_in` flipping only the opt-in
+      promotion (an explicit project per-code level still wins), `AnalysisHost::set_warning_override`,
+      and mutually-exclusive `--strict` / `--engine-defaults` CLI flags.

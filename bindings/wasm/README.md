@@ -29,7 +29,7 @@ const az = new Analyzer();
 const uri = "inmemory://main.gd";
 az.openDocument(uri, "extends Node\nfunc _ready():\n\tvar x = 5 / 2\n", null);
 
-console.log(JSON.parse(az.diagnostics(uri)));  // → INTEGER_DIVISION warning
+console.log(az.diagnostics(uri));  // → INTEGER_DIVISION warning (a native JS array, no JSON.parse)
 ```
 
 Bundlers and native ESM both work. With Vite/webpack, `import init` resolves the
@@ -58,7 +58,9 @@ at `playground/data/extension_api.bin` you can copy, or generate it from the rep
 ## API
 
 Same URI-keyed session model as the native package. Construct once, push
-documents, query by **UTF-8 byte offset**; data queries return a **JSON string**.
+documents, query by **UTF-8 byte offset**; queries return **native JS values**
+(no `JSON.parse`). Navigation/edit results (`gotoDefinition`, `findReferences`,
+`rename`) carry a `uri` per target, so you need no `FileId`→URI mapping of your own.
 
 ```js
 az.openDocument(uri, text, resPath);   // resPath ("res://…") enables cross-file resolution
@@ -67,13 +69,13 @@ az.closeDocument(uri);
 az.setProjectConfig(projectGodotText); // enables [autoload] resolution
 az.loadEngineApi(bytes);               // optional engine model
 
-JSON.parse(az.diagnostics(uri));
-JSON.parse(az.documentSymbols(uri));
-JSON.parse(az.completions(uri, byteOffset));
-const hover = az.hover(uri, byteOffset);          // string | null
-JSON.parse(az.gotoDefinition(uri, byteOffset));
-JSON.parse(az.inlayHints(uri));
-JSON.parse(az.foldingRanges(uri));
+az.diagnostics(uri);                   // array
+az.documentSymbols(uri);               // array
+az.completions(uri, byteOffset);       // array
+const hover = az.hover(uri, byteOffset);          // object | null
+az.gotoDefinition(uri, byteOffset);    // array, each target has a `uri`
+az.inlayHints(uri);                    // array
+az.foldingRanges(uri);                 // array
 ```
 
 ### Positions (byte offsets)
