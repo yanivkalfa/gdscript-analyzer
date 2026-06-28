@@ -112,16 +112,20 @@ token or a changed string *value*.
 - **Enum-brace spacing — IMPLEMENTED.** An enum body is spaced inside (`enum E { A, B }`) while a dict
   stays tight (`{"k": v}`) and an empty enum is tight (`{}`). Byte-identical to gdformat.
 
+- **Layout ownership — IMPLEMENTED.** The reflow re-lays-out *every* statement, not just single-line
+  ones: a statement the author wrapped across lines is collapsed back onto one line when it now fits,
+  and re-wrapped to the canonical flat → compact → exploded form when it does not (the wrap target is
+  the outermost bracket group — for a `func` definition, its parameter list). Statements that cannot
+  be safely collapsed (a comment, a multi-line lambda body, a multi-line string) are kept verbatim.
+  Corpus-safe (0 non-parsing / 0 token changes / 0 idempotence breaks, safe_mode off). Raised the
+  byte-exact match to ~62% (godot) / ~39% (ReactiveUI).
+  *Caveat:* gdformat's wrapping algorithm has years of construct-specific tuning; our simpler model
+  makes a **different (but valid, ≤ width, meaning-preserving) layout choice** for some complex
+  multi-line statements — so `format(gdformat-output)` is now a ~90% (godot) / ~81% (ReactiveUI)
+  fixpoint rather than ~94%. The remaining tail is items 3–5 below plus assorted wrap-choice nuances.
+
 Still not implemented:
 
-2. **Re-flowing already-multi-line statements (layout ownership).** The reflow only touches statements
-   that occupy a *single* physical line. A statement the author already wrapped across lines is kept
-   **verbatim** (its interior indentation and wrapping preserved). gdformat *owns* the layout: it
-   collapses a wrapped construct that now fits onto one line, and re-indents/re-wraps one that does
-   not to its canonical form. This is the single biggest reason `format(original)` differs from
-   `gdformat(original)` on the corpus (the whitespace-only diffs): re-indented continuation lines and
-   un-collapsed short wraps. (`format(gdformat-output)` is a ~94% fixpoint, so the two formatters
-   *agree* on already-clean code — they differ on how aggressively they re-lay-out hand-wrapped code.)
 3. **Exploded method chains + leading-dot padding.** A method chain too long even for the compact
    paren-wrap is broken by gdformat at each `.`, leading-dot style (`. method`). We leave such a (rare)
    chain on one line, and we tighten an *already*-wrapped chain's `. method` to `.method` — the main

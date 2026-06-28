@@ -1167,7 +1167,33 @@ fn render_seq(
     unit: &str,
 ) -> (String, usize) {
     let mut out = String::new();
-    for d in docs {
+    // Flat width of each doc, so a group knows the width of the content that *follows* it on the line
+    // (its "tail") — a group must wrap when the group + its tail overflow, even if the group alone fits.
+    let widths: Vec<usize> = docs
+        .iter()
+        .map(|d| cols(&flat_seq(std::slice::from_ref(d))))
+        .collect();
+    let total: usize = widths.iter().sum();
+    // gdformat wraps the *outermost* (last) bracket group — except a `func`/`static func` definition,
+    // whose **parameter list** (the first group) is the one that wraps, not a `-> Array[T]` return
+    // type. An earlier group otherwise stays flat unless it is itself forced (a magic comma).
+    let first_text = match docs.first() {
+        Some(ReflowDoc::Text { text, .. }) => Some(text.as_str()),
+        _ => None,
+    };
+    let is_def = first_text == Some("func")
+        || (first_text == Some("static")
+            && matches!(docs.get(1), Some(ReflowDoc::Text { text, .. }) if text == "func"));
+    let wrap_target = if is_def {
+        docs.iter()
+            .position(|d| matches!(d, ReflowDoc::Group { .. }))
+    } else {
+        docs.iter()
+            .rposition(|d| matches!(d, ReflowDoc::Group { .. }))
+    };
+    let mut before = 0usize;
+    for (i, d) in docs.iter().enumerate() {
+        let tail = total - before - widths[i];
         match d {
             ReflowDoc::Text { text, space } => {
                 if *space {
@@ -1188,11 +1214,18 @@ fn render_seq(
                     out.push(' ');
                     col += 1;
                 }
-                let (g, end) = render_group(open, elems, close, *magic, indent, col, cfg, tw, unit);
+                let (g, end) = if Some(i) == wrap_target || group_forced(elems, *magic) {
+                    render_group(open, elems, close, *magic, indent, col, tail, cfg, tw, unit)
+                } else {
+                    let flat = format!("{open}{}{close}", flat_group_contents(elems, *magic));
+                    let end = col + cols(&flat);
+                    (flat, end)
+                };
                 out.push_str(&g);
                 col = end;
             }
         }
+        before += widths[i];
     }
     (out, col)
 }
@@ -1208,14 +1241,16 @@ fn render_group(
     magic: bool,
     indent: usize,
     col: usize,
+    tail: usize,
     cfg: &FmtConfig,
     tw: usize,
     unit: &str,
 ) -> (String, usize) {
     let forced = group_forced(elems, magic);
-    // flat: the whole group on the current line (only when not forced multi-line).
+    // flat: the whole group on the current line (only when it — plus the content that follows it on
+    // the line — fits, and it is not forced multi-line).
     let flat = format!("{open}{}{close}", flat_group_contents(elems, magic));
-    if !forced && (col + cols(&flat) <= cfg.line_width || elems.is_empty()) {
+    if !forced && (col + cols(&flat) + tail <= cfg.line_width || elems.is_empty()) {
         let end = col + cols(&flat);
         return (flat, end);
     }
@@ -1377,6 +1412,33 @@ fn expression_span(atoms: &[Atom]) -> Option<(usize, usize)> {
     }
 }
 
+/// Strip a redundant grouping paren that wraps the *entire* expression (e.g. the `(...)` this very
+/// pass injected on a previous run) so re-flowing is idempotent. `(a and b)` → `a and b`, but
+/// `(a + b) * c` is left alone (the paren is not the whole expression).
+fn strip_redundant_parens(mut expr: &[Atom]) -> &[Atom] {
+    while expr.len() >= 2 && expr[0].text == "(" {
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, a) in expr.iter().enumerate() {
+            if open_close(&a.text).is_some() {
+                depth += 1;
+            } else if matches!(a.text.as_str(), ")" | "]" | "}") {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+        }
+        if close == Some(expr.len() - 1) {
+            expr = &expr[1..expr.len() - 1];
+        } else {
+            break;
+        }
+    }
+    expr
+}
+
 /// The indices (within `expr`) of top-level **binary** operators, paired with their precedence. A
 /// `+`/`-` etc. is binary only when it follows an operand (not at a unary position); and a `/`/`%`
 /// inside a **node-path run** (`$Node/Path`, `%Unique/Child`) is a path separator, not an operator —
@@ -1424,9 +1486,34 @@ fn operator_chain_wrap(
     if pre_end >= suf_start {
         return None;
     }
-    let expr = &atoms[pre_end..suf_start];
+    let expr = strip_redundant_parens(&atoms[pre_end..suf_start]);
     let ops = top_level_binary_ops(expr);
     let min_prec = ops.iter().map(|&(_, p)| p).min()?;
+    let prefix = flat_atoms(&atoms[..pre_end]);
+    let suffix = flat_atoms(&atoms[suf_start..]);
+    let lead = |out: &mut String| {
+        out.push_str(&unit.repeat(indent));
+        out.push_str(&prefix);
+        if !prefix.is_empty() {
+            out.push(' ');
+        }
+        out.push_str("(\n");
+    };
+    // Compact first: the whole expression on one indented continuation line (gdformat tries this
+    // before breaking — e.g. `(...).normalized() * power` that fits stays on one line).
+    let expr_flat = flat_atoms(expr);
+    if (indent + 1) * tw + cols(&expr_flat) <= cfg.line_width {
+        let mut out = String::new();
+        lead(&mut out);
+        out.push_str(&unit.repeat(indent + 1));
+        out.push_str(&expr_flat);
+        out.push('\n');
+        out.push_str(&unit.repeat(indent));
+        out.push(')');
+        out.push_str(&suffix);
+        return Some(out);
+    }
+
     let split: Vec<usize> = ops
         .iter()
         .filter(|&&(_, p)| p == min_prec)
@@ -1444,15 +1531,8 @@ fn operator_chain_wrap(
     }
     segs.push((prev_op, &expr[start..]));
 
-    let prefix = flat_atoms(&atoms[..pre_end]);
-    let suffix = flat_atoms(&atoms[suf_start..]);
     let mut out = String::new();
-    out.push_str(&unit.repeat(indent));
-    out.push_str(&prefix);
-    if !prefix.is_empty() {
-        out.push(' ');
-    }
-    out.push_str("(\n");
+    lead(&mut out);
     for (op, operand) in &segs {
         out.push_str(&unit.repeat(indent + 1));
         let mut col = (indent + 1) * tw;
@@ -1486,7 +1566,7 @@ fn compact_paren_wrap(
     unit: &str,
 ) -> Option<String> {
     let (pre_end, suf_start) = expression_span(atoms)?;
-    let expr = atoms.get(pre_end..suf_start)?;
+    let expr = strip_redundant_parens(atoms.get(pre_end..suf_start)?);
     // Only wrap an expression that has a bracketed group (e.g. a method chain) and no top-level
     // binary operator: a bare expression / node-path is left on one line, as gdformat does.
     if expr.is_empty()
@@ -1517,10 +1597,156 @@ fn compact_paren_wrap(
     Some(out)
 }
 
-/// Reflow over-long single-line statements. Token-preserving; safe to run last.
+/// Collapse a (possibly multi-line) statement to its canonical single-line body — re-synthesising the
+/// inter-token spacing from scratch (so an already-wrapped statement is flattened). Returns `None`
+/// when the statement must be kept **verbatim**: it contains a comment, a multi-line lambda body, a
+/// backslash continuation, or a multi-line string (whose own newlines must be preserved).
+fn flatten_statement(stmt: &str) -> Option<String> {
+    use SyntaxKind as S;
+    let raw = gdscript_syntax::tokenize(stmt);
+    let (toks, _diags) = gdscript_syntax::run_prepass(&raw, stmt);
+    let mut out = String::with_capacity(stmt.len());
+    let mut stack: Vec<S> = Vec::new();
+    let mut brace_enum: Vec<bool> = Vec::new();
+    let mut pending_enum = false;
+    let mut prev_sig: Option<S> = None;
+    let mut prev_unary = false;
+    let mut node_path = false;
+    let mut pending_break = false; // a line break was seen; the next token re-spaces across it
+    for t in &toks {
+        match t.kind {
+            S::NewlinePhys => pending_break = true,
+            // A synthetic newline inside brackets is a multi-line lambda body — cannot collapse.
+            S::Newline if !stack.is_empty() => return None,
+            S::Indent | S::Dedent | S::Bom | S::Newline => {}
+            S::Whitespace => {
+                // Keep intra-line spacing verbatim (it is already canonical / the user's, when
+                // spacing-normalisation is off); drop a line's leading indentation.
+                if !pending_break && prev_sig.is_some() {
+                    out.push_str(&stmt[t.range]);
+                }
+            }
+            S::LineComment
+            | S::DocComment
+            | S::RegionComment
+            | S::EndRegionComment
+            | S::LineContinuation => return None,
+            k => {
+                let text = &stmt[t.range];
+                if matches!(k, S::String | S::StringName | S::NodePath) && text.contains('\n') {
+                    return None; // a multi-line string — keep the statement verbatim
+                }
+                // Replace a line break by the spacing the intra-line rules would synthesize.
+                if pending_break {
+                    let sp = match prev_sig {
+                        Some(_) if node_path && matches!(k, S::Ident | S::Slash | S::String) => {
+                            Spacing::Verbatim
+                        }
+                        Some(p) => {
+                            let top_enum = stack.last() == Some(&S::LBrace)
+                                && brace_enum.last() == Some(&true);
+                            space_before(p, k, stack.last().copied(), prev_unary, top_enum)
+                        }
+                        None => Spacing::None,
+                    };
+                    if matches!(sp, Spacing::Single) {
+                        out.push(' ');
+                    }
+                    pending_break = false;
+                }
+                out.push_str(text);
+                match k {
+                    S::LBrace => {
+                        stack.push(k);
+                        brace_enum.push(pending_enum);
+                        pending_enum = false;
+                    }
+                    S::LParen | S::LBrack => stack.push(k),
+                    S::RBrace => {
+                        stack.pop();
+                        brace_enum.pop();
+                    }
+                    S::RParen | S::RBrack => {
+                        stack.pop();
+                    }
+                    _ => {}
+                }
+                if k == S::EnumKw {
+                    pending_enum = true;
+                }
+                let unary_ctx = prev_sig.is_none_or(|p| !is_operand_end(p));
+                if k == S::Dollar || (k == S::Percent && unary_ctx) {
+                    node_path = true;
+                } else if node_path && !matches!(k, S::Ident | S::Slash | S::String) {
+                    node_path = false;
+                }
+                prev_unary = match k {
+                    S::Minus | S::Plus => unary_ctx,
+                    S::Tilde | S::Bang => true,
+                    _ => false,
+                };
+                prev_sig = Some(k);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Render a flattened statement `body` at `indent` into its canonical layout — flat if it fits, else
+/// wrapped (operator-chain → bracketed compact/exploded → compact-paren). Always indented.
+fn render_statement(body: &str, indent: usize, cfg: &FmtConfig, tw: usize, unit: &str) -> String {
+    let flat = || format!("{}{body}", unit.repeat(indent));
+    let Some(atoms) = line_atoms(body) else {
+        return flat();
+    };
+    let width = indent * tw + cols(body);
+    // A too-long top-level binary-operator chain is wrapped in injected parens (highest priority).
+    if width > cfg.line_width {
+        let oc = operator_chain_wrap(&atoms, indent, cfg, tw, unit);
+        if let Some(oc) = oc {
+            return oc;
+        }
+    }
+    if !atoms.iter().any(|a| open_close(&a.text).is_some()) {
+        return flat();
+    }
+    let (docs, _) = build_elems(&atoms, &mut 0, None);
+    if docs.len() != 1 {
+        return flat();
+    }
+    let top = &docs[0];
+    // Faithfulness: the atom tree must round-trip the body's *tokens* (spacing may differ — e.g. enum
+    // braces / type-annotation colons — which `flat_seq` does not reproduce).
+    if !same_significant_tokens(&flat_seq(top), body) {
+        return flat();
+    }
+    // Stay flat unless the line is too long or a magic trailing comma forces it exploded.
+    let forced = top
+        .iter()
+        .any(|d| matches!(d, ReflowDoc::Group { elems, magic, .. } if group_forced(elems, *magic)));
+    if width <= cfg.line_width && !forced {
+        return flat();
+    }
+    let (rendered, _) = render_seq(top, indent, indent * tw, cfg, tw, unit);
+    let result = format!("{}{rendered}", unit.repeat(indent));
+    // If bracket reflow still overflows (e.g. a long method chain), wrap the expression compact.
+    let overflows = result.lines().any(|l| display_cols(l, tw) > cfg.line_width);
+    if overflows {
+        let cp = compact_paren_wrap(&atoms, indent, cfg, tw, unit);
+        if let Some(cp) = cp {
+            return cp;
+        }
+    }
+    result
+}
+
+/// Re-flow the layout of every statement: a statement that now fits is collapsed onto one line, one
+/// that does not is re-wrapped to its canonical form — gdformat-style layout ownership. Statements
+/// that cannot be safely collapsed (comments, multi-line lambdas, multi-line strings) are preserved.
+/// Token-preserving (modulo the trailing commas / parens the meaning-equivalence net allows).
 #[allow(
     clippy::too_many_lines,
-    reason = "one cohesive pass: cross-line bracket/straddle bookkeeping then a per-line reflow decision"
+    reason = "one cohesive pass: per-line bracket/straddle bookkeeping then logical-statement grouping"
 )]
 fn reflow(formatted: &str, config: &FmtConfig) -> String {
     use SyntaxKind as S;
@@ -1545,8 +1771,9 @@ fn reflow(formatted: &str, config: &FmtConfig) -> String {
         .collect();
     let line_of = |off: usize| line_starts.partition_point(|&s| s <= off).saturating_sub(1);
 
-    // Cross-line bracket depth at each line's start + lines covered by a multi-line token (e.g. a
-    // `"""..."""` string) + lines ending in a `\` continuation — all disqualify a line from reflow.
+    // Per line: bracket depth at its start, whether a multi-line token (e.g. a `"""..."""` string)
+    // covers it, and whether it ends in a `\` continuation — used to group physical lines into the
+    // logical statement they belong to.
     let raw = gdscript_syntax::tokenize(formatted);
     let mut start_depth = vec![i32::MIN; lines.len()];
     let mut straddled = vec![false; lines.len()];
@@ -1567,112 +1794,64 @@ fn reflow(formatted: &str, config: &FmtConfig) -> String {
             S::LParen | S::LBrack | S::LBrace => depth += 1,
             S::RParen | S::RBrack | S::RBrace => depth -= 1,
             S::LineContinuation if sl < ends_cont.len() => ends_cont[sl] = true,
+            // The next line starts at the current depth — covers blank lines (which have no token of
+            // their own to set `start_depth`, so they would otherwise stay unset and be absorbed).
+            S::NewlinePhys if sl + 1 < start_depth.len() && start_depth[sl + 1] == i32::MIN => {
+                start_depth[sl + 1] = depth;
+            }
             _ => {}
         }
     }
+    let sd = |i: usize| {
+        let d = start_depth.get(i).copied().unwrap_or(0);
+        if d == i32::MIN { 0 } else { d }
+    };
+    let strad = |i: usize| straddled.get(i).copied().unwrap_or(false);
+    let cont = |i: usize| ends_cont.get(i).copied().unwrap_or(false);
 
     let mut out = String::with_capacity(formatted.len());
-    for (li, &line) in lines.iter().enumerate() {
-        let last = li + 1 == lines.len();
-        if let Some(wrapped) = try_reflow_line(
-            line,
-            li,
-            &start_depth,
-            &straddled,
-            &ends_cont,
-            config,
-            tw,
-            &unit,
-        ) {
-            out.push_str(&wrapped);
-        } else {
+    let mut li = 0;
+    while li < lines.len() {
+        let line = lines[li];
+        // A statement head: a non-blank line at bracket depth 0 that is not the continuation of the
+        // previous line (a `\` or a multi-line token spanning the boundary).
+        let head = !line.trim().is_empty()
+            && sd(li) == 0
+            && (li == 0 || !cont(li - 1))
+            && !(li > 0 && strad(li) && strad(li - 1));
+        if !head {
             out.push_str(line);
+            if li + 1 < lines.len() {
+                out.push('\n');
+            }
+            li += 1;
+            continue;
         }
-        if !last {
+        // Extend to the end of the logical statement (brackets open, a multi-line token spanning the
+        // boundary, or a backslash continuation).
+        let mut j = li;
+        while j + 1 < lines.len() && (sd(j + 1) != 0 || (strad(j) && strad(j + 1)) || cont(j)) {
+            j += 1;
+        }
+        let stmt = lines[li..=j].join("\n");
+        let indent = if config.use_tabs {
+            line.bytes().take_while(|&b| b == b'\t').count()
+        } else {
+            line.bytes()
+                .take_while(|&b| b == b' ')
+                .count()
+                .checked_div(config.indent_size)
+                .unwrap_or(0)
+        };
+        let rendered =
+            flatten_statement(&stmt).map(|body| render_statement(&body, indent, config, tw, &unit));
+        out.push_str(rendered.as_deref().unwrap_or(&stmt));
+        if j + 1 < lines.len() {
             out.push('\n');
         }
+        li = j + 1;
     }
     out
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a focused single-call-site helper"
-)]
-fn try_reflow_line(
-    line: &str,
-    li: usize,
-    start_depth: &[i32],
-    straddled: &[bool],
-    ends_cont: &[bool],
-    config: &FmtConfig,
-    tw: usize,
-    unit: &str,
-) -> Option<String> {
-    if line.trim().is_empty()
-        || start_depth.get(li).copied().unwrap_or(0) != 0
-        || straddled.get(li).copied().unwrap_or(false)
-        || ends_cont.get(li).copied().unwrap_or(false)
-        || (li > 0 && ends_cont.get(li - 1).copied().unwrap_or(false))
-    {
-        return None;
-    }
-    let indent_chars = line.len() - line.trim_start_matches(['\t', ' ']).len();
-    let body = &line[indent_chars..];
-    let indent = if config.use_tabs {
-        line.bytes().take_while(|&b| b == b'\t').count()
-    } else {
-        line.bytes()
-            .take_while(|&b| b == b' ')
-            .count()
-            .checked_div(config.indent_size)
-            .unwrap_or(0)
-    };
-    let atoms = line_atoms(body)?;
-    let width = indent * tw + cols(body);
-    // A too-long statement whose expression is a top-level binary-operator chain is wrapped in
-    // injected parens, breaking at the lowest-precedence operator (the meaning-equivalence net
-    // accepts the redundant parens). This takes priority over bracket reflow.
-    if width > config.line_width {
-        let wrapped = operator_chain_wrap(&atoms, indent, config, tw, unit);
-        if let Some(oc) = wrapped {
-            return (oc != line).then_some(oc);
-        }
-    }
-    // Bracket reflow: needs a bracketed group and a faithful flat reconstruction.
-    if !atoms.iter().any(|a| open_close(&a.text).is_some()) {
-        return None;
-    }
-    let (docs, _) = build_elems(&atoms, &mut 0, None);
-    if docs.len() != 1 {
-        return None; // a top-level comma — not a normal statement; leave it
-    }
-    let top = &docs[0];
-    // Faithfulness check: only reflow when our flat reconstruction is byte-identical to the input.
-    if flat_seq(top) != *body {
-        return None;
-    }
-    // Reflow when the line is too long OR a magic trailing comma forces it exploded.
-    let forced = top
-        .iter()
-        .any(|d| matches!(d, ReflowDoc::Group { elems, magic, .. } if group_forced(elems, *magic)));
-    if width <= config.line_width && !forced {
-        return None;
-    }
-    let (rendered, _) = render_seq(top, indent, indent * tw, config, tw, unit);
-    let result = format!("{}{rendered}", unit.repeat(indent));
-    // If bracket reflow still leaves a line over the limit (e.g. a long method chain whose calls
-    // have no arguments to wrap), fall back to wrapping the whole expression in compact parens.
-    let overflows = result
-        .lines()
-        .any(|l| display_cols(l, tw) > config.line_width);
-    if overflows {
-        let cp = compact_paren_wrap(&atoms, indent, config, tw, unit);
-        if let Some(cp) = cp {
-            return Some(cp);
-        }
-    }
-    (result != line).then_some(result)
 }
 
 /// Trim trailing spaces/tabs from the end of `out` (the current line).
@@ -1682,9 +1861,8 @@ fn trim_trailing_inline_ws(out: &mut String) {
     }
 }
 
-/// Whether two sources lex to the same sequence of significant (non-trivia) tokens — the strict
-/// token-preservation check, used by the token-*preserving* passes' tests.
-#[cfg(test)]
+/// Whether two sources lex to the same sequence of significant (non-trivia) tokens — a
+/// spacing-insensitive equality used by the reflow faithfulness check and the token-preserving tests.
 fn same_significant_tokens(a: &str, b: &str) -> bool {
     fn sig(s: &str) -> Vec<(SyntaxKind, &str)> {
         gdscript_syntax::tokenize(s)
@@ -2447,11 +2625,41 @@ mod tests {
     }
 
     #[test]
-    fn reflow_preserves_already_wrapped_statements() {
-        // A statement that is already wrapped (spans bracket-continuation lines) is left as-is — the
-        // reflow only touches single-physical-line statements, which is what makes it idempotent.
+    fn reflow_keeps_an_already_canonical_wrapped_statement() {
+        // A wrapped statement that is too long to collapse stays in its canonical exploded form.
         let src = "func f():\n\tvar n = outermost_call(\n\t\tinner_first(aaaa, bbbb, cccc, dddd),\n\t\tinner_second(eeee, ffff, gggg, hhhh),\n\t\tinner_third(iiii, jjjj, kkkk)\n\t)\n";
         assert_eq!(fmt(src), src);
+    }
+
+    // ---- Phase-4: layout ownership (re-flow already-multi-line statements) ----
+
+    #[test]
+    fn reflow_collapses_a_short_hand_wrapped_statement() {
+        // A statement the author wrapped that now fits is collapsed back onto one line.
+        let src = "func f():\n\tvar x = call(\n\t\ta,\n\t\tb,\n\t\tc\n\t)\n";
+        assert_eq!(fmt(src), "func f():\n\tvar x = call(a, b, c)\n");
+    }
+
+    #[test]
+    fn reflow_rewraps_a_still_too_long_wrapped_statement_idempotently() {
+        // A wrapped statement still over the limit is re-laid-out to canonical form, idempotently.
+        let src = "func f():\n\tvar x = some_long_function_name(argument_number_one, argument_number_two,\n\t\targument_number_three, argument_number_four, argument_number_five)\n";
+        let out = fmt(src);
+        assert!(
+            out.contains("some_long_function_name(\n"),
+            "should wrap: {out:?}"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn reflow_keeps_a_statement_with_an_inner_comment_verbatim() {
+        // A comment inside the brackets blocks a safe collapse — the statement is preserved.
+        let src = "func f():\n\tvar x = call(\n\t\ta,  # first\n\t\tb,\n\t)\n";
+        let out = fmt(src);
+        assert!(out.contains("# first"), "{out:?}");
+        assert!(super::same_significant_tokens(src, &out));
+        assert_eq!(fmt(&out), out, "idempotent");
     }
 
     // ---- Phase-4: string-quote normalization (gdformat / Black rule) ----
