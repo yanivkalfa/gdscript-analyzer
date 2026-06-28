@@ -545,6 +545,13 @@ fn types_definitely_clash(api: &EngineApi, a: &Ty, b: &Ty) -> bool {
     if a.is_uninformative() || b.is_uninformative() {
         return false;
     }
+    // Enums are int-backed and their qualified name resolves differently on the annotation side
+    // (`resolve_type_name` → `Class.Enum`) than on the engine-model side (`resolve_tyref`), so an
+    // enum "clash" is unreliable — never clash on an enum. (Fixes a false NATIVE_METHOD_OVERRIDE on
+    // a valid dotted-enum-typed override param, e.g. `p_mode: MultiplayerPeer.TransferMode`.)
+    if matches!(a, Ty::Enum(_)) || matches!(b, Ty::Enum(_)) {
+        return false;
+    }
     matches!(ty::is_assignable(api, a, b), Assign::No)
         && matches!(ty::is_assignable(api, b, a), Assign::No)
 }
@@ -1955,16 +1962,28 @@ impl Cx<'_> {
         if !sig.is_static {
             return;
         }
-        let receiver_is_local_instance =
-            matches!(self.body.expr(receiver), Expr::Name(n) if self.locals.contains_key(n));
-        if receiver_is_local_instance {
-            self.warn(
-                range,
-                WarningCode::StaticCalledOnInstance,
-                "A static method is being called on an instance; call it on the type instead."
-                    .to_owned(),
-            );
+        let Expr::Name(rname) = self.body.expr(receiver) else {
+            return;
+        };
+        if !self.locals.contains_key(rname) {
+            return;
         }
+        // A local that ALIASES a type/var (`var t := JSON; t.stringify()`) is not an instance —
+        // calling a static method through it is valid (`t` holds the type, not an object). A bare
+        // `Name` initializer marks such an alias; only a constructor/call init (or a param/field
+        // with no init) is a true instance. Skipping the alias case fixes a false positive.
+        if let Some(b) = self.bindings.iter().rev().find(|b| &b.name == rname)
+            && let Some(init) = b.init
+            && matches!(self.body.expr(init), Expr::Name(_))
+        {
+            return;
+        }
+        self.warn(
+            range,
+            WarningCode::StaticCalledOnInstance,
+            "A static method is being called on an instance; call it on the type instead."
+                .to_owned(),
+        );
     }
 
     fn member_ref_ty(&self, m: &MemberRef, as_method: bool) -> Ty {
@@ -2526,8 +2545,7 @@ mod tests {
         let codes = file_codes("var err: Error\nfunc f():\n\tpass\n");
         assert!(
             codes.iter().any(|c| c == "ENUM_VARIABLE_WITHOUT_DEFAULT"),
-            "{:?}",
-            codes
+            "{codes:?}"
         );
     }
 
@@ -2537,8 +2555,7 @@ mod tests {
         let codes = file_codes("extends Node\nfunc _input(event: int):\n\tpass\n");
         assert!(
             codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
-            "{:?}",
-            codes
+            "{codes:?}"
         );
     }
 
@@ -2547,8 +2564,7 @@ mod tests {
         let codes = file_codes("extends Node\nfunc _input(event: InputEvent):\n\tpass\n");
         assert!(
             !codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
-            "{:?}",
-            codes
+            "{codes:?}"
         );
     }
 
@@ -2557,8 +2573,7 @@ mod tests {
         let codes = file_codes("extends Node\nfunc _input(event):\n\tpass\n");
         assert!(
             !codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
-            "{:?}",
-            codes
+            "{codes:?}"
         );
     }
 
@@ -2567,27 +2582,39 @@ mod tests {
         let codes = file_codes("extends Node\nfunc my_helper(x: int):\n\treturn x\n");
         assert!(
             !codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
-            "{:?}",
-            codes
+            "{codes:?}"
+        );
+    }
+
+    #[test]
+    fn dotted_enum_override_param_does_not_false_warn() {
+        // A valid override whose param is a dotted engine enum must NOT clash (enums are int-backed
+        // and resolve to different qualified names on the annotation vs model side). Bug-hunt repro.
+        let codes = file_codes(
+            "extends MultiplayerPeerExtension\nfunc _set_transfer_mode(p_mode: MultiplayerPeer.TransferMode):\n\tpass\n",
+        );
+        assert!(
+            !codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
+            "{codes:?}"
         );
     }
 
     #[test]
     fn unused_signal_warns() {
         let codes = file_codes("signal my_event\nfunc f():\n\tpass\n");
-        assert!(codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{:?}", codes);
+        assert!(codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{codes:?}");
     }
 
     #[test]
     fn emitted_signal_is_not_unused() {
         let codes = file_codes("signal my_event\nfunc f():\n\tmy_event.emit()\n");
-        assert!(!codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{:?}", codes);
+        assert!(!codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{codes:?}");
     }
 
     #[test]
     fn signal_connected_by_string_is_not_unused() {
         let codes = file_codes("signal my_event\nfunc f():\n\tconnect(\"my_event\", Callable())\n");
-        assert!(!codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{:?}", codes);
+        assert!(!codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{codes:?}");
     }
 
     #[test]
@@ -2618,6 +2645,17 @@ mod tests {
     fn static_method_on_the_type_does_not_warn() {
         // `JSON.stringify(...)` (on the type) is the correct form — never flagged.
         let h = infer_first_func("func f():\n\tJSON.stringify({})\n");
+        assert!(
+            !codes(&h).contains(&"STATIC_CALLED_ON_INSTANCE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn static_method_through_a_type_aliased_local_does_not_warn() {
+        // `var t := JSON` aliases the TYPE; `t.stringify()` is valid, not static-on-instance.
+        let h = infer_first_func("func f():\n\tvar t := JSON\n\tt.stringify({})\n");
         assert!(
             !codes(&h).contains(&"STATIC_CALLED_ON_INSTANCE"),
             "{:?}",

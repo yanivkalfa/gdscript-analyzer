@@ -487,6 +487,17 @@ impl WarningSettings {
         }
     }
 
+    /// Force the `strict_opt_in` flag on an already-resolved settings value, leaving every other
+    /// field (the project's explicit `per_code`, `treat_as_errors`, `exclude_addons`, `engine`)
+    /// intact — so a CLI `--strict`/`--engine-defaults` override only flips the opt-in-group
+    /// promotion and still honors the project's explicit per-code levels (`gate()` gives `per_code`
+    /// priority over the promotion). The pure transform behind the host `WarningOverride`.
+    #[must_use]
+    pub fn with_strict_opt_in(mut self, on: bool) -> Self {
+        self.strict_opt_in = on;
+        self
+    }
+
     /// The engine-matching default for a project of declared version `engine`: Godot's own
     /// `default_warning_levels[]` (the opt-in group stays IGNORE), addons excluded.
     #[must_use]

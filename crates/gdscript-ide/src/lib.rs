@@ -25,6 +25,10 @@ use gdscript_base::{
 use gdscript_db::{Db, RootDatabase};
 use salsa::Durability;
 
+/// Re-exported so clients can set the warning-strictness override without depending on
+/// `gdscript-db` directly. See [`AnalysisHost::set_warning_override`].
+pub use gdscript_db::WarningOverride;
+
 mod features;
 mod navigation;
 mod semantic;
@@ -147,6 +151,13 @@ impl AnalysisHost {
             }
             Err(_) => false,
         }
+    }
+
+    /// Force a warning-strictness baseline regardless of `project.godot` presence (the CLI
+    /// `--strict` / `--engine-defaults` knob; an LSP could set it per session). A plain `Db` field,
+    /// not a salsa input — changing it never re-runs inference, only the downstream gate.
+    pub fn set_warning_override(&mut self, ov: gdscript_db::WarningOverride) {
+        self.db.set_warning_override(ov);
     }
 
     /// A cheap, cloneable, `Send` snapshot for read queries (a cloned salsa database handle).
