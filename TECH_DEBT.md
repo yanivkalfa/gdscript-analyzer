@@ -671,15 +671,13 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       signal connected purely from a scene/other file is invisible (the Godot-parity limitation).
       **`UNUSED_PRIVATE_CLASS_VARIABLE`** still deferred (the same `NameUses` scan now exists to build
       it on).
-- [ ] **`UNASSIGNED_VARIABLE` / `_OP_ASSIGN`** — read-before-assign of a typed local; needs the W2
-      CFG's definite-assignment pass (a natural W2 extension — reachability is there, definite-assign
-      is not yet). **Deferred from the §1 pass (FP risk):** a sound, no-false-positive version must
-      resolve two subtleties first — (a) a *typed* local is auto-default-initialised in GDScript
-      (`var x: int` reads `0`), so reading-before-assign is not a runtime error, only a lint; and
-      (b) the may-vs-must question (warn on *possibly*-unassigned like Godot, or only *definitely*-
-      unassigned to stay conservative?). Resolving these needs a short Godot-semantics validation +
-      its own bug-hunt; rushing it pre-freeze risks false positives. Build it as a definite-assignment
-      lattice in `flow.rs` (per-statement `assigned: Set<Place>`, intersect at joins).
+- [x] **`UNASSIGNED_VARIABLE` — DONE (Phase 2, `feat/w1-warnings`).** A read of a typed-no-init local
+      not definitely assigned on every path, via a new `flow::analyze_assigned` definite-assignment
+      lattice (grow-only, intersect-at-merge, params seeded, lambda bodies unchecked) consulted at each
+      read in `resolve_name` (excluding the assignment LHS). Matches Godot's may-unassigned; verified 0
+      false positives on 545 real `.gd` (the 20 demo hits are genuine read-before-assign). The cosmetic
+      **`_OP_ASSIGN`** variant stays deferred — compound-assign collapses to `BinOp::Assign` in lowering,
+      so it can't be distinguished without the un-collapsed CST op.
 - [ ] **`UNUSED_*` precision** — the M1 use-tracking is name-based and counts a *write* as a use
       (sound: only ever under-warns). A precise read-vs-write split (excluding assignment-LHS, the
       `ReferenceKind::Write` logic) would catch assigned-but-never-read locals.
@@ -690,16 +688,14 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       flow runs pre-inference so it can only *invalidate* on assignment (the sound 1.0 floor), not
       re-narrow to the assigned value's type. Re-narrowing needs the value's inferred type fed back
       into the facts — a post-1.0 precision item.
-- [ ] **`match`-arm scrutinee narrowing + `UNREACHABLE_PATTERN`** — the lowered `MatchArm` carries
-      no pattern type/`is_wildcard` info, so a `T():` arm can't yet narrow the scrutinee and an
-      arm-after-wildcard isn't flagged. Needs `body.rs` lowering to capture each arm's pattern
-      `AstPtr` + wildcard flag (the `flow.rs` `Terminator::Match`/`MatchEdge` shape already models it).
-      **Deferred from the §1 pass (FP risk):** a sound `UNREACHABLE_PATTERN` must detect an
-      *unconditional catch-all* arm with certainty — the `_` wildcard parses as a `PatternLiteral`
-      (identifier `_`), and `var x` as a `PatternBind`, and only when either is the arm's *sole*
-      top-level pattern with no `when` guard. Misdetecting flags a reachable arm (a false positive on
-      valid code), so this needs careful per-pattern CST work + its own bug-hunt rather than a rushed
-      pre-freeze add.
+- [x] **`UNREACHABLE_PATTERN` — DONE (Phase 2).** `body.rs` `MatchArm` now carries a `range` +
+      `is_catch_all` (`arm_is_unconditional_catch_all`: sole top-level `_`/`var x`, no `when` guard);
+      `flow.rs` records every arm after a catch-all; `infer.rs` emits it. Conservative (a multi-pattern
+      `1, _:`, a nested `_`, and a guarded arm are NOT catch-alls — under-warn, 0 false positives on
+      545 files). **`match`-arm scrutinee narrowing — N/A (not deferred, removed from scope):** GDScript
+      `match` has **no type patterns** (patterns are literals/constants, `_`, `var x`, array, dict), so
+      `match x: Node2D:` matches `x == Node2D` (a value compare), not `x is Node2D` — there is no
+      scrutinee type to narrow, and doing so would be an *incorrect* (false) narrowing.
 - [ ] **`NotNull` / `Not(T)` consumption** — recorded by the flow pass but not used for typing in
       1.0 (no null-access diagnostic to drive `NotNull`; `Not(T)` has no positive type). Wire when a
       null-safety check lands.
