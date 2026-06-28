@@ -1413,44 +1413,78 @@ fn canonical_string(text: &str) -> String {
     out
 }
 
-/// Whether `a` and `b` are **meaning-equivalent** — the relaxed safety net used once the formatter
-/// performs token-*mutating* rewrites. Equivalent to [`same_significant_tokens`] except it normalises
-/// away exactly the differences gdformat is allowed to introduce: a **trailing comma** (a `,`
-/// immediately before a closing bracket) is dropped, and **string literals are compared by their
-/// canonical quote form** (so `'x'` ≡ `"x"`). A dropped/added real token or a changed string *value*
-/// is still caught.
-fn meaning_preserved(a: &str, b: &str) -> bool {
-    fn norm(s: &str) -> Vec<(SyntaxKind, String)> {
-        let toks: Vec<_> = gdscript_syntax::tokenize(s)
-            .into_iter()
-            .filter(|t| !t.kind.is_trivia())
-            .collect();
-        let mut out = Vec::with_capacity(toks.len());
-        for (i, t) in toks.iter().enumerate() {
-            if t.kind == SyntaxKind::Comma
-                && toks.get(i + 1).is_some_and(|n| {
-                    matches!(
-                        n.kind,
-                        SyntaxKind::RParen | SyntaxKind::RBrack | SyntaxKind::RBrace
-                    )
-                })
-            {
-                continue; // a trailing comma — gdformat may add or drop it
+/// A normalised parse-tree event used by [`meaning_preserved`].
+#[derive(Clone, PartialEq, Eq)]
+enum TreeEvent {
+    Open(SyntaxKind),
+    Close,
+    Token(SyntaxKind, String),
+}
+
+/// Walk a parse-tree node, appending normalised events: trivia is dropped, a `ParenExpr` is
+/// **unwrapped** (its node + `(`/`)` tokens removed, its inner expression spliced in — so a
+/// *redundant* grouping paren is invisible while a precedence-changing one still differs, because the
+/// surrounding `BinExpr` nesting changes), and string literals are recorded by canonical quote form.
+fn emit_tree_events(node: &gdscript_syntax::GdNode, out: &mut Vec<TreeEvent>) {
+    use cstree::util::NodeOrToken;
+    if node.kind() == SyntaxKind::ParenExpr {
+        for child in node.children() {
+            emit_tree_events(child, out);
+        }
+        return;
+    }
+    out.push(TreeEvent::Open(node.kind()));
+    for child in node.children_with_tokens() {
+        match child {
+            NodeOrToken::Node(n) => emit_tree_events(n, out),
+            NodeOrToken::Token(t) => {
+                let kind = t.kind();
+                if kind.is_trivia() {
+                    continue;
+                }
+                let text = if matches!(
+                    kind,
+                    SyntaxKind::String | SyntaxKind::StringName | SyntaxKind::NodePath
+                ) {
+                    canonical_string(t.text())
+                } else {
+                    t.text().to_owned()
+                };
+                out.push(TreeEvent::Token(kind, text));
             }
-            let text = &s[t.range];
-            let norm = if matches!(
-                t.kind,
-                SyntaxKind::String | SyntaxKind::StringName | SyntaxKind::NodePath
-            ) {
-                canonical_string(text)
-            } else {
-                text.to_owned()
-            };
-            out.push((t.kind, norm));
+        }
+    }
+    out.push(TreeEvent::Close);
+}
+
+/// Whether `a` and `b` are **meaning-equivalent** — the relaxed safety net used once the formatter
+/// performs token-*mutating* rewrites. It compares the **parse-tree structure** (so token order,
+/// nesting and operator precedence must all match), normalising away exactly the differences gdformat
+/// is allowed to introduce: **redundant grouping parens** are unwrapped, a **trailing comma** before a
+/// closing bracket is dropped, and **string literals are compared by canonical quote form**. A
+/// dropped/added/reordered token, a changed string *value*, or a precedence change is still caught.
+fn meaning_preserved(a: &str, b: &str) -> bool {
+    fn events(s: &str) -> Vec<TreeEvent> {
+        let mut raw = Vec::new();
+        emit_tree_events(&gdscript_syntax::parse(s).syntax_node(), &mut raw);
+        let mut out = Vec::with_capacity(raw.len());
+        for i in 0..raw.len() {
+            // Drop a trailing comma (a `,` immediately before a closing-bracket token).
+            let trailing_comma = matches!(&raw[i], TreeEvent::Token(SyntaxKind::Comma, _))
+                && matches!(
+                    raw.get(i + 1),
+                    Some(TreeEvent::Token(
+                        SyntaxKind::RParen | SyntaxKind::RBrack | SyntaxKind::RBrace,
+                        _
+                    ))
+                );
+            if !trailing_comma {
+                out.push(raw[i].clone());
+            }
         }
         out
     }
-    norm(a) == norm(b)
+    events(a) == events(b)
 }
 
 #[cfg(test)]
@@ -2127,12 +2161,23 @@ mod tests {
     }
 
     #[test]
-    fn meaning_preserved_accepts_quote_and_trailing_comma_changes() {
-        assert!(super::meaning_preserved("var a = 'x'", "var a = \"x\""));
-        assert!(super::meaning_preserved("f(a, b,)", "f(a, b)"));
-        assert!(super::meaning_preserved("[1, 2,]", "[1, 2]"));
-        // but a real change is still caught
-        assert!(!super::meaning_preserved("var a = 'x'", "var a = \"y\""));
-        assert!(!super::meaning_preserved("f(a, b)", "f(a)"));
+    fn meaning_preserved_accepts_quote_trailing_comma_and_redundant_parens() {
+        use super::meaning_preserved as mp;
+        // string quotes, trailing commas, and *redundant* grouping parens are all accepted
+        assert!(mp("var a = 'x'\n", "var a = \"x\"\n"));
+        assert!(mp("func f():\n\tg(a, b,)\n", "func f():\n\tg(a, b)\n"));
+        assert!(mp(
+            "func f():\n\tvar x = [1, 2,]\n",
+            "func f():\n\tvar x = [1, 2]\n"
+        ));
+        assert!(mp("var x = (a + b)\n", "var x = a + b\n"));
+        assert!(mp(
+            "func f():\n\tif (a and b):\n\t\tpass\n",
+            "func f():\n\tif a and b:\n\t\tpass\n"
+        ));
+        // but real changes — value, dropped token, and PRECEDENCE — are still caught
+        assert!(!mp("var a = 'x'\n", "var a = \"y\"\n"));
+        assert!(!mp("func f():\n\tg(a, b)\n", "func f():\n\tg(a)\n"));
+        assert!(!mp("var x = (a + b) * c\n", "var x = a + b * c\n"));
     }
 }
