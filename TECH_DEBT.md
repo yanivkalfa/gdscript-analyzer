@@ -221,18 +221,17 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
 ## Phase 2 — deferred / known limitations
 
 ### Deliberately phased (NOT shortcuts — scoped per the roadmap)
-- [ ] **guitkx adapter migration to the typed binding (release-gated).** The analyzer side is
-      done (Phase 3 typed FFI, above): `@gdscript-analyzer/core` will return native JS values and
-      enrich navigation with `uri`. The guitkx adapter
-      (`…/ReactiveUI-Gadot/ide-extensions/lsp-server/src/analyzerAdapter.ts`) still consumes the
-      **published 0.2.x** string-returning API, so it cannot adopt the new contract until this
-      branch merges → releases → publishes a new (breaking) version. **CONCRETE BLOCKER:** can't
-      `npm link` a locally-built `.node` either (no MSVC C++ build tools on the dev box — see the
-      FFI item). Once published, the migration is ~20 lines: (1) bump the dep; (2) drop the four
-      `JSON.parse(...)` calls (`completions`/`hover`/`diagnostics`/`gotoDefinition`) — use the
-      objects directly; (3) replace the `fileIds`/`nextId` id↔uri mirror in `track()`/
-      `definitionsAt()` with the result's `d.uri` field (keep the per-doc text tracking). Then the
-      embedded-on e2e check (completion/hover/goto with no Godot editor) can run.
+- [~] **guitkx adapter migration to the typed binding — MIGRATED + VALIDATED locally; ship gated on
+      publish.** The adapter (`…/ReactiveUI-Gadot/ide-extensions/lsp-server/src/analyzerAdapter.ts`)
+      was migrated to the typed contract: dropped the four `JSON.parse(...)` calls
+      (`completions`/`hover`/`diagnostics`/`gotoDefinition`), now reads the result's `d.uri` field,
+      and **deleted** the `fileIds`/`nextId`/`track()` id↔uri mirror (`docs` collapsed to `uri→text`).
+      Validated by `npm link`-ing the locally-built `.node` into the LSP server: `tsc` clean + all
+      **32 tests green**, incl. the cross-file-goto test (now driven by the binding's `uri`, not a
+      mirror). **Only the SHIP is gated:** committing it needs `@gdscript-analyzer/core` published at
+      the new version + a `package.json` dep bump, else a clean `npm install` of guitkx pulls the old
+      0.2.x and the typed-contract adapter crashes. So: hold the guitkx commit until this branch
+      merges → releases → publishes, then bump the dep and land the (already-validated) adapter diff.
 - [ ] **Cross-file resolution → Phase 3.** `class_name` globals, autoloads, `preload`,
       script `extends`, and `as`/`is` against user types all funnel through
       `resolve_external() -> Ty::Unknown` (the seam). Correct + non-cascading today; Phase 3
@@ -289,9 +288,11 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       serializes as a JS `Map`, breaking `result.field`). No client-side `JSON.parse`. The single
       source of truth stays the `gdscript-base` POD (no `#[napi(object)]`/POD re-declaration in the
       binding crates — the `Value` route keeps them trivial delegators). Verified locally: 15
-      `gdscript-session` unit tests + the wasm32 build/clippy + the full `xtask ci` gate. The napi
-      `.node` itself is still CI-built only (no MSVC C++ build tools / no `libnode` locally — see
-      below); `bindings/node/hello.mjs` exercises the new contract in the CI node-smoke job.
+      `gdscript-session` unit tests + the wasm32 build/clippy + the full `xtask ci` gate, **plus an
+      end-to-end napi run**: the `.node` builds with the MSVC toolset and `bindings/node/hello.mjs`
+      confirms native-object returns + a cross-file goto target carrying its `uri`. (A generic
+      contributor still needs the VS C++ workload to build the `.node` locally — otherwise it is
+      CI-built; `hello.mjs` runs in the CI node-smoke job.)
   - [x] **Mirror-free navigation.** The session injects a `"uri"` next to every `"file"` id in a
         serialized result (a generic walk over `NavTarget`/`Reference`/`FileEdit`/`WouldCollide`),
         so a client (guitkx) resolves cross-file targets without maintaining its own `FileId`→URI
