@@ -109,6 +109,66 @@ pub fn format(source: &str, config: &FmtConfig) -> String {
     format_lf(source, config)
 }
 
+/// A single whole-line replacement edit produced by [`format_range`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeEdit {
+    /// The byte range in the original `source` to replace (snapped to whole lines).
+    pub range: core::ops::Range<usize>,
+    /// The replacement text.
+    pub new_text: String,
+}
+
+/// Format only the part of `source` overlapping the byte range `sel` (for editor "format selection"
+/// / LSP `textDocument/rangeFormatting`). The whole document is formatted for correct structure and
+/// indentation; the result is the **minimal changed line-hunk** that intersects `sel`, or `None` if
+/// nothing in the selection's lines changes. Applying the edit yields the same bytes the whole-file
+/// [`format`] would have produced for that region.
+#[must_use]
+pub fn format_range(
+    source: &str,
+    config: &FmtConfig,
+    sel: core::ops::Range<usize>,
+) -> Option<RangeEdit> {
+    let formatted = format(source, config);
+    if formatted == source {
+        return None;
+    }
+    let src: Vec<&str> = source.split_inclusive('\n').collect();
+    let out: Vec<&str> = formatted.split_inclusive('\n').collect();
+    // Trim the common prefix and suffix lines: the change is the span between them.
+    let mut p = 0;
+    while p < src.len() && p < out.len() && src[p] == out[p] {
+        p += 1;
+    }
+    let mut s = 0;
+    while s < src.len() - p && s < out.len() - p && src[src.len() - 1 - s] == out[out.len() - 1 - s]
+    {
+        s += 1;
+    }
+    let (changed_start, changed_end) = (p, src.len() - s); // source line span [start, end)
+
+    // Byte offset of each source line start (so `starts[i]` is line `i`'s first byte).
+    let mut starts = Vec::with_capacity(src.len() + 1);
+    let mut acc = 0;
+    for l in &src {
+        starts.push(acc);
+        acc += l.len();
+    }
+    starts.push(acc);
+    let line_of = |off: usize| starts.partition_point(|&b| b <= off).saturating_sub(1);
+
+    let last_byte = source.len().saturating_sub(1);
+    let sel_first = line_of(sel.start.min(last_byte));
+    let sel_last = line_of(sel.end.saturating_sub(1).max(sel.start).min(last_byte));
+    if changed_end <= sel_first || changed_start > sel_last {
+        return None; // the selection's lines are unchanged
+    }
+    Some(RangeEdit {
+        range: starts[changed_start]..starts[changed_end],
+        new_text: out[p..out.len() - s].concat(),
+    })
+}
+
 /// `format` working purely in LF (the caller handles CRLF round-tripping).
 fn format_lf(source: &str, config: &FmtConfig) -> String {
     let input_parses = gdscript_syntax::parse(source).errors().is_empty();
@@ -2437,6 +2497,23 @@ mod tests {
     fn magic_trailing_comma_is_idempotent() {
         let once = fmt("var a = call(x, y,)\n");
         assert_eq!(fmt(&once), once);
+    }
+
+    // ---- Phase-4: format_range ----
+
+    #[test]
+    fn format_range_edits_only_the_changed_lines_overlapping_the_selection() {
+        let src = "func f():\n\tvar x = 1\n\tvar y=2\n";
+        // line 2 (bytes 21..30) needs spacing; selecting it returns just that line's edit
+        let e = super::format_range(src, &FmtConfig::default(), 21..30).unwrap();
+        assert_eq!(e.range, 21..30);
+        assert_eq!(e.new_text, "\tvar y = 2\n");
+        // selecting the already-formatted line 1 → no edit
+        assert!(super::format_range(src, &FmtConfig::default(), 10..21).is_none());
+        // a fully-formatted document → no edit
+        assert!(
+            super::format_range("func f():\n\tvar y = 2\n", &FmtConfig::default(), 0..20).is_none()
+        );
     }
 
     // ---- Phase-4: enum-brace spacing ----

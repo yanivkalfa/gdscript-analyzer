@@ -40,14 +40,14 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId, Response
 use lsp_types::{
     CodeActionParams, CodeActionProviderCapability, CompletionOptions, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, FileChangeType, FileSystemWatcher,
-    FoldingRangeProviderCapability, GlobPattern, HoverProviderCapability, InitializeParams,
-    InitializeResult, OneOf, PositionEncodingKind, PublishDiagnosticsParams, Registration,
-    RegistrationParams, RenameOptions, RenameParams, SemanticTokensFullOptions,
-    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SignatureHelpOptions, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
-    WorkspaceSymbolParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentRangeFormattingParams,
+    FileChangeType, FileSystemWatcher, FoldingRangeProviderCapability, GlobPattern,
+    HoverProviderCapability, InitializeParams, InitializeResult, OneOf, PositionEncodingKind,
+    PublishDiagnosticsParams, Registration, RegistrationParams, RenameOptions, RenameParams,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SignatureHelpOptions, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Uri, WorkspaceSymbolParams,
 };
 
 use crate::convert::diagnostic_to_lsp;
@@ -132,6 +132,7 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         // Phase-6 W3: whole-document formatting.
         document_formatting_provider: Some(OneOf::Left(true)),
+        document_range_formatting_provider: Some(OneOf::Left(true)),
         ..Default::default()
     }
 }
@@ -334,6 +335,7 @@ impl GlobalState {
             "textDocument/foldingRange" => self.spawn_file(req, handlers::folding_ranges),
             "textDocument/inlayHint" => self.spawn_file(req, handlers::inlay_hints),
             "textDocument/formatting" => self.spawn_file(req, handlers::formatting),
+            "textDocument/rangeFormatting" => self.spawn_range(req, handlers::range_formatting),
             "textDocument/semanticTokens/full" => {
                 self.spawn_file(req, handlers::semantic_tokens);
             }
@@ -388,6 +390,29 @@ impl GlobalState {
             .line_index
             .offset(&ctx.text, params.position, ctx.encoding);
         self.spawn(id, move |a| handler(a, &ctx, offset));
+    }
+
+    /// Dispatch a range request (`rangeFormatting`): convert both ends to byte offsets.
+    fn spawn_range<F, R>(&self, req: Request, handler: F)
+    where
+        F: FnOnce(&Analysis, &DocCtx, u32, u32) -> Cancellable<R> + Send + 'static,
+        R: serde::Serialize,
+    {
+        let id = req.id.clone();
+        let params: DocumentRangeFormattingParams = match serde_json::from_value(req.params) {
+            Ok(p) => p,
+            Err(e) => return self.send(Response::new_err(id, INVALID_PARAMS, e.to_string())),
+        };
+        let Some(ctx) = self.doc_ctx(&params.text_document.uri) else {
+            return self.respond_null(id);
+        };
+        let start = ctx
+            .line_index
+            .offset(&ctx.text, params.range.start, ctx.encoding);
+        let end = ctx
+            .line_index
+            .offset(&ctx.text, params.range.end, ctx.encoding);
+        self.spawn(id, move |a| handler(a, &ctx, start, end));
     }
 
     /// Dispatch a whole-file read (`documentSymbol`/`foldingRange`).

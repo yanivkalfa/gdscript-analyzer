@@ -223,6 +223,37 @@ impl Analysis {
         })
     }
 
+    /// Format only the lines overlapping the byte range `[start, end)` (editor "format selection").
+    /// Returns the byte range to replace and its replacement, or `None` if the selection's lines do
+    /// not change (or the file is unknown).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn format_range(
+        &self,
+        file: FileId,
+        start: u32,
+        end: u32,
+    ) -> Cancellable<Option<(u32, u32, String)>> {
+        catch(|| {
+            self.db.file_text(file).and_then(|ft| {
+                let sel = (start as usize)..(end as usize);
+                gdscript_fmt::format_range(
+                    ft.text(&self.db),
+                    &gdscript_fmt::FmtConfig::default(),
+                    sel,
+                )
+                .map(|e| {
+                    (
+                        u32::try_from(e.range.start).unwrap_or(u32::MAX),
+                        u32::try_from(e.range.end).unwrap_or(u32::MAX),
+                        e.new_text,
+                    )
+                })
+            })
+        })
+    }
+
     /// The document outline (classes, funcs, vars, consts, enums, signals, members).
     ///
     /// # Errors

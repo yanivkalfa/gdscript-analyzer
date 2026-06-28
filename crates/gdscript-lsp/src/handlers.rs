@@ -101,6 +101,28 @@ pub fn formatting(a: &Analysis, ctx: &DocCtx) -> Cancellable<Option<Vec<lsp::Tex
     }]))
 }
 
+/// `textDocument/rangeFormatting` — format only the lines overlapping the selection `[start, end)`.
+/// Returns a single whole-line replacement edit, or `None` if those lines do not change.
+pub fn range_formatting(
+    a: &Analysis,
+    ctx: &DocCtx,
+    start: u32,
+    end: u32,
+) -> Cancellable<Option<Vec<lsp::TextEdit>>> {
+    let Some((rs, re, new_text)) = a.format_range(ctx.file, start, end)? else {
+        return Ok(None);
+    };
+    Ok(Some(vec![lsp::TextEdit {
+        range: convert::range_to_lsp(
+            &ctx.line_index,
+            &ctx.text,
+            TextRange::new(rs, re),
+            ctx.encoding,
+        ),
+        new_text,
+    }]))
+}
+
 /// `textDocument/semanticTokens/full` — the whole file's tokens, 5-int relative-encoded.
 pub fn semantic_tokens(
     a: &Analysis,
