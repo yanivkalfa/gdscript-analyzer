@@ -1589,6 +1589,7 @@ impl Cx<'_> {
                     recv_ty.clone()
                 } else if let Some(m) = self.api.lookup_member(*class, name) {
                     self.check_member_kind_misuse(&m, as_method, name, name_range);
+                    self.check_static_on_instance(receiver, &m, as_method, name_range);
                     self.member_ref_ty(&m, as_method)
                 } else if let Some(t) = self.class_enum_value(*class, name) {
                     // A statically-accessed enum value (`Control.PRESET_FULL_RECT`).
@@ -1785,6 +1786,38 @@ impl Cx<'_> {
             code,
             format!("The {kind} \"{name}\" is being called as if it were a function."),
         );
+    }
+
+    /// Flag `STATIC_CALLED_ON_INSTANCE`: an engine static method called through an instance value
+    /// rather than the type. Conservative + sound — fires only when the receiver is a **typed local
+    /// instance** (a `Name` bound in `locals`), never a bare class name (`Class.static()` is
+    /// correct) nor an expression we can't classify. Under-warns by design; zero false positives.
+    fn check_static_on_instance(
+        &mut self,
+        receiver: ExprId,
+        m: &MemberRef,
+        as_method: bool,
+        range: TextRange,
+    ) {
+        if !as_method {
+            return;
+        }
+        let MemberRef::Method(sig) = m else {
+            return;
+        };
+        if !sig.is_static {
+            return;
+        }
+        let receiver_is_local_instance =
+            matches!(self.body.expr(receiver), Expr::Name(n) if self.locals.contains_key(n));
+        if receiver_is_local_instance {
+            self.warn(
+                range,
+                WarningCode::StaticCalledOnInstance,
+                "A static method is being called on an instance; call it on the type instead."
+                    .to_owned(),
+            );
+        }
     }
 
     fn member_ref_ty(&self, m: &MemberRef, as_method: bool) -> Ty {
@@ -2348,6 +2381,29 @@ mod tests {
         );
         assert!(
             !codes(&h).contains(&"ENUM_VARIABLE_WITHOUT_DEFAULT"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn static_method_on_instance_warns() {
+        // `JSON.stringify` is static; calling it through a JSON *instance* warns.
+        let h =
+            infer_first_func("func f():\n\tvar j := JSON.new()\n\tj.stringify({})\n\treturn j\n");
+        assert!(
+            codes(&h).contains(&"STATIC_CALLED_ON_INSTANCE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn static_method_on_the_type_does_not_warn() {
+        // `JSON.stringify(...)` (on the type) is the correct form — never flagged.
+        let h = infer_first_func("func f():\n\tJSON.stringify({})\n");
+        assert!(
+            !codes(&h).contains(&"STATIC_CALLED_ON_INSTANCE"),
             "{:?}",
             codes(&h)
         );
