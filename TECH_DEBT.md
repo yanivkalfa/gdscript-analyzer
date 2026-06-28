@@ -221,13 +221,18 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
 ## Phase 2 — deferred / known limitations
 
 ### Deliberately phased (NOT shortcuts — scoped per the roadmap)
-- [ ] **guitkx napi `analyzerProxy.ts` validation (Playbook §5.1, conditional).** The
-      end-to-end check that the napi build answers guitkx's embedded-GDScript
-      completion/hover with no Godot editor running. Needs the napi `.node` build
-      (`libnode.dll`, CI-only — see Phase 1) + the guitkx LSP server at
-      `…/ReactiveUI-Gadot/ide-extensions/lsp-server`. Everything it depends on (the
-      analyzer answering completion/hover headless) is built and proven against the corpus;
-      this is the integration wiring, deferred to the Phase-5 client work.
+- [ ] **guitkx adapter migration to the typed binding (release-gated).** The analyzer side is
+      done (Phase 3 typed FFI, above): `@gdscript-analyzer/core` will return native JS values and
+      enrich navigation with `uri`. The guitkx adapter
+      (`…/ReactiveUI-Gadot/ide-extensions/lsp-server/src/analyzerAdapter.ts`) still consumes the
+      **published 0.2.x** string-returning API, so it cannot adopt the new contract until this
+      branch merges → releases → publishes a new (breaking) version. **CONCRETE BLOCKER:** can't
+      `npm link` a locally-built `.node` either (no MSVC C++ build tools on the dev box — see the
+      FFI item). Once published, the migration is ~20 lines: (1) bump the dep; (2) drop the four
+      `JSON.parse(...)` calls (`completions`/`hover`/`diagnostics`/`gotoDefinition`) — use the
+      objects directly; (3) replace the `fileIds`/`nextId` id↔uri mirror in `track()`/
+      `definitionsAt()` with the result's `d.uri` field (keep the per-doc text tracking). Then the
+      embedded-on e2e check (completion/hover/goto with no Godot editor) can run.
 - [ ] **Cross-file resolution → Phase 3.** `class_name` globals, autoloads, `preload`,
       script `extends`, and `as`/`is` against user types all funnel through
       `resolve_external() -> Ty::Unknown` (the seam). Correct + non-cascading today; Phase 3
