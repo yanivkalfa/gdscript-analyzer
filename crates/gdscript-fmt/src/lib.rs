@@ -83,8 +83,21 @@ impl FmtConfig {
 /// Format `source`, returning the tidied text. In `safe_mode` (the default) this returns `source`
 /// unchanged rather than risk a meaning-changing edit (a syntax error in the input, or output whose
 /// significant tokens differ from the input's).
+///
+/// The source's line-ending style is preserved: a file using `\r\n` (a Windows checkout) is
+/// formatted internally in `\n` and re-emitted with `\r\n`, so the formatter never churns every line
+/// by flipping CRLF to LF (matching gdformat, which preserves line endings).
 #[must_use]
 pub fn format(source: &str, config: &FmtConfig) -> String {
+    if source.contains("\r\n") {
+        let lf = source.replace("\r\n", "\n");
+        return format_lf(&lf, config).replace('\n', "\r\n");
+    }
+    format_lf(source, config)
+}
+
+/// `format` working purely in LF (the caller handles CRLF round-tripping).
+fn format_lf(source: &str, config: &FmtConfig) -> String {
     let input_parses = gdscript_syntax::parse(source).errors().is_empty();
     // Safe mode: never reformat around a syntax error — we'd risk mis-indenting a mis-parsed block.
     if config.safe_mode && !input_parses {
@@ -1378,5 +1391,33 @@ mod tests {
         };
         let src = "func a():\n\tpass\nfunc b():\n\tpass\n";
         assert_eq!(format(src, &cfg), src);
+    }
+
+    // ---- Phase-4 increment C: line-ending preservation ----
+
+    #[test]
+    fn crlf_line_endings_are_preserved() {
+        // A CRLF file is formatted (spacing + blank policy applied) but stays CRLF — never churned
+        // to LF.
+        let src = "func a():\r\n\tvar x=1\r\nfunc b():\r\n\tpass\r\n";
+        assert_eq!(
+            fmt(src),
+            "func a():\r\n\tvar x = 1\r\n\r\n\r\nfunc b():\r\n\tpass\r\n"
+        );
+    }
+
+    #[test]
+    fn crlf_preserved_including_multiline_string_interior() {
+        // A `\r\n` inside a multi-line string round-trips (normalize to LF, format, restore CRLF).
+        let src = "var s = \"\"\"a\r\nb\"\"\"\r\n";
+        let out = fmt(src);
+        assert_eq!(out, "var s = \"\"\"a\r\nb\"\"\"\r\n");
+        assert!(super::same_significant_tokens(src, &out));
+    }
+
+    #[test]
+    fn lf_files_stay_lf() {
+        let src = "func a():\n\tpass\n";
+        assert!(!fmt(src).contains('\r'));
     }
 }
