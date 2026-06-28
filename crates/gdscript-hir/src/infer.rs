@@ -154,6 +154,7 @@ pub fn infer(
         used_locals: FxHashSet::default(),
         narrowing: FxHashMap::default(),
         flow: flow::analyze(body),
+        is_func_body,
     };
     // Parameters bind first (their defaults can reference earlier params).
     let params = body.params.clone();
@@ -582,6 +583,10 @@ struct Cx<'a> {
     /// The precomputed per-body control-flow narrowing facts (Workstream 2). The checker consults
     /// `facts_before(stmt)` to build [`Cx::narrowing`]; it survives `else`/early-return/`and`-`or`.
     flow: FlowAnalysis,
+    /// Whether this is a real function body (vs a class-field initializer body). Gates the
+    /// body-only checks (`UNUSED_*`, `SHADOWED_VARIABLE`) so a field initializer doesn't, e.g.,
+    /// "shadow itself" against its own member entry.
+    is_func_body: bool,
 }
 
 impl Cx<'_> {
@@ -887,6 +892,40 @@ impl Cx<'_> {
             }
             (None, None) => Ty::Variant,
         };
+        // SHADOWED_VARIABLE — a local `var`/`const` whose name shadows a parameter or an own class
+        // member (a redeclared *local* is a Godot error, not handled here). Sound: only fires on a
+        // genuine outer-scope shadow. The binding isn't pushed yet, so the `Param` scan can't see it.
+        // Gated to a real function body — a class-field initializer's own `var n` is not a shadow.
+        let shadows_param = self
+            .bindings
+            .iter()
+            .any(|b| b.kind == BindingKind::Param && b.name == v.name);
+        // Only a *value* member (var/const/signal, or an anon-enum constant) — not a method or a
+        // type name, where the "shadow" framing is weaker — counts, to stay conservative.
+        let shadows_member = match self.class.lookup(&v.name) {
+            Some(ClassItem::EnumVariant) => true,
+            Some(item) => matches!(
+                self.class.member(item),
+                Some(Member::Var(_) | Member::Const(_) | Member::Signal(_))
+            ),
+            None => false,
+        };
+        if self.is_func_body && (shadows_param || shadows_member) {
+            let what = if v.is_const { "constant" } else { "variable" };
+            let outer = if shadows_param {
+                "parameter"
+            } else {
+                "class member"
+            };
+            self.warn(
+                v.name_range,
+                WarningCode::ShadowedVariable,
+                format!(
+                    "The local {what} \"{}\" shadows a {outer} of the same name.",
+                    v.name
+                ),
+            );
+        }
         self.bindings.push(Binding {
             name: v.name.clone(),
             name_range: v.name_range,
@@ -2165,6 +2204,26 @@ mod tests {
     fn int_to_float_is_silent() {
         let h = infer_first_func("func f():\n\tvar x: float = 3\n\treturn x\n");
         assert!(codes(&h).is_empty(), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn local_shadowing_a_param_warns_shadowed_variable() {
+        let h = infer_first_func("func f(x):\n\tvar x = 1\n\treturn x\n");
+        assert!(codes(&h).contains(&"SHADOWED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn local_shadowing_a_class_member_warns_shadowed_variable() {
+        // The class scope (built from the whole file) sees the member `health`; the local shadows it.
+        let h =
+            infer_first_func("var health = 100\nfunc f():\n\tvar health = 1\n\treturn health\n");
+        assert!(codes(&h).contains(&"SHADOWED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn non_shadowing_local_does_not_warn_shadowed_variable() {
+        let h = infer_first_func("func f(x):\n\tvar y = 1\n\treturn x + y\n");
+        assert!(!codes(&h).contains(&"SHADOWED_VARIABLE"), "{:?}", codes(&h));
     }
 
     #[test]
