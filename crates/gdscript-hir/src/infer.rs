@@ -359,7 +359,13 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
     }
 
     // File-level (member) warnings that need the whole item-tree, not a single body.
-    raw_warnings.extend(member_level_warnings(db, api, root, &tree));
+    raw_warnings.extend(member_level_warnings(
+        db,
+        api,
+        root,
+        &tree,
+        res_path.as_deref(),
+    ));
 
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
@@ -451,11 +457,17 @@ fn member_level_warnings(
     api: &EngineApi,
     root: &GdNode,
     tree: &ItemTree,
+    res_path: Option<&str>,
 ) -> Vec<RawWarning> {
     let mut out = Vec::new();
     let has_signal = tree.members.iter().any(|m| matches!(m, Member::Signal(_)));
     // Only pay for the whole-file name scan when there is a signal to judge.
     let uses = has_signal.then(|| NameUses::collect(root));
+    // The resolved ENGINE base, for NATIVE_METHOD_OVERRIDE (an unresolved/user base ⇒ no check).
+    let engine_base = match resolve::resolve_base(db, api, tree, res_path) {
+        Ty::Object(c) => Some(c),
+        _ => None,
+    };
     for m in &tree.members {
         match m {
             // An enum-typed field with no initializer (the local case is in `infer_local_var`).
@@ -490,10 +502,51 @@ fn member_level_warnings(
                     });
                 }
             }
+            // NATIVE_METHOD_OVERRIDE (ERROR-default) — an override of an engine VIRTUAL whose
+            // signature is clearly incompatible. Conservative to the extreme (a false positive is a
+            // loud error): warn ONLY on a *definite type clash* at an overlapping typed parameter —
+            // both the override's annotation and the virtual's param resolve to known engine types
+            // that are mutually NON-assignable. Arity, defaults/vararg, and variance subtleties are
+            // deliberately left to under-warn (see `TECH_DEBT.md`).
+            Member::Func(f) => {
+                if let Some(base) = engine_base
+                    && let Some(MemberRef::Method(vsig)) = api.lookup_member(base, &f.name)
+                    && vsig.is_virtual
+                {
+                    for (p, vp) in f.params.iter().zip(vsig.params.iter()) {
+                        let Some(ann) = &p.type_ref else { continue };
+                        let pty = resolve::resolve_type_name(db, api, ann);
+                        let vty = ty::resolve_tyref(api, &vp.ty);
+                        if types_definitely_clash(api, &pty, &vty) {
+                            out.push(RawWarning {
+                                range: f.name_range,
+                                code: WarningCode::NativeMethodOverride,
+                                message: format!(
+                                    "The override of the native virtual method \"{}\" has an incompatible type for parameter \"{}\".",
+                                    f.name, p.name
+                                ),
+                            });
+                            break; // one warning per overriding function
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
     out
+}
+
+/// Whether two **known** engine types are mutually non-assignable — a *definite* clash. An
+/// uninformative type (`Variant`/`Unknown`) never clashes (gradual), and any assignable relation in
+/// either direction (subtype, widening, enum/int, …) is treated as "related" (not a clash), so the
+/// conservative `NATIVE_METHOD_OVERRIDE` only fires on genuinely unrelated types.
+fn types_definitely_clash(api: &EngineApi, a: &Ty, b: &Ty) -> bool {
+    if a.is_uninformative() || b.is_uninformative() {
+        return false;
+    }
+    matches!(ty::is_assignable(api, a, b), Assign::No)
+        && matches!(ty::is_assignable(api, b, a), Assign::No)
 }
 
 /// Identifier-occurrence counts + string-literal contents across a file's CST — the file-wide
@@ -2473,6 +2526,47 @@ mod tests {
         let codes = file_codes("var err: Error\nfunc f():\n\tpass\n");
         assert!(
             codes.iter().any(|c| c == "ENUM_VARIABLE_WITHOUT_DEFAULT"),
+            "{:?}",
+            codes
+        );
+    }
+
+    #[test]
+    fn native_virtual_override_with_clashing_param_type_warns() {
+        // `_input(event: InputEvent)` is a Node virtual; `event: int` is an incompatible override.
+        let codes = file_codes("extends Node\nfunc _input(event: int):\n\tpass\n");
+        assert!(
+            codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
+            "{:?}",
+            codes
+        );
+    }
+
+    #[test]
+    fn native_virtual_override_with_correct_param_type_does_not_warn() {
+        let codes = file_codes("extends Node\nfunc _input(event: InputEvent):\n\tpass\n");
+        assert!(
+            !codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
+            "{:?}",
+            codes
+        );
+    }
+
+    #[test]
+    fn native_virtual_override_with_untyped_param_does_not_warn() {
+        let codes = file_codes("extends Node\nfunc _input(event):\n\tpass\n");
+        assert!(
+            !codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
+            "{:?}",
+            codes
+        );
+    }
+
+    #[test]
+    fn a_non_virtual_method_is_not_a_native_override() {
+        let codes = file_codes("extends Node\nfunc my_helper(x: int):\n\treturn x\n");
+        assert!(
+            !codes.iter().any(|c| c == "NATIVE_METHOD_OVERRIDE"),
             "{:?}",
             codes
         );
