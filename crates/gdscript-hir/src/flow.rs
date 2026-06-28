@@ -180,6 +180,9 @@ pub struct FlowAnalysis {
     entry_facts: FxHashMap<StmtId, FlowFacts>,
     /// The first statement of each maximal unreachable run (the `UNREACHABLE_CODE` anchors).
     unreachable_anchors: Vec<StmtId>,
+    /// The byte ranges of `match` arms that follow an unconditional catch-all (the
+    /// `UNREACHABLE_PATTERN` anchors). Stored as ranges (an arm is not a `StmtId`).
+    unreachable_pattern_anchors: Vec<TextRange>,
 }
 
 impl FlowAnalysis {
@@ -197,6 +200,12 @@ impl FlowAnalysis {
             .map(|&sid| body.source_map.stmt_range(sid))
             .collect()
     }
+
+    /// The byte ranges of `match` arms after an unconditional catch-all (`UNREACHABLE_PATTERN`).
+    #[must_use]
+    pub fn unreachable_pattern_ranges(&self) -> &[TextRange] {
+        &self.unreachable_pattern_anchors
+    }
 }
 
 /// Run the forward dataflow over a lowered body, producing per-statement entry facts + reachability.
@@ -206,6 +215,7 @@ pub fn analyze(body: &Body) -> FlowAnalysis {
         body,
         entry_facts: FxHashMap::default(),
         unreachable_anchors: Vec::new(),
+        unreachable_pattern_anchors: Vec::new(),
     };
     a.block(FlowFacts::default(), &body.block);
     // Each lambda body is a fresh scope — analyze it independently (its statements share the body's
@@ -219,6 +229,7 @@ pub fn analyze(body: &Body) -> FlowAnalysis {
     FlowAnalysis {
         entry_facts: a.entry_facts,
         unreachable_anchors: a.unreachable_anchors,
+        unreachable_pattern_anchors: a.unreachable_pattern_anchors,
     }
 }
 
@@ -226,6 +237,7 @@ struct Analyzer<'a> {
     body: &'a Body,
     entry_facts: FxHashMap<StmtId, FlowFacts>,
     unreachable_anchors: Vec<StmtId>,
+    unreachable_pattern_anchors: Vec<TextRange>,
 }
 
 impl Analyzer<'_> {
@@ -272,9 +284,15 @@ impl Analyzer<'_> {
                 // in the 1.0 cut — pattern types aren't lowered yet); the match falls through with
                 // every arm's assignments widened away (we can't yet prove exhaustiveness).
                 let mut after = facts.clone();
+                // Every arm after an unconditional catch-all (`_`/`var x`, no guard) is unreachable.
+                let mut saw_catch_all = false;
                 for arm in arms {
+                    if saw_catch_all {
+                        self.unreachable_pattern_anchors.push(arm.range);
+                    }
                     let _ = self.block(facts.clone(), &arm.body);
                     self.scan_invalidations(&mut after, &arm.body);
+                    saw_catch_all |= arm.is_catch_all;
                 }
                 Some(after)
             }
@@ -579,6 +597,7 @@ pub fn condition_facts(body: &Body, cond: ExprId, truthy: bool) -> Vec<(Place, N
         body,
         entry_facts: FxHashMap::default(),
         unreachable_anchors: Vec::new(),
+        unreachable_pattern_anchors: Vec::new(),
     }
     .derive_facts(cond, truthy)
 }

@@ -144,6 +144,10 @@ fn collect_assign_lhs(body: &Body) -> FxHashSet<ExprId> {
 }
 
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the per-body inference orchestration reads best whole"
+)]
 pub fn infer(
     db: &dyn Db,
     api: &EngineApi,
@@ -243,6 +247,17 @@ pub fn infer(
             range,
             WarningCode::UnreachableCode,
             "Unreachable code (statement after a return, break, continue, or an exhaustive match)."
+                .to_owned(),
+        );
+    }
+
+    // UNREACHABLE_PATTERN — a `match` arm after an unconditional catch-all (Workstream 2).
+    let unreachable_patterns = cx.flow.unreachable_pattern_ranges().to_vec();
+    for range in unreachable_patterns {
+        cx.warn(
+            range,
+            WarningCode::UnreachablePattern,
+            "Unreachable pattern: an earlier arm's wildcard (`_`) or `var` binding always matches."
                 .to_owned(),
         );
     }
@@ -2655,6 +2670,65 @@ mod tests {
             infer_first_func("func f(c) -> int:\n\tvar x: int\n\tif c:\n\t\tx = 1\n\treturn x\n");
         assert!(
             codes(&h).contains(&"UNASSIGNED_VARIABLE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn arm_after_wildcard_is_unreachable_pattern() {
+        let h =
+            infer_first_func("func f(x):\n\tmatch x:\n\t\t_:\n\t\t\tpass\n\t\t1:\n\t\t\tpass\n");
+        assert!(
+            codes(&h).contains(&"UNREACHABLE_PATTERN"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn arm_after_var_bind_is_unreachable_pattern() {
+        let h = infer_first_func(
+            "func f(x):\n\tmatch x:\n\t\tvar y:\n\t\t\treturn y\n\t\t1:\n\t\t\tpass\n",
+        );
+        assert!(
+            codes(&h).contains(&"UNREACHABLE_PATTERN"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn arm_before_wildcard_is_not_unreachable() {
+        let h =
+            infer_first_func("func f(x):\n\tmatch x:\n\t\t1:\n\t\t\tpass\n\t\t_:\n\t\t\tpass\n");
+        assert!(
+            !codes(&h).contains(&"UNREACHABLE_PATTERN"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn guarded_wildcard_is_not_a_catch_all() {
+        // `_ when c:` is conditional — a following arm is NOT unreachable.
+        let h = infer_first_func(
+            "func f(x, c):\n\tmatch x:\n\t\t_ when c:\n\t\t\tpass\n\t\t1:\n\t\t\tpass\n",
+        );
+        assert!(
+            !codes(&h).contains(&"UNREACHABLE_PATTERN"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn multi_pattern_with_wildcard_is_conservatively_not_catch_all() {
+        // `1, _:` IS a catch-all in Godot, but we conservatively under-warn (no false positive).
+        let h =
+            infer_first_func("func f(x):\n\tmatch x:\n\t\t1, _:\n\t\t\tpass\n\t\t2:\n\t\t\tpass\n");
+        assert!(
+            !codes(&h).contains(&"UNREACHABLE_PATTERN"),
             "{:?}",
             codes(&h)
         );
