@@ -596,8 +596,19 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                             out.push_str(ws);
                         }
                         cont_line_start = false;
+                    } else if matches!(
+                        t.kind,
+                        SyntaxKind::LineComment
+                            | SyntaxKind::DocComment
+                            | SyntaxKind::RegionComment
+                            | SyntaxKind::EndRegionComment
+                    ) {
+                        // An inline (trailing) comment is offset by exactly two spaces (gdformat's
+                        // `INLINE_COMMENT_OFFSET`), regardless of the original spacing.
+                        out.push_str("  ");
+                        node_path = false;
                     } else if t.kind.is_trivia() {
-                        // A comment / line-continuation / BOM: keep the original spacing before it.
+                        // A line-continuation / BOM: keep the original spacing before it.
                         if let Some(ws) = pending_ws {
                             out.push_str(ws);
                         }
@@ -2497,6 +2508,23 @@ mod tests {
     fn magic_trailing_comma_is_idempotent() {
         let once = fmt("var a = call(x, y,)\n");
         assert_eq!(fmt(&once), once);
+    }
+
+    // ---- Phase-4: inline-comment offset ----
+
+    #[test]
+    fn inline_comments_get_two_spaces() {
+        assert_eq!(fmt("var x = 1 # one\n"), "var x = 1  # one\n");
+        assert_eq!(fmt("var y = 2     # many\n"), "var y = 2  # many\n");
+        assert_eq!(
+            fmt("func f(): # c\n\tpass ## doc\n"),
+            "func f():  # c\n\tpass  ## doc\n"
+        );
+        // a standalone comment (its own line) is unaffected — it is indentation, not an offset
+        assert_eq!(
+            fmt("func f():\n\t# standalone\n\tpass\n"),
+            "func f():\n\t# standalone\n\tpass\n"
+        );
     }
 
     // ---- Phase-4: format_range ----

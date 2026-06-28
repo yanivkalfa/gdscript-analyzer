@@ -38,6 +38,10 @@ correct on this corpus — the passes are correct on their own.
 - **Block-boundary comment indentation** (increment C): a comment is placed at its intended depth
   (authored indentation clamped to the surrounding structure), matching gdformat — a column-0 comment
   stays at column 0, an over-indented one snaps to the block.
+- **Inline-comment offset**: a trailing `# comment` is offset by exactly two spaces (gdformat's
+  `INLINE_COMMENT_OFFSET`), regardless of the original spacing.
+- **String-quote normalisation**, **magic trailing comma**, **operator-chain wrapping**, and
+  **enum-brace spacing** — see the token-mutating section below; all byte-identical to gdformat.
 
 ## Deliberate deviations
 
@@ -110,6 +114,14 @@ token or a changed string *value*.
 
 Still not implemented:
 
+2. **Re-flowing already-multi-line statements (layout ownership).** The reflow only touches statements
+   that occupy a *single* physical line. A statement the author already wrapped across lines is kept
+   **verbatim** (its interior indentation and wrapping preserved). gdformat *owns* the layout: it
+   collapses a wrapped construct that now fits onto one line, and re-indents/re-wraps one that does
+   not to its canonical form. This is the single biggest reason `format(original)` differs from
+   `gdformat(original)` on the corpus (the whitespace-only diffs): re-indented continuation lines and
+   un-collapsed short wraps. (`format(gdformat-output)` is a ~94% fixpoint, so the two formatters
+   *agree* on already-clean code — they differ on how aggressively they re-lay-out hand-wrapped code.)
 3. **Exploded method chains + leading-dot padding.** A method chain too long even for the compact
    paren-wrap is broken by gdformat at each `.`, leading-dot style (`. method`). We leave such a (rare)
    chain on one line, and we tighten an *already*-wrapped chain's `. method` to `.method` — the main
