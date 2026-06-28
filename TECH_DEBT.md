@@ -574,3 +574,140 @@ The "do 1–8" follow-up batch. Each is documented in full under its own Phase s
       prevents false positives, so the current state is safe. (b) **`analyzerProxy.ts` end-to-end
       validation** — needs the napi `.node` build (`libnode.dll`, CI-only), so it is CI-gated. Best done
       AFTER the analyzer's `@gdscript-analyzer/core` `^0.2.0` is published and the guitkx dep is bumped.
+
+---
+
+## Phase 6 — v1.0 (in progress, branch `feat/phase6`)
+
+Driven by `plans/PHASE-6-EXECUTION-OVERVIEW.md` + the seven workstream playbooks. Done so far:
+W1 M0 (the `WarningCode` emit-then-gate seam), W2 M0–M2 (the CFG narrowing dataflow + checker
+wiring + short-circuit), W1 M1 (a self-contained-check subset). W6 (the `#[non_exhaustive]` freeze
++ 1.0 tag) is held for last, by design.
+
+### §1 hardening pass (bug-hunt + a tech-debt batch) — DONE
+
+A pre-1.0 **adversarial bug-hunt** (8 lenses × 3-vote verify) over the W1 gate / W2 flow / W3
+formatter, plus an **empirical** sweep over 545 real `.gd` files (ReactiveUI-Gadot + godot-demo-
+projects: **0 panics**). The W2-flow-soundness and panic-safety lenses found **nothing** (the
+narrowing dataflow + panic-safety are clean). **5 confirmed defects, all fixed + regression-tested**:
+- [x] **`INT_AS_ENUM_WITHOUT_CAST` false positive** — a class enum *member* typed as bare `int`
+      while its annotation typed as `Ty::Enum`, so `var m: C.E = C.MEMBER` false-warned.
+      `class_enum_value` now returns the declaring enum type; `is_assignable` routes a *different*
+      enum to `IntAsEnum` (not a hard `TYPE_MISMATCH`). **Demo-projects: 124 → 1** (the 1 is a real
+      bare-int case); `TYPE_MISMATCH` unchanged.
+- [x] **Formatter indentation corruption** after a comment-only line (mistaken for a bracket
+      continuation → invalid GDScript the token-equality net can't see). `reindent` now tracks
+      bracket depth; the safety net gained a **parse-validity recheck** (input clean ⇒ output clean).
+      *Known cosmetic limitation:* a comment that is the **first line of a block** lands at column 0
+      (the prepass emits `Indent` only at the first code line) — valid, but not re-indented.
+- [x] **`exclude_addons` over-match** (`contains("/addons/")`) → only the root `res://addons/` now.
+- [x] **`@warning_ignore_start` stacked per code** (leaked to EOF) → overwrites per code like Godot.
+- [x] **`@warning_ignore` one-shot** now covers the whole physical line (`;`-joined statements).
+
+Tech-debt items completed in the same pass:
+- [x] **W1 `SHADOWED_VARIABLE`** — a local `var`/`const` shadowing a param or own value-member
+      (var/const/signal/anon-enum). Sound (function-body-only, value-members-only); verified on the
+      corpus (2 real shadows / 89 files, 0 false positives). `SHADOWED_VARIABLE_BASE_CLASS` (needs
+      the base item-tree) stays deferred below.
+- [x] **W5 `examples/analyze.rs`** — a documented public-API tour (diagnostics / hover / symbols /
+      format), CI-verified via clippy `--all-targets`.
+
+### W1 — warning set: checks deferred from the M1 cut (machinery is DONE; these are additive)
+
+The `WarningCode` catalog + `gate()` + per-code settings already support **all 48** codes; the
+following just need their detection wired (each is purely additive — a new `Cx::warn(...)` site or a
+file-level scan, gated by the existing seam). Landed in M1: `EMPTY_FILE`, `UNUSED_VARIABLE`,
+`UNUSED_LOCAL_CONSTANT`, `UNUSED_PARAMETER`, `STANDALONE_EXPRESSION`, `STANDALONE_TERNARY`,
+`INT_AS_ENUM_WITHOUT_CAST`, `INCOMPATIBLE_TERNARY`, `UNREACHABLE_CODE` (consumes W2 reachability).
+Landed in the §1 pass: `SHADOWED_VARIABLE` (param/value-member shadow).
+
+**Deferral policy (pre-freeze):** each remaining check is purely additive (a new `Cx::warn` site on
+the existing seam), so it ships as a clean 0.x **PATCH** *after* the freeze with no API churn. The
+ones below were deliberately **not** rushed into the 1.0 cut because they carry a false-positive risk
+(uncertain Godot-parity semantics) that the §1 pass exists to eliminate — better landed individually,
+each with its own bug-hunt, than batched in under freeze pressure. Sequenced by value.
+
+- [ ] **`UNTYPED_DECLARATION` / `INFERRED_DECLARATION`** — directly from the binding `annotated` /
+      `inferred_colon_eq` flags. **Low value:** default-IGNORE opt-in *and* extremely noisy (fires on
+      essentially every untyped/inferred local) — most users never enable them; the strict group's
+      real value (the `UNSAFE_*` codes) already ships. Adding them also needs a `codes()` test helper
+      that filters the opt-in group (else they pollute every focused infer fixture).
+- [x] **`SHADOWED_VARIABLE` — DONE (§1 pass).** A local `var`/`const` shadowing a param or own
+      value-member (var/const/signal/anon-enum). **`SHADOWED_VARIABLE_BASE_CLASS`** (a member
+      shadowing a *base*-class member) stays deferred — it needs the base item-tree walk via
+      `script_class` (engine base via `api.lookup_member`, user base via the `ScriptRef` chain).
+- [ ] **`SHADOWED_GLOBAL_IDENTIFIER` (extend)** — currently fires only for a `class_name` collision
+      (file-level, ungated, direct `Diagnostic`). Godot also fires for a local/member shadowing a
+      global; extend + route through `gate` as a real `WarningCode`.
+- [ ] **`ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE`** — needs the bool *value* of a constant
+      condition; the lowered `Literal::Bool` doesn't carry true/false. Recover it from the CST token
+      at the expr range (like navigation does) or extend `Literal` to carry the value.
+- [ ] **`CONFUSABLE_IDENTIFIER` / `_LOCAL_DECLARATION` / `_LOCAL_USAGE` / `_CAPTURE_REASSIGNMENT` /
+      `_TEMPORARY_MODIFICATION`** — Unicode mixed-script/homoglyph detection; needs a confusables
+      table (`unicode-security` crate or the Unicode confusables data). `_TEMPORARY_MODIFICATION` is
+      master-only (already `since=Master`).
+- [ ] **Deprecated-misuse trio** (`PROPERTY_USED_AS_FUNCTION`, `CONSTANT_USED_AS_FUNCTION`,
+      `FUNCTION_USED_AS_PROPERTY`) — call/property-kind mismatch on a resolved member.
+- [ ] **`NATIVE_METHOD_OVERRIDE`** — overriding a native virtual with an incompatible signature
+      (needs param-type comparison against the engine virtual).
+- [ ] **`STATIC_CALLED_ON_INSTANCE`**, **`MISSING_TOOL`**, **`REDUNDANT_STATIC_UNLOAD`**,
+      **`REDUNDANT_AWAIT`**, **`ENUM_VARIABLE_WITHOUT_DEFAULT`**, **`UNSAFE_VOID_RETURN`**,
+      **`UNSAFE_CAST`**, **`RETURN_VALUE_DISCARDED`**, **`INT_AS_ENUM_WITHOUT_MATCH`**,
+      **`DEPRECATED_KEYWORD`** (`yield` — parser must surface it), **`ONREADY_WITH_EXPORT`** (an
+      annotation pair on one member; needs item-tree annotation info), **`UNPRIVATE…`** etc. — each is
+      a small, self-contained check; sequenced by value after the M1 subset.
+- [ ] **`UNUSED_SIGNAL`**, **`UNUSED_PRIVATE_CLASS_VARIABLE`** — member-level unused analysis (needs
+      a whole-file member-read scan, like the local `used_locals` set but across methods).
+- [ ] **`UNASSIGNED_VARIABLE` / `_OP_ASSIGN`** — read-before-assign of a typed local; needs the W2
+      CFG's definite-assignment pass (a natural W2 extension — reachability is there, definite-assign
+      is not yet). **Deferred from the §1 pass (FP risk):** a sound, no-false-positive version must
+      resolve two subtleties first — (a) a *typed* local is auto-default-initialised in GDScript
+      (`var x: int` reads `0`), so reading-before-assign is not a runtime error, only a lint; and
+      (b) the may-vs-must question (warn on *possibly*-unassigned like Godot, or only *definitely*-
+      unassigned to stay conservative?). Resolving these needs a short Godot-semantics validation +
+      its own bug-hunt; rushing it pre-freeze risks false positives. Build it as a definite-assignment
+      lattice in `flow.rs` (per-statement `assigned: Set<Place>`, intersect at joins).
+- [ ] **`UNUSED_*` precision** — the M1 use-tracking is name-based and counts a *write* as a use
+      (sound: only ever under-warns). A precise read-vs-write split (excluding assignment-LHS, the
+      `ReferenceKind::Write` logic) would catch assigned-but-never-read locals.
+
+### W2 — narrowing: deferred precision (post-1.0 quality, MINOR/PATCH not API breaks)
+
+- [ ] **Assignment re-narrowing** (`x = other` → x: typeof(other)). M1 made flow authoritative, and
+      flow runs pre-inference so it can only *invalidate* on assignment (the sound 1.0 floor), not
+      re-narrow to the assigned value's type. Re-narrowing needs the value's inferred type fed back
+      into the facts — a post-1.0 precision item.
+- [ ] **`match`-arm scrutinee narrowing + `UNREACHABLE_PATTERN`** — the lowered `MatchArm` carries
+      no pattern type/`is_wildcard` info, so a `T():` arm can't yet narrow the scrutinee and an
+      arm-after-wildcard isn't flagged. Needs `body.rs` lowering to capture each arm's pattern
+      `AstPtr` + wildcard flag (the `flow.rs` `Terminator::Match`/`MatchEdge` shape already models it).
+      **Deferred from the §1 pass (FP risk):** a sound `UNREACHABLE_PATTERN` must detect an
+      *unconditional catch-all* arm with certainty — the `_` wildcard parses as a `PatternLiteral`
+      (identifier `_`), and `var x` as a `PatternBind`, and only when either is the arm's *sole*
+      top-level pattern with no `when` guard. Misdetecting flags a reachable arm (a false positive on
+      valid code), so this needs careful per-pattern CST work + its own bug-hunt rather than a rushed
+      pre-freeze add.
+- [ ] **`NotNull` / `Not(T)` consumption** — recorded by the flow pass but not used for typing in
+      1.0 (no null-access diagnostic to drive `NotNull`; `Not(T)` has no positive type). Wire when a
+      null-safety check lands.
+- [ ] **Loop-carried back-edge fixpoints, aliasing, narrowing through call results
+      (`if get_thing() is T:`)** — explicitly out of the 1.0 cut (per the W2 playbook §1 tail).
+
+### W3/W4/W5 — Phase-6 deferrals (infra needing CI services or measurement-first decisions)
+
+- [ ] **W3 — formatter reflow / gdformat parity.** Landed: the `gdscript-fmt` crate — a
+      safe-by-construction whitespace + **block-indentation** normalizer (re-emits the pre-pass
+      token stream, every significant token verbatim, with a re-parse significant-token-equality
+      fallback **plus** a parse-validity recheck — both added/hardened in the §1 pass), wired into
+      `Analysis::format` + the CLI (`format --check/--write`/stdout) + LSP `textDocument/formatting`.
+      *Cosmetic limitation (documented in `lib.rs`):* a comment that is the first line of a block is
+      left at column 0. Deferred (the bulk of `gdformat` parity): the **Wadler/Prettier `Doc` IR +
+      line-reflow** (wrapping long calls/arrays/dicts to `line_width`), **intra-line spacing
+      normalization** (one space around binary operators, after commas/colons), a blank-line policy
+      (2 between top-level defs / 1 inside), and `format_range`. **Concrete blocker for validation:**
+      a `gdformat`-differential golden corpus + a `DEVIATIONS.md` — without it, shipping reflow that
+      silently diverges from `gdformat` is worse than not having it. The reflow tail is additive on
+      the established `format()` API + safety net.
+- [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
+- [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
+- [ ] **CLI `--strict` / `--engine-defaults` override.** Today the strictness is chosen by `project.godot` presence (standalone = strict, project = engine defaults). An explicit CLI flag to force either mode regardless needs a host-level settings override (the gate's settings selection is in `type_diagnostics`, keyed on `project_config()`); thread a "force strict" toggle through the `Db` or inject a synthetic `WarningSettings`.

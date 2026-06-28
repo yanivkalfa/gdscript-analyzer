@@ -15,6 +15,7 @@ default-members = [
     "crates/gdscript-db",
     "crates/gdscript-hir",
     "crates/gdscript-ide",
+    "crates/gdscript-fmt",
     "crates/gdscript-scene",
     "crates/gdscript-session",
     "crates/gdscript-lsp",
@@ -43,6 +44,7 @@ gdscript-api = { path = "crates/gdscript-api", version = "0.2.1" }
 gdscript-db = { path = "crates/gdscript-db", version = "0.2.1" }
 gdscript-hir = { path = "crates/gdscript-hir", version = "0.2.1" }
 gdscript-ide = { path = "crates/gdscript-ide", version = "0.2.1" }
+gdscript-fmt = { path = "crates/gdscript-fmt", version = "0.2.1" }
 gdscript-scene = { path = "crates/gdscript-scene", version = "0.2.1" }
 # `gdscript-session` is internal-only (`publish = false`) — bundled into the napi/wasm bindings, never
 # sent to crates.io. It is therefore PATH-ONLY (no version requirement): release-plz bumps its package

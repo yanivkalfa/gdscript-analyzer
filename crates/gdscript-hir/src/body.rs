@@ -413,11 +413,12 @@ pub enum Stmt {
     Assert(Option<ExprId>),
 }
 
-/// Maps every [`ExprId`] back to its source byte range. The reverse direction (offset →
+/// Maps every [`ExprId`]/[`StmtId`] back to its source byte range. The reverse direction (offset →
 /// `ExprId`) is the tightest containing expression.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BodySourceMap {
     expr_ranges: Vec<TextRange>,
+    stmt_ranges: Vec<TextRange>,
 }
 
 impl BodySourceMap {
@@ -425,6 +426,12 @@ impl BodySourceMap {
     #[must_use]
     pub fn expr_range(&self, id: ExprId) -> TextRange {
         self.expr_ranges[id.0 as usize]
+    }
+
+    /// The source range of a statement (the whole statement node — the `UNREACHABLE_CODE` anchor).
+    #[must_use]
+    pub fn stmt_range(&self, id: StmtId) -> TextRange {
+        self.stmt_ranges[id.0 as usize]
     }
 
     /// The innermost (tightest) expression whose range contains `offset`.
@@ -528,6 +535,7 @@ struct Lowerer {
     exprs: Vec<Expr>,
     stmts: Vec<Stmt>,
     expr_ranges: Vec<TextRange>,
+    stmt_ranges: Vec<TextRange>,
 }
 
 impl Lowerer {
@@ -540,6 +548,7 @@ impl Lowerer {
             tail,
             source_map: BodySourceMap {
                 expr_ranges: self.expr_ranges,
+                stmt_ranges: self.stmt_ranges,
             },
         }
     }
@@ -551,9 +560,10 @@ impl Lowerer {
         id
     }
 
-    fn alloc_stmt(&mut self, stmt: Stmt) -> StmtId {
+    fn alloc_stmt(&mut self, stmt: Stmt, range: TextRange) -> StmtId {
         let id = StmtId(u32::try_from(self.stmts.len()).unwrap_or(u32::MAX));
         self.stmts.push(stmt);
+        self.stmt_ranges.push(range);
         id
     }
 
@@ -750,6 +760,7 @@ impl Lowerer {
 
     fn lower_stmt(&mut self, node: &GdNode) -> Option<StmtId> {
         use SyntaxKind as K;
+        let range = cst::text_range_of(node);
         let stmt = match node.kind() {
             K::ExprStmt => Stmt::Expr(self.lower_first_expr(node)),
             K::VarDecl | K::ConstDecl => Stmt::Var(self.lower_local_var(node)),
@@ -772,7 +783,7 @@ impl Lowerer {
             // A nested local `func` is a declaration, not a statement we type in Phase 2.
             _ => return None,
         };
-        Some(self.alloc_stmt(stmt))
+        Some(self.alloc_stmt(stmt, range))
     }
 
     fn lower_local_var(&mut self, node: &GdNode) -> LocalVar {

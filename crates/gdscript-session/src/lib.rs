@@ -388,7 +388,7 @@ mod tests {
         );
         s.open(
             "file:///main.gd",
-            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n",
+            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n\treturn n\n",
             Some("res://main.gd"),
         );
         // valid code → no diagnostics; the cross-file preload typed `n` as int → an `: int` inlay.
@@ -416,7 +416,7 @@ mod tests {
         );
         s.open(
             "file:///main.gd",
-            "func go():\n\tvar v := Audio.volume()\n",
+            "func go():\n\tvar v := Audio.volume()\n\treturn v\n",
             Some("res://main.gd"),
         );
         s.set_project_config("[autoload]\nAudio=\"*res://audio.gd\"\n");
@@ -463,7 +463,7 @@ mod tests {
         s.open("file:///markup.gd", markup, Some("res://markup.gd")); // path must be recorded now
         s.open(
             "file:///main.gd",
-            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n",
+            "const M = preload(\"res://markup.gd\")\nfunc go():\n\tvar n := M.new().parse()\n\treturn n\n",
             Some("res://main.gd"),
         );
         assert!(

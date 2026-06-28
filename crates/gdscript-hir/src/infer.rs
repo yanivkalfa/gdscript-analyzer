@@ -14,16 +14,18 @@ use gdscript_base::{Diagnostic, DiagnosticSource, FileId, Severity, TextRange};
 use gdscript_db::Db;
 use gdscript_scene::{SceneModel, SceneNode};
 use gdscript_syntax::GdNode;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use std::sync::Arc;
 
 use crate::body::{self, BinOp, Body, Expr, ExprId, Literal, ParamBinding, Stmt, UnOp};
 use crate::cst::{self, AstPtr};
+use crate::flow::{self, FlowAnalysis, NarrowedTy, Place};
 use crate::item_tree::{ItemTree, Member, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
 use crate::ty::{self, Assign, EnumRef, ScriptRefId, Ty};
+use crate::warnings::{RawWarning, WarningCode};
 
 // ---- diagnostic codes + message templates (Playbook §5, engine-matching) -----------------
 
@@ -71,6 +73,8 @@ pub enum BindingKind {
 /// A typed local binding — the unit hover + inlay hints read for `var`/param/`for` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
+    /// The binding name (for unused-binding analysis, find-references).
+    pub name: SmolStr,
     /// The name token's range.
     pub name_range: TextRange,
     /// The binding's resolved type. For an untyped `var x = e` this is the gradual `Variant`;
@@ -82,6 +86,9 @@ pub struct Binding {
     pub annotated: bool,
     /// Whether the source used `:=` (inferred-but-hard).
     pub inferred_colon_eq: bool,
+    /// Whether this is a `const` (vs a `var`) — distinguishes `UNUSED_LOCAL_CONSTANT` from
+    /// `UNUSED_VARIABLE`.
+    pub is_const: bool,
     /// What kind of binding this is.
     pub kind: BindingKind,
 }
@@ -93,8 +100,12 @@ pub struct InferenceResult {
     pub expr_ty: FxHashMap<ExprId, Ty>,
     /// The local bindings introduced by the body (params, `var`/`const`, `for` vars).
     pub bindings: Vec<Binding>,
-    /// The §5 type diagnostics raised.
+    /// The §5 type diagnostics raised directly (the ungated analyzer-native codes:
+    /// `TYPE_MISMATCH`, `INVALID_NODE_PATH` — these have no Godot warning-setting key).
     pub diagnostics: Vec<Diagnostic>,
+    /// The gateable Godot warnings, recorded severity-free. Resolved into final diagnostics by
+    /// [`crate::warnings::gate`] downstream of the cached `analyze_file` query (Workstream 1).
+    pub raw_warnings: Vec<RawWarning>,
 }
 
 impl InferenceResult {
@@ -124,6 +135,7 @@ pub fn infer(
     class: &ClassScope,
     body: &Body,
     return_ty: Ty,
+    is_func_body: bool,
 ) -> InferenceResult {
     let self_ty = class.self_ty.clone();
     let mut cx = Cx {
@@ -137,19 +149,25 @@ pub fn infer(
         expr_ty: FxHashMap::default(),
         bindings: Vec::new(),
         diagnostics: Vec::new(),
+        raw_warnings: Vec::new(),
         locals: FxHashMap::default(),
+        used_locals: FxHashSet::default(),
         narrowing: FxHashMap::default(),
+        flow: flow::analyze(body),
+        is_func_body,
     };
     // Parameters bind first (their defaults can reference earlier params).
     let params = body.params.clone();
     for p in &params {
         let ty = cx.param_ty(p);
         cx.bindings.push(Binding {
+            name: p.name.clone(),
             name_range: p.name_range,
             ty: ty.clone(),
             init: None,
             annotated: p.type_ref.is_some(),
             inferred_colon_eq: false,
+            is_const: false,
             kind: BindingKind::Param,
         });
         cx.locals.insert(p.name.clone(), ty);
@@ -159,10 +177,54 @@ pub fn infer(
     }
     let block = body.block.clone();
     cx.infer_block(&block);
+
+    // UNUSED_* — a declared local/param/const never read. Only for a *function* body: a class-field
+    // initializer body would otherwise false-flag every field (the member is read in other methods,
+    // not in its own initializer). `_`-prefixed names + loop/match captures are excluded.
+    if is_func_body {
+        let unused: Vec<(TextRange, WarningCode, String)> = cx
+            .bindings
+            .iter()
+            .filter_map(|b| {
+                if b.name.starts_with('_') || cx.used_locals.contains(&b.name) {
+                    return None;
+                }
+                let (code, what) = match b.kind {
+                    BindingKind::Param => (WarningCode::UnusedParameter, "parameter"),
+                    BindingKind::Var if b.is_const => {
+                        (WarningCode::UnusedLocalConstant, "local constant")
+                    }
+                    BindingKind::Var => (WarningCode::UnusedVariable, "local variable"),
+                    BindingKind::ForVar | BindingKind::MatchBind => return None,
+                };
+                Some((
+                    b.name_range,
+                    code,
+                    format!("The {what} \"{}\" is declared but never used.", b.name),
+                ))
+            })
+            .collect();
+        for (range, code, msg) in unused {
+            cx.warn(range, code, msg);
+        }
+    }
+
+    // UNREACHABLE_CODE — statements after a return/break/continue / exhaustive branch (Workstream 2).
+    let unreachable = cx.flow.unreachable_ranges(body);
+    for range in unreachable {
+        cx.warn(
+            range,
+            WarningCode::UnreachableCode,
+            "Unreachable code (statement after a return, break, continue, or an exhaustive match)."
+                .to_owned(),
+        );
+    }
+
     InferenceResult {
         expr_ty: cx.expr_ty,
         bindings: cx.bindings,
         diagnostics: cx.diagnostics,
+        raw_warnings: cx.raw_warnings,
     }
 }
 
@@ -184,7 +246,7 @@ pub fn infer_func(
     // are nested inside the ParamList, so they are not direct children).
     let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
         .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
-    infer(db, api, root, class, &body, return_ty)
+    infer(db, api, root, class, &body, return_ty, true)
 }
 
 /// One inferred unit of a file: a function body or a class field's initializer, with its
@@ -208,8 +270,12 @@ pub struct FileInference {
     pub tree: Arc<ItemTree>,
     /// The inferred function/field units.
     pub units: Vec<Unit>,
-    /// All type diagnostics, merged across units.
+    /// The ungated analyzer-native diagnostics, merged across units (`TYPE_MISMATCH`,
+    /// `INVALID_NODE_PATH`) plus the file-level `SHADOWED_GLOBAL_IDENTIFIER` / `CYCLIC_INHERITANCE`.
     pub diagnostics: Vec<Diagnostic>,
+    /// The severity-free gateable Godot warnings, merged across units. The IDE layer resolves
+    /// these via [`crate::warnings::gate`] against the project's settings (Workstream 1).
+    pub raw_warnings: Vec<RawWarning>,
 }
 
 impl FileInference {
@@ -227,10 +293,21 @@ impl FileInference {
 /// class-field initializer against a shared [`ClassScope`]. The single entry point for the
 /// IDE features (Playbook §6 — a pure `(api, parsed file) -> result` function).
 #[must_use]
+#[allow(clippy::too_many_lines)] // the two-pass field-fixpoint + function walk reads best whole
 pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId) -> FileInference {
     let tree = item_tree(root);
     let mut units = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut raw_warnings: Vec<RawWarning> = Vec::new();
+
+    // EMPTY_FILE — a script with no members, no `class_name`, and no `extends` (Workstream 1).
+    if tree.members.is_empty() && tree.class_name.is_none() && tree.extends.is_none() {
+        raw_warnings.push(RawWarning {
+            range: TextRange::new(0, 0),
+            code: WarningCode::EmptyFile,
+            message: "Empty script file.".to_owned(),
+        });
+    }
     let mut member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
     // `self` is the script's OWN class (a self-`ScriptRef`), not just its engine base — so member
     // access on an aliased `self` resolves the file's own members (see `ClassScope::self_ty`).
@@ -297,6 +374,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         const MAX_ROUNDS: usize = 4;
         let mut final_units: Vec<Unit> = Vec::new();
         let mut final_diagnostics: Vec<Diagnostic> = Vec::new();
+        let mut final_raw_warnings: Vec<RawWarning> = Vec::new();
         for _ in 0..MAX_ROUNDS {
             let mut class = ClassScope::new(db, api, &tree, res_path.as_deref());
             class.self_ty = self_ref.clone();
@@ -304,6 +382,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
             let mut next_member_types: FxHashMap<SmolStr, Ty> = FxHashMap::default();
             final_units = Vec::new();
             final_diagnostics = Vec::new();
+            final_raw_warnings = Vec::new();
             for m in &tree.members {
                 let (ptr, range) = match m {
                     Member::Var(v) => (v.ptr, v.range),
@@ -315,6 +394,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
                         next_member_types.insert(SmolStr::new(name), b.ty.clone());
                     }
                     final_diagnostics.extend(unit.result.diagnostics.iter().cloned());
+                    final_raw_warnings.extend(unit.result.raw_warnings.iter().cloned());
                     final_units.push(unit);
                 }
             }
@@ -324,6 +404,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
             member_types = next_member_types;
         }
         diagnostics.extend(final_diagnostics);
+        raw_warnings.extend(final_raw_warnings);
         units.extend(final_units);
     }
 
@@ -340,8 +421,9 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
             let body = body::body_of_func(&node);
             let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
                 .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
-            let result = infer(db, api, root, &class, &body, return_ty);
+            let result = infer(db, api, root, &class, &body, return_ty, true);
             diagnostics.extend(result.diagnostics.iter().cloned());
+            raw_warnings.extend(result.raw_warnings.iter().cloned());
             units.push(Unit {
                 range: f.range,
                 body,
@@ -354,6 +436,7 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         tree,
         units,
         diagnostics,
+        raw_warnings,
     }
 }
 
@@ -459,7 +542,7 @@ fn unit_from_decl(
 ) -> Option<Unit> {
     let node = ptr.to_node(root)?;
     let body = body::body_of_decl_stmt(&node);
-    let result = infer(db, api, root, class, &body, Ty::Variant);
+    let result = infer(db, api, root, class, &body, Ty::Variant, false);
     Some(Unit {
         range,
         body,
@@ -486,10 +569,24 @@ struct Cx<'a> {
     expr_ty: FxHashMap<ExprId, Ty>,
     bindings: Vec<Binding>,
     diagnostics: Vec<Diagnostic>,
+    /// Severity-free gateable warnings (Workstream 1), resolved by `gate()` downstream.
+    raw_warnings: Vec<RawWarning>,
     /// Function-scoped local bindings (GDScript locals are function-, not block-, scoped).
     locals: FxHashMap<SmolStr, Ty>,
-    /// Flow-scoped `is`/`as` narrowing facts, keyed by a dotted access path.
+    /// The names of locals/params that were *read* during the walk — drives the `UNUSED_*` family
+    /// (a declared binding whose name never appears here is unused). Conservative: a write-only use
+    /// also records the name (no false positives, only the occasional missed warning).
+    used_locals: FxHashSet<SmolStr>,
+    /// The active narrowing env for the current statement, keyed by a dotted access path. Rebuilt
+    /// per statement from [`Cx::flow`] (Workstream 2) — not mutated ad-hoc anymore.
     narrowing: FxHashMap<String, Ty>,
+    /// The precomputed per-body control-flow narrowing facts (Workstream 2). The checker consults
+    /// `facts_before(stmt)` to build [`Cx::narrowing`]; it survives `else`/early-return/`and`-`or`.
+    flow: FlowAnalysis,
+    /// Whether this is a real function body (vs a class-field initializer body). Gates the
+    /// body-only checks (`UNUSED_*`, `SHADOWED_VARIABLE`) so a field initializer doesn't, e.g.,
+    /// "shadow itself" against its own member entry.
+    is_func_body: bool,
 }
 
 impl Cx<'_> {
@@ -532,6 +629,17 @@ impl Cx<'_> {
         });
     }
 
+    /// Record a gateable Godot warning, severity-free. The resolved severity (and whether it fires
+    /// at all) is decided later by [`crate::warnings::gate`], keyed on the project's warning
+    /// settings — so a settings edit never re-runs inference (Workstream 1, the salsa firewall).
+    fn warn(&mut self, range: TextRange, code: WarningCode, message: String) {
+        self.raw_warnings.push(RawWarning {
+            range,
+            code,
+            message,
+        });
+    }
+
     fn range_of(&self, id: ExprId) -> TextRange {
         self.body.source_map.expr_range(id)
     }
@@ -540,10 +648,9 @@ impl Cx<'_> {
     /// unconditionally: `to` being `Variant`/`Unknown` yields `Ok`/no diagnostic.
     fn check_assign(&mut self, from: &Ty, to: &Ty, range: TextRange) {
         match ty::is_assignable(self.api, from, to) {
-            Assign::Narrowing => self.emit(
+            Assign::Narrowing => self.warn(
                 range,
-                Severity::Warning,
-                NARROWING_CONVERSION,
+                WarningCode::NarrowingConversion,
                 "Narrowing conversion (float is converted to int and loses precision).".to_owned(),
             ),
             Assign::No => {
@@ -558,7 +665,75 @@ impl Cx<'_> {
                     ),
                 );
             }
-            Assign::Ok | Assign::OkUnsafe | Assign::IntAsEnum => {}
+            // `int` assigned to an enum slot without an explicit cast (the previously-dead arm).
+            Assign::IntAsEnum => self.warn(
+                range,
+                WarningCode::IntAsEnumWithoutCast,
+                "Integer used when an enum value is expected. Cast the value to the enum type."
+                    .to_owned(),
+            ),
+            Assign::Ok | Assign::OkUnsafe => {}
+        }
+    }
+
+    /// Flag a statement whose expression has no effect: a bare value (`STANDALONE_EXPRESSION`) or a
+    /// ternary used as a statement (`STANDALONE_TERNARY`). A call / await / assignment / `preload`
+    /// has an effect and is never flagged.
+    fn check_standalone(&mut self, e: ExprId) {
+        if self.expr_has_side_effect(e) {
+            return;
+        }
+        match self.body.expr(e) {
+            Expr::Ternary { .. } => self.warn(
+                self.range_of(e),
+                WarningCode::StandaloneTernary,
+                "Standalone ternary conditional: the return value is discarded.".to_owned(),
+            ),
+            // Not value-like statements / forms with subtle effects — never flag.
+            Expr::Missing | Expr::Lambda { .. } | Expr::GetNode { .. } | Expr::Preload { .. } => {}
+            _ => self.warn(
+                self.range_of(e),
+                WarningCode::StandaloneExpression,
+                "Standalone expression (the line has no effect).".to_owned(),
+            ),
+        }
+    }
+
+    /// Whether evaluating an expression may have a side effect — a call, an `await`, a `preload`,
+    /// or an assignment anywhere in the subtree. Used to suppress `STANDALONE_*` on effectful lines.
+    fn expr_has_side_effect(&self, e: ExprId) -> bool {
+        match self.body.expr(e) {
+            Expr::Call { .. }
+            | Expr::Await(_)
+            | Expr::Preload { .. }
+            | Expr::Bin {
+                op: BinOp::Assign, ..
+            } => true,
+            Expr::Bin { lhs, rhs, .. }
+            | Expr::In { lhs, rhs, .. }
+            | Expr::Index {
+                base: lhs,
+                index: rhs,
+            } => self.expr_has_side_effect(*lhs) || self.expr_has_side_effect(*rhs),
+            Expr::Unary { operand, .. }
+            | Expr::Paren(operand)
+            | Expr::Cast { operand, .. }
+            | Expr::Is { operand, .. } => self.expr_has_side_effect(*operand),
+            Expr::Field { receiver, .. } => self.expr_has_side_effect(*receiver),
+            Expr::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr_has_side_effect(*cond)
+                    || self.expr_has_side_effect(*then_branch)
+                    || self.expr_has_side_effect(*else_branch)
+            }
+            Expr::Array(items) => items.iter().any(|&i| self.expr_has_side_effect(i)),
+            Expr::Dict(entries) => entries.iter().any(|(k, v)| {
+                self.expr_has_side_effect(*k) || v.is_some_and(|e| self.expr_has_side_effect(e))
+            }),
+            _ => false,
         }
     }
 
@@ -571,9 +746,13 @@ impl Cx<'_> {
     }
 
     fn infer_stmt(&mut self, id: body::StmtId) {
+        // Install the narrowing in force *before* this statement (Workstream 2). Recomputed per
+        // statement from the precomputed flow facts — replaces the old ad-hoc `in_branch` frames.
+        self.narrowing = self.facts_to_narrowing(id);
         match self.body.stmt(id).clone() {
             Stmt::Expr(e) => {
                 self.infer_expr(e, &Expectation::None);
+                self.check_standalone(e);
             }
             Stmt::Var(v) => self.infer_local_var(&v),
             Stmt::Return(e) => {
@@ -595,25 +774,24 @@ impl Cx<'_> {
                 elifs,
                 else_branch,
             } => {
+                // The branch narrowing now lives in the flow facts, so each sub-statement installs
+                // its own via `infer_stmt`. Restore the if-level facts before each guard (a block
+                // walk overwrites `self.narrowing`).
+                let at_if = self.narrowing.clone();
                 self.infer_expr(cond, &Expectation::None);
-                self.in_branch(|cx| {
-                    cx.apply_narrowing(cond);
-                    cx.infer_block(&then_branch);
-                });
+                self.infer_block(&then_branch);
                 for (econd, eblock) in elifs {
+                    self.narrowing.clone_from(&at_if);
                     self.infer_expr(econd, &Expectation::None);
-                    self.in_branch(|cx| {
-                        cx.apply_narrowing(econd);
-                        cx.infer_block(&eblock);
-                    });
+                    self.infer_block(&eblock);
                 }
                 if let Some(eb) = else_branch {
-                    self.in_branch(|cx| cx.infer_block(&eb));
+                    self.infer_block(&eb);
                 }
             }
             Stmt::While { cond, body } => {
                 self.infer_expr(cond, &Expectation::None);
-                self.in_branch(|cx| cx.infer_block(&body));
+                self.infer_block(&body);
             }
             Stmt::For(f) => {
                 let iter_ty = self.infer_expr(f.iter, &Expectation::None);
@@ -622,39 +800,45 @@ impl Cx<'_> {
                     |ptr| self.resolve_ptr_ty(*ptr),
                 );
                 self.bindings.push(Binding {
+                    name: f.var.clone(),
                     name_range: f.var_range,
                     ty: var_ty.clone(),
                     init: None,
                     annotated: f.var_type.is_some(),
                     inferred_colon_eq: false,
+                    is_const: false,
                     kind: BindingKind::ForVar,
                 });
                 self.locals.insert(f.var.clone(), var_ty);
-                self.in_branch(|cx| cx.infer_block(&f.body));
+                self.infer_block(&f.body);
             }
             Stmt::Match { scrutinee, arms } => {
+                let at_match = self.narrowing.clone();
                 self.infer_expr(scrutinee, &Expectation::None);
                 for arm in arms {
-                    self.in_branch(|cx| {
-                        for b in &arm.binds {
-                            // Record the capture as a binding so navigation (find-refs / rename)
-                            // sees it as a local that shadows a same-named member; the type is the
-                            // Phase-2 `Variant`.
-                            cx.bindings.push(Binding {
-                                name_range: b.range,
-                                ty: Ty::Variant,
-                                init: None,
-                                annotated: false,
-                                inferred_colon_eq: false,
-                                kind: BindingKind::MatchBind,
-                            });
-                            cx.locals.insert(b.name.clone(), Ty::Variant);
-                        }
-                        if let Some(g) = arm.guard {
-                            cx.infer_expr(g, &Expectation::None);
-                        }
-                        cx.infer_block(&arm.body);
-                    });
+                    // Restore the match-level facts before each arm's guard (a prior arm's body
+                    // walk overwrote `self.narrowing`).
+                    self.narrowing.clone_from(&at_match);
+                    for b in &arm.binds {
+                        // Record the capture as a binding so navigation (find-refs / rename) sees
+                        // it as a local that shadows a same-named member; the type is the Phase-2
+                        // `Variant`.
+                        self.bindings.push(Binding {
+                            name: b.name.clone(),
+                            name_range: b.range,
+                            ty: Ty::Variant,
+                            init: None,
+                            annotated: false,
+                            inferred_colon_eq: false,
+                            is_const: false,
+                            kind: BindingKind::MatchBind,
+                        });
+                        self.locals.insert(b.name.clone(), Ty::Variant);
+                    }
+                    if let Some(g) = arm.guard {
+                        self.infer_expr(g, &Expectation::None);
+                    }
+                    self.infer_block(&arm.body);
                 }
             }
             Stmt::Break | Stmt::Continue | Stmt::Pass => {}
@@ -687,10 +871,9 @@ impl Cx<'_> {
             // `var x := e` — inferred (hard); guard the Variant / null cases.
             (None, Some(init)) if v.is_inferred => {
                 if init.is_variant() {
-                    self.emit(
+                    self.warn(
                         range,
-                        Severity::Error,
-                        INFERENCE_ON_VARIANT,
+                        WarningCode::InferenceOnVariant,
                         inference_on_variant_msg(if v.is_const { "constant" } else { "variable" }),
                     );
                     Ty::Variant
@@ -709,15 +892,51 @@ impl Cx<'_> {
             }
             (None, None) => Ty::Variant,
         };
+        // SHADOWED_VARIABLE — a local `var`/`const` whose name shadows a parameter or an own class
+        // member (a redeclared *local* is a Godot error, not handled here). Sound: only fires on a
+        // genuine outer-scope shadow. The binding isn't pushed yet, so the `Param` scan can't see it.
+        // Gated to a real function body — a class-field initializer's own `var n` is not a shadow.
+        let shadows_param = self
+            .bindings
+            .iter()
+            .any(|b| b.kind == BindingKind::Param && b.name == v.name);
+        // Only a *value* member (var/const/signal, or an anon-enum constant) — not a method or a
+        // type name, where the "shadow" framing is weaker — counts, to stay conservative.
+        let shadows_member = match self.class.lookup(&v.name) {
+            Some(ClassItem::EnumVariant) => true,
+            Some(item) => matches!(
+                self.class.member(item),
+                Some(Member::Var(_) | Member::Const(_) | Member::Signal(_))
+            ),
+            None => false,
+        };
+        if self.is_func_body && (shadows_param || shadows_member) {
+            let what = if v.is_const { "constant" } else { "variable" };
+            let outer = if shadows_param {
+                "parameter"
+            } else {
+                "class member"
+            };
+            self.warn(
+                v.name_range,
+                WarningCode::ShadowedVariable,
+                format!(
+                    "The local {what} \"{}\" shadows a {outer} of the same name.",
+                    v.name
+                ),
+            );
+        }
         self.bindings.push(Binding {
+            name: v.name.clone(),
             name_range: v.name_range,
             ty: binding_ty.clone(),
             init: v.init,
             annotated: v.type_ref.is_some(),
             inferred_colon_eq: v.is_inferred,
+            is_const: v.is_const,
             kind: BindingKind::Var,
         });
-        self.narrowing.remove(v.name.as_str());
+        // A (re-)declaration's narrowing invalidation is handled by the flow analysis (Workstream 2).
         self.locals.insert(v.name.clone(), binding_ty);
     }
 
@@ -767,7 +986,18 @@ impl Cx<'_> {
                 } else if self.is_null(then_branch) {
                     b
                 } else {
-                    self.join(&a, &b)
+                    let r = self.join(&a, &b);
+                    // Both arms informative but with no common type (the join widened to Variant) —
+                    // the ternary's two values are mutually incompatible.
+                    if r.is_variant() && !a.is_uninformative() && !b.is_uninformative() {
+                        self.warn(
+                            self.range_of(id),
+                            WarningCode::IncompatibleTernary,
+                            "The values of the ternary conditional are not mutually compatible."
+                                .to_owned(),
+                        );
+                    }
+                    r
                 }
             }
             Expr::Call { callee, args } => self.infer_call(callee, &args),
@@ -1073,6 +1303,16 @@ impl Cx<'_> {
         if op == BinOp::Assign {
             return self.infer_assign(lhs, rhs);
         }
+        // Short-circuit narrowing (Workstream 2): the RHS of `a and b` is typed under `a`'s
+        // then-facts; `a or b`'s RHS under `a`'s else-facts. Restore the env afterward.
+        if matches!(op, BinOp::And | BinOp::Or) {
+            self.infer_expr(lhs, &Expectation::None);
+            let saved = self.narrowing.clone();
+            self.apply_condition_facts(lhs, op == BinOp::And);
+            self.infer_expr(rhs, &Expectation::None);
+            self.narrowing = saved;
+            return self.bool_ty();
+        }
         let lt = self.infer_expr(lhs, &Expectation::None);
         let rt = self.infer_expr(rhs, &Expectation::None);
         if op.is_boolean() {
@@ -1080,10 +1320,9 @@ impl Cx<'_> {
         }
         // `int / int` discards the fractional part.
         if op == BinOp::Div && self.is_int(&lt) && self.is_int(&rt) {
-            self.emit(
+            self.warn(
                 self.range_of(id),
-                Severity::Warning,
-                INTEGER_DIVISION,
+                WarningCode::IntegerDivision,
                 "Integer division. Decimal part will be discarded.".to_owned(),
             );
             return self.int_ty();
@@ -1102,15 +1341,8 @@ impl Cx<'_> {
         if !slot.is_uninformative() {
             self.check_assign(&value, &slot, self.range_of(rhs));
         }
-        // Assignment narrowing: bound the narrowed type by the declared slot.
-        if let Some(key) = self.narrow_key(lhs) {
-            let narrowed = if slot.is_uninformative() {
-                value.clone()
-            } else {
-                slot.clone()
-            };
-            self.narrowing.insert(key, narrowed);
-        }
+        // Assignment *invalidates* the place's narrowing (handled by the flow analysis, Workstream
+        // 2); re-narrowing from the assigned value's type is a post-1.0 precision item.
         slot
     }
 
@@ -1200,10 +1432,9 @@ impl Cx<'_> {
             if ty::is_assignable(self.api, &arg_ty, param_ty) == Assign::OkUnsafe {
                 let pl = param_ty.label(self.api).unwrap_or_else(|| "?".to_owned());
                 let al = arg_ty.label(self.api).unwrap_or_else(|| "?".to_owned());
-                self.emit(
+                self.warn(
                     self.range_of(arg),
-                    Severity::Warning,
-                    UNSAFE_CALL_ARGUMENT,
+                    WarningCode::UnsafeCallArgument,
                     format!(
                         "The argument {} requires a value of type \"{pl}\" but is passed \"{al}\", which is unsafe.",
                         i + 1
@@ -1460,20 +1691,20 @@ impl Cx<'_> {
         let recv_label = recv.label(self.api).unwrap_or_else(|| "?".to_owned());
         let (code, message) = if as_method {
             (
-                UNSAFE_METHOD_ACCESS,
+                WarningCode::UnsafeMethodAccess,
                 format!(
                     "The method \"{name}()\" is not present on the inferred type \"{recv_label}\" (but may be present on a subtype)."
                 ),
             )
         } else {
             (
-                UNSAFE_PROPERTY_ACCESS,
+                WarningCode::UnsafePropertyAccess,
                 format!(
                     "The property \"{name}\" is not present on the inferred type \"{recv_label}\" (but may be present on a subtype)."
                 ),
             )
         };
-        self.emit(range, Severity::Warning, code, message);
+        self.warn(range, code, message);
     }
 
     fn member_ref_ty(&self, m: &MemberRef, as_method: bool) -> Ty {
@@ -1542,16 +1773,23 @@ impl Cx<'_> {
 
     /// The type of a class enum **value** accessed statically (`Control.PRESET_FULL_RECT`):
     /// the engine exposes enum values as class members, so search every (inherited) enum's
-    /// values. Returns `int` when found.
+    /// values. Returns the value's **declaring enum type** (`Ty::Enum`) — mirroring how a
+    /// `Class.Enum` *annotation* resolves (`resolve::resolve_named`), so an enum member assigned
+    /// to a slot of that same enum is `Assign::Ok`, not a false `INT_AS_ENUM_WITHOUT_CAST`. (An
+    /// enum value is still freely assignable to `int` — see `ty::is_assignable`.)
     fn class_enum_value(&self, class: gdscript_api::ClassId, name: &str) -> Option<Ty> {
         let mut cur = Some(class);
         while let Some(cid) = cur {
             let c = self.api.class(cid);
-            if c.enums
+            if let Some(e) = c
+                .enums
                 .iter()
-                .any(|e| e.values.iter().any(|v| v.name == name))
+                .find(|e| e.values.iter().any(|v| v.name == name))
             {
-                return Some(self.int_ty());
+                return Some(Ty::Enum(EnumRef {
+                    qualified: SmolStr::new(format!("{}.{}", c.name, e.name)),
+                    bitfield: e.is_bitfield,
+                }));
             }
             cur = c.base;
         }
@@ -1619,11 +1857,13 @@ impl Cx<'_> {
         for p in params {
             let ty = self.param_ty(p);
             self.bindings.push(Binding {
+                name: p.name.clone(),
                 name_range: p.name_range,
                 ty: ty.clone(),
                 init: None,
                 annotated: p.type_ref.is_some(),
                 inferred_colon_eq: false,
+                is_const: false,
                 kind: BindingKind::Param,
             });
             self.locals.insert(p.name.clone(), ty);
@@ -1645,6 +1885,11 @@ impl Cx<'_> {
     // ---- name resolution (local → class member → inherited → global) ----
 
     fn resolve_name(&mut self, id: ExprId, name: &str) -> Ty {
+        // Record a read of a local/param for the `UNUSED_*` analysis (before the narrowing check,
+        // so a narrowed read still counts as used).
+        if self.locals.contains_key(name) {
+            self.used_locals.insert(SmolStr::new(name));
+        }
         // Flow narrowing wins over the binding's declared type.
         if let Some(key) = self.narrow_key(id)
             && let Some(t) = self.narrowing.get(&key)
@@ -1732,33 +1977,57 @@ impl Cx<'_> {
 
     // ---- narrowing ----
 
-    /// Apply the narrowing implied by an `if`/`elif` condition to the current (cloned) branch.
+    /// Build the narrowing env for a statement from the precomputed flow facts (Workstream 2).
     ///
-    /// `is`-narrowing is a deliberate divergence from upstream Godot (whose `is` does **not**
-    /// flow-narrow); we add it as a UX improvement but keep it **widen-only** so it never produces
-    /// a type Godot's checker would reject: narrow only when the tested type is a strict downcast
-    /// of the operand's current type, or the operand is uninformative. If the operand is already a
-    /// subtype of the test (`d: Derived; if d is Base`), keep it — do not un-narrow. The
-    /// `is_uninformative` guard also stays: never narrow to a type we couldn't resolve.
-    fn apply_narrowing(&mut self, cond: ExprId) {
-        let Expr::Is {
-            operand,
-            ty: Some(ptr),
-            negated: false,
-        } = self.body.expr(cond).clone()
-        else {
-            return;
-        };
-        let Some(key) = self.narrow_key(operand) else {
-            return;
-        };
-        let narrowed = self.resolve_ptr_ty(ptr);
-        if narrowed.is_uninformative() {
-            return;
+    /// Only `Is` facts contribute a type (`NotNull`/`Not` are recorded by the flow pass but not yet
+    /// consumed for typing — the 1.0 cut). The **widen-only + `is_uninformative`** soundness gate is
+    /// preserved verbatim from the old `apply_narrowing`: `is`-narrowing is a deliberate divergence
+    /// from upstream Godot (whose `is` does not flow-narrow), kept widen-only so it never produces a
+    /// type Godot would reject — narrow only when the tested type is a downcast of the place's
+    /// declared type, or the declared type is uninformative; never un-narrow a known subtype
+    /// (`d: Derived; if d is Base` keeps `Derived`), never narrow to a type we couldn't resolve.
+    fn facts_to_narrowing(&self, id: body::StmtId) -> FxHashMap<String, Ty> {
+        let mut out = FxHashMap::default();
+        if let Some(facts) = self.flow.facts_before(id) {
+            for (place, nt) in facts.iter() {
+                if let Some((key, ty)) = self.narrowing_entry(place, nt) {
+                    out.insert(key, ty);
+                }
+            }
         }
-        let cur = self.expr_ty.get(&operand).cloned().unwrap_or(Ty::Variant);
-        if cur.is_uninformative() || self.is_subtype(&narrowed, &cur) {
-            self.narrowing.insert(key, narrowed);
+        out
+    }
+
+    /// Resolve one flow fact into a `(dotted-key, narrowed-type)` narrowing entry, applying the
+    /// widen-only + `is_uninformative` soundness gate. `None` if the fact doesn't narrow a type
+    /// (a `NotNull`/`Not`, an unresolvable/uninformative type, or an un-narrowing of a known subtype).
+    fn narrowing_entry(&self, place: &Place, nt: &NarrowedTy) -> Option<(String, Ty)> {
+        let NarrowedTy::Is(ptr) = nt else {
+            return None;
+        };
+        let narrowed = self.resolve_ptr_ty(*ptr);
+        if narrowed.is_uninformative() {
+            return None;
+        }
+        // Gate against a local/param's declared type; for `self`-members / field chains the
+        // `is_uninformative` check above is the soundness floor.
+        if let Place::Local(n) = place
+            && let Some(cur) = self.locals.get(n)
+            && !cur.is_uninformative()
+            && !self.is_subtype(&narrowed, cur)
+        {
+            return None;
+        }
+        Some((place.dotted_key(), narrowed))
+    }
+
+    /// Apply a condition's short-circuit narrowing to the active env, for typing the RHS of an
+    /// `and`/`or` (Workstream 2): `if x is T and x.method():` narrows `x` for `x.method()`.
+    fn apply_condition_facts(&mut self, cond: ExprId, truthy: bool) {
+        for (place, nt) in flow::condition_facts(self.body, cond, truthy) {
+            if let Some((key, ty)) = self.narrowing_entry(&place, &nt) {
+                self.narrowing.insert(key, ty);
+            }
         }
     }
 
@@ -1812,14 +2081,6 @@ impl Cx<'_> {
             return a.clone();
         }
         Ty::Variant
-    }
-
-    /// Run a closure within a branch-scoped narrowing frame (clone on enter, restore on exit).
-    fn in_branch<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let saved = self.narrowing.clone();
-        let r = f(self);
-        self.narrowing = saved;
-        r
     }
 }
 
@@ -1884,26 +2145,35 @@ mod tests {
         let body = body::body_of_func(&func);
         let return_ty = cst::first_child(&func, |k| k == SyntaxKind::TypeRef)
             .map_or(Ty::Variant, |t| resolve::resolve_type_ref(&db, api, &t));
-        let result = infer(&db, api, &root, &class, &body, return_ty);
+        let result = infer(&db, api, &root, &class, &body, return_ty, true);
         Harness { result, body }
     }
 
+    /// Every code inference produced — the ungated `diagnostics` plus the severity-free
+    /// `raw_warnings` (the gateable Godot codes, post-W1-M0). Infer-level tests assert what the
+    /// checker *records*; the gate-level resolution is tested in `crate::warnings`.
     fn codes(h: &Harness) -> Vec<&str> {
         h.result
             .diagnostics
             .iter()
             .map(|d| d.code.as_str())
+            .chain(h.result.raw_warnings.iter().map(|w| w.code.as_str()))
             .collect()
     }
 
     /// Run the whole-file pass (Pass 1 field fixpoint + Pass 2 functions) and collect every
-    /// diagnostic code. Drives `analyze_file` directly so the bounded member fixpoint runs.
+    /// diagnostic code (ungated diagnostics + raw gateable warnings). Drives `analyze_file`
+    /// directly so the bounded member fixpoint runs.
     fn file_codes(src: &str) -> Vec<String> {
         let api = gdscript_api::bundled();
         let db = gdscript_db::RootDatabase::default();
         let root = parse(src).syntax_node();
         let fi = analyze_file(&db, api, &root, FileId(0));
-        fi.diagnostics.iter().map(|d| d.code.clone()).collect()
+        fi.diagnostics
+            .iter()
+            .map(|d| d.code.clone())
+            .chain(fi.raw_warnings.iter().map(|w| w.code.as_str().to_owned()))
+            .collect()
     }
 
     #[test]
@@ -1932,11 +2202,53 @@ mod tests {
 
     #[test]
     fn int_to_float_is_silent() {
-        let h = infer_first_func("func f():\n\tvar x: float = 3\n");
+        let h = infer_first_func("func f():\n\tvar x: float = 3\n\treturn x\n");
+        assert!(codes(&h).is_empty(), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn local_shadowing_a_param_warns_shadowed_variable() {
+        let h = infer_first_func("func f(x):\n\tvar x = 1\n\treturn x\n");
+        assert!(codes(&h).contains(&"SHADOWED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn local_shadowing_a_class_member_warns_shadowed_variable() {
+        // The class scope (built from the whole file) sees the member `health`; the local shadows it.
+        let h =
+            infer_first_func("var health = 100\nfunc f():\n\tvar health = 1\n\treturn health\n");
+        assert!(codes(&h).contains(&"SHADOWED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn non_shadowing_local_does_not_warn_shadowed_variable() {
+        let h = infer_first_func("func f(x):\n\tvar y = 1\n\treturn x + y\n");
+        assert!(!codes(&h).contains(&"SHADOWED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn enum_member_into_its_own_enum_slot_is_not_int_as_enum() {
+        // `var m: Tween.TweenProcessMode = Tween.TWEEN_PROCESS_IDLE` is valid GDScript with no
+        // cast — the enum member must type as its enum (not bare `int`), so `check_assign` sees
+        // `Enum → Enum` (Ok). A regression here would false-warn on extremely common engine code.
+        let h = infer_first_func(
+            "func f():\n\tvar m: Tween.TweenProcessMode = Tween.TWEEN_PROCESS_IDLE\n\treturn m\n",
+        );
         assert!(
-            h.result.diagnostics.is_empty(),
+            !codes(&h).contains(&"INT_AS_ENUM_WITHOUT_CAST"),
             "{:?}",
-            h.result.diagnostics
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn bare_int_into_enum_slot_still_warns() {
+        // The fix must not over-suppress: a genuine uncast `int` into an enum slot still warns.
+        let h = infer_first_func("func f():\n\tvar m: Tween.TweenProcessMode = 0\n\treturn m\n");
+        assert!(
+            codes(&h).contains(&"INT_AS_ENUM_WITHOUT_CAST"),
+            "{:?}",
+            codes(&h)
         );
     }
 
@@ -1986,14 +2298,114 @@ mod tests {
     }
 
     #[test]
+    fn early_return_is_guard_narrows_past_the_guard() {
+        // `if not (x is Node): return` — the only non-returning path proves x is Node, so after the
+        // guard a real Node method is safe and a missing one warns (Workstream 2, beats the engine).
+        let safe =
+            infer_first_func("func f(x):\n\tif not (x is Node):\n\t\treturn\n\tx.get_parent()\n");
+        assert!(
+            codes(&safe).iter().all(|c| !c.starts_with("UNSAFE")),
+            "real Node method must not warn after the guard: {:?}",
+            codes(&safe)
+        );
+        let bogus =
+            infer_first_func("func f(x):\n\tif not (x is Node):\n\t\treturn\n\tx.bogus_method()\n");
+        assert!(
+            codes(&bogus).contains(&UNSAFE_METHOD_ACCESS),
+            "missing method must warn after the guard: {:?}",
+            codes(&bogus)
+        );
+    }
+
+    #[test]
+    fn and_short_circuit_narrows_the_rhs() {
+        // `x is Node and x.<m>()` types the RHS under x: Node — a real method is safe, a missing
+        // one warns. The engine does not narrow here (Workstream 2, beats the engine).
+        let safe = infer_first_func("func f(x):\n\tif x is Node and x.get_parent():\n\t\tpass\n");
+        assert!(
+            codes(&safe).iter().all(|c| !c.starts_with("UNSAFE")),
+            "real Node method in the and-rhs must not warn: {:?}",
+            codes(&safe)
+        );
+        let bogus =
+            infer_first_func("func f(x):\n\tif x is Node and x.bogus_method():\n\t\tpass\n");
+        assert!(
+            codes(&bogus).contains(&UNSAFE_METHOD_ACCESS),
+            "missing method in the and-rhs must warn: {:?}",
+            codes(&bogus)
+        );
+    }
+
+    // ---- Workstream 1 M1: self-contained checks ----
+
+    #[test]
+    fn empty_file_warns() {
+        assert!(file_codes("").iter().any(|c| c == "EMPTY_FILE"));
+        assert!(
+            file_codes("# just a comment\n")
+                .iter()
+                .any(|c| c == "EMPTY_FILE")
+        );
+        assert!(
+            file_codes("extends Node\n")
+                .iter()
+                .all(|c| c != "EMPTY_FILE")
+        );
+    }
+
+    #[test]
+    fn unused_variable_and_parameter() {
+        let h = infer_first_func("func f(unused_p):\n\tvar unused_v = 1\n");
+        assert!(codes(&h).contains(&"UNUSED_PARAMETER"), "{:?}", codes(&h));
+        assert!(codes(&h).contains(&"UNUSED_VARIABLE"), "{:?}", codes(&h));
+        // A used binding does not warn; a `_`-prefixed one is intentionally ignored.
+        let used = infer_first_func("func f(p):\n\tvar v = p\n\treturn v\n");
+        assert!(codes(&used).iter().all(|c| !c.starts_with("UNUSED")));
+        let underscored = infer_first_func("func f(_ignored):\n\tpass\n");
+        assert!(!codes(&underscored).contains(&"UNUSED_PARAMETER"));
+    }
+
+    #[test]
+    fn standalone_expression_and_ternary() {
+        let expr = infer_first_func("func f(a, b):\n\ta + b\n");
+        assert!(
+            codes(&expr).contains(&"STANDALONE_EXPRESSION"),
+            "{:?}",
+            codes(&expr)
+        );
+        let tern = infer_first_func("func f(c):\n\t1 if c else 2\n");
+        assert!(
+            codes(&tern).contains(&"STANDALONE_TERNARY"),
+            "{:?}",
+            codes(&tern)
+        );
+        // A call statement has an effect — never flagged.
+        let call = infer_first_func("func f(n):\n\tn.queue_free()\n");
+        assert!(codes(&call).iter().all(|c| !c.starts_with("STANDALONE")));
+    }
+
+    #[test]
+    fn unreachable_code_after_return() {
+        let h = infer_first_func("func f():\n\treturn\n\tprint(\"dead\")\n");
+        assert!(codes(&h).contains(&"UNREACHABLE_CODE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn incompatible_ternary_warns() {
+        // `"s" if c else 1` — String vs int, no common type.
+        let h = infer_first_func("func f(c):\n\tvar x = \"s\" if c else 1\n\treturn x\n");
+        assert!(
+            codes(&h).contains(&"INCOMPATIBLE_TERNARY"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
     fn variant_receiver_never_unsafe() {
         // Untyped param → Variant receiver → unchecked, no diagnostic.
         let h = infer_first_func("func f(x):\n\tx.anything_at_all()\n");
-        assert!(
-            h.result.diagnostics.is_empty(),
-            "{:?}",
-            h.result.diagnostics
-        );
+        assert!(codes(&h).is_empty(), "{:?}", codes(&h));
     }
 
     #[test]
@@ -2183,11 +2595,7 @@ mod tests {
     fn unknown_seam_never_warns() {
         // `preload(...)` is Unknown; `:=` from it does NOT warn, and member access is unchecked.
         let h = infer_first_func("func f():\n\tvar s := preload(\"res://x.gd\")\n\ts.whatever()\n");
-        assert!(
-            h.result.diagnostics.is_empty(),
-            "{:?}",
-            h.result.diagnostics
-        );
+        assert!(codes(&h).is_empty(), "{:?}", codes(&h));
     }
 
     #[test]

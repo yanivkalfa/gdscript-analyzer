@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 gdscript-ide = { workspace = true }
 gdscript-base = { workspace = true }
+gdscript-fmt = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }
 ignore = { workspace = true }

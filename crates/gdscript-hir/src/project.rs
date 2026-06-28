@@ -13,6 +13,8 @@
 
 use smol_str::SmolStr;
 
+use crate::warnings::{WarnLevel, WarningCode, WarningSettings};
+
 /// One `[autoload]` entry from `project.godot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoloadEntry {
@@ -110,6 +112,86 @@ pub fn parse_engine_version(text: &str) -> Option<(u32, u32)> {
             .find_map(|part| parse_major_minor(dequote(part.trim())));
     }
     None
+}
+
+/// Parse the `debug/gdscript/warnings/*` settings from `project.godot` into a [`WarningSettings`],
+/// starting from the engine default for `engine`. Keys live under `[debug]` as
+/// `gdscript/warnings/<tail>` (Godot groups a setting by its first path segment). `<tail>` is
+/// `enable` / `treat_warnings_as_errors` / `exclude_addons` (bools) or a code's lowercased
+/// setting-name mapped to a `0|1|2` (Ignore/Warn/Error) level. A deliberate minimal scan (not a
+/// `VariantParser` port); robust to malformed input (a bad line is skipped). `directory_rules`
+/// (Godot master, a typed-Variant dict) is not parsed — see `TECH_DEBT.md`.
+#[must_use]
+pub fn parse_warning_settings(text: &str, engine: (u32, u32)) -> WarningSettings {
+    let mut settings = WarningSettings::engine_default(engine);
+    let mut in_debug = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_debug = inner.trim() == "debug";
+            continue;
+        }
+        if !in_debug {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(tail) = key.trim().strip_prefix("gdscript/warnings/") else {
+            continue;
+        };
+        let value = dequote(value.trim());
+        match tail {
+            "enable" => {
+                if let Some(b) = parse_bool(value) {
+                    settings.enabled = b;
+                }
+            }
+            "treat_warnings_as_errors" => {
+                if let Some(b) = parse_bool(value) {
+                    settings.treat_as_errors = b;
+                }
+            }
+            "exclude_addons" => {
+                if let Some(b) = parse_bool(value) {
+                    settings.exclude_addons = b;
+                }
+            }
+            _ => {
+                if let Some(code) = WarningCode::from_setting_name(tail)
+                    && let Some(level) = parse_warn_level(value)
+                {
+                    settings.per_code.insert(code, level);
+                }
+            }
+        }
+    }
+    settings
+}
+
+/// Parse a Godot `ConfigFile` boolean (`true`/`false`), or `None`.
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a warning level: the `0|1|2` int Godot 4.x writes, tolerating a legacy `true`/`false`.
+fn parse_warn_level(s: &str) -> Option<WarnLevel> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u32>() {
+        return WarnLevel::from_int(n);
+    }
+    match s {
+        "true" => Some(WarnLevel::Warn),
+        "false" => Some(WarnLevel::Ignore),
+        _ => None,
+    }
 }
 
 /// Parse a `<major>.<minor>` string (ignoring any trailing `.patch`) into `(major, minor)`.
