@@ -766,13 +766,18 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
         (godot-demo-projects, EOL-normalised): byte-exact 14% → **45%**; `format(gold)==gold` for
         **426/455** token-compatible files (was 70). Corpus safety (544 files, safe_mode OFF): 0
         non-parsing, 0 token changes, 0 idempotence breaks.
+      - [x] **Length-driven line reflow — DONE (Phase 4C, same branch).** A single-line statement that
+        exceeds `line_width` and contains a bracketed group is wrapped flat → compact → exploded via a
+        small `Doc`-IR (`FmtConfig::reflow`, default on). **Token-preserving** (no trailing comma added);
+        byte-identical to gdformat on the corpus for the cases it handles. Only single-physical-line
+        statements are reflowed (already-wrapped statements preserved → idempotent). Differential after
+        reflow: byte-exact **51%** (godot) / **33%** (ReactiveUI), EOL-normalised; corpus safety (544
+        files, safe_mode OFF): 0 non-parsing, 0 token changes, 0 idempotence breaks.
       Remaining for full `gdformat` parity (all captured in **`crates/gdscript-fmt/DEVIATIONS.md`**
-      with oracle-verified before/after shapes): **the line-reflow Doc-IR** — *length-driven* wrapping
-      of long calls/arrays/dicts (compact → exploded; **token-preserving**, the planned next increment)
-      — plus the **token-mutating** behaviours that need the safety net relaxed to AST-equivalence
-      (magic trailing comma, operator-chain paren injection, string-quote normalisation, wrapped-chain
-      `. method` padding), and **`format_range`** (range formatting for LSP). The reflow tail is
-      additive on the established `format()` API + safety net.
+      with oracle-verified before/after shapes): the **token-mutating** behaviours that need the safety
+      net relaxed to AST-equivalence (magic trailing comma, operator-chain paren injection, string-quote
+      normalisation, wrapped-chain `. method` padding), and **`format_range`** (range formatting for
+      LSP). These are additive on the established `format()` API + safety net.
 - [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
 - [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain

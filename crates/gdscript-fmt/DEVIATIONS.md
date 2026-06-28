@@ -15,11 +15,12 @@ records where we match, where we deliberately differ, and what is not yet implem
 - **fixpoint** — `format(gdformat(original))` equals `gdformat(original)`: do we *preserve*
   gdformat's own output? This isolates our remaining gaps from the wrapping we don't yet do.
 
-As of the blank-line-insertion + boundary-comment-indentation + EOL work (Phase 4C), over
-`godot-demo-projects` (455 clean-parsing files, EOL-normalised):
+As of Phase 4C (blank-line insertion + boundary-comment indentation + EOL preservation +
+length-driven reflow), EOL-normalised:
 
-- exact match: **~45%** (up from ~14% before Phase 4C)
-- fixpoint `format(gold)==gold`: **426 / 455** token-compatible files
+- exact match: **~51%** over `godot-demo-projects` (455 files; up from ~14% before 4C), **~33%** over
+  the denser `ReactiveUI-Gadot` library code (up from ~2%)
+- fixpoint `format(gold)==gold`: **426 / 455** token-compatible godot files (was 70)
 
 Corpus safety (all 544 clean files, `safe_mode` OFF): **0** non-parsing outputs, **0**
 token-sequence changes, **0** idempotence breaks. The safety net is never the thing that makes us
@@ -46,28 +47,28 @@ correct on this corpus — the passes are correct on their own.
    (This is also why the corpus "exact match" is measured EOL-normalised: the Windows oracle output is
    CRLF while the LF originals are not.)
 
-## Not yet implemented (tracked in `TECH_DEBT.md`, W3)
+## Implemented — line reflow / wrapping (length-driven)
 
-### Line reflow / wrapping — gdformat's exact behaviour (captured from the oracle)
+A **single-line** statement that does not fit in `line_width` (default 100) and contains a bracketed
+group (`(...)`, `[...]`, `{...}`, or a function parameter list) is wrapped via a `Doc`-IR that tries
+**flat → compact → exploded** with a width check — **token-preserving** (no trailing comma added),
+byte-identical to gdformat on the corpus:
 
-A bracketed group (`(...)`, `[...]`, `{...}`) or a function parameter list that does not fit in
-`line_width` (default 100) is laid out in one of two **length-driven** modes — both of which keep the
-same token sequence (no trailing comma is added):
-
-- **compact** — the default: open bracket stays on the line, **all** elements go on **one** indented
-  continuation line (`", "`-separated), close bracket on its own line. Used when that single
-  continuation line fits.
+- **compact** — open bracket stays on the line, **all** elements on **one** indented continuation
+  line (`", "`-separated), close bracket on its own line. Used when that line fits.
   ```gdscript
   var x = some_function(
       argument_one, argument_two, argument_three, argument_four, arg_five
   )
   ```
-- **exploded** — when even the compact continuation line is too long: **one element per line**, close
-  bracket on its own line, **no** trailing comma. Elements are themselves reflowed recursively (a
-  nested group that fits stays inline).
+- **exploded** — when even the compact line is too long: **one element per line**, close on its own
+  line, **no** trailing comma; elements are reflowed recursively (a nested group that fits stays
+  inline).
 
-These are **token-preserving** and are the planned next increment (a Wadler/Prettier-style `Doc`-IR
-that tries flat → compact → exploded with a width check).
+Gated behind `FmtConfig::reflow` (default on). *Only single-physical-line statements are reflowed*
+(an already-wrapped statement is preserved) — this keeps the pass trivially idempotent. Statements
+that are **left unwrapped** (a documented gap, not a bug): those with a magic trailing comma (see §2),
+a long bracketless operator chain (§3), an inline comment, or no bracket group at all.
 
 ### Token-mutating behaviours (require relaxing the significant-token safety net to AST-equivalence)
 

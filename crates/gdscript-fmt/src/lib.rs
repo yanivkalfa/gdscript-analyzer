@@ -19,8 +19,11 @@
 //! the significant token sequence changed. So it never corrupts code, even input it doesn't fully
 //! understand. The result is idempotent: `format(format(x)) == format(x)`.
 //!
-//! Line-reflow / wrapping (full `gdformat` parity via a Wadler/Prettier `Doc`-IR pretty-printer)
-//! is the documented next step — see `TECH_DEBT.md`.
+//! It also performs **length-driven line reflow** (Phase-4 increment C): a single-line statement
+//! that exceeds `line_width` and contains a bracketed group is wrapped flat → compact → exploded via
+//! a small `Doc`-IR, matching gdformat and preserving the token sequence. The remaining gdformat
+//! behaviours (magic trailing comma, operator-chain paren injection, quote normalization) are
+//! token-mutating and documented in `DEVIATIONS.md`.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use gdscript_syntax::SyntaxKind;
@@ -36,7 +39,7 @@ pub struct FmtConfig {
     pub use_tabs: bool,
     /// Spaces per indent level when `use_tabs` is `false`.
     pub indent_size: usize,
-    /// The target line width for reflow. **Reserved** — line-wrapping is not yet implemented.
+    /// The target line width for [`reflow`](Self::reflow) (default 100).
     pub line_width: usize,
     /// Normalize intra-line spacing between tokens (one space around binary operators, after
     /// `,`/`:`, hugged brackets, tight member access + unary). On by default. Turn off to format
@@ -49,6 +52,10 @@ pub struct FmtConfig {
     /// `static func`, 1 around nested ones; comments/annotations attached to a def move with it). On
     /// by default. Purely additive — never changes the significant token sequence.
     pub insert_blank_lines: bool,
+    /// Wrap a single-line statement that exceeds [`line_width`](Self::line_width) and contains a
+    /// bracketed group (call / array / dict / parameter list) — flat → compact → exploded, matching
+    /// gdformat's length-driven layout. On by default. Token-preserving (no trailing comma added).
+    pub reflow: bool,
     /// Re-parse + significant-token-equality fallback to verbatim. Keep on unless you have a
     /// reason not to: it is the guarantee the formatter never changes meaning.
     pub safe_mode: bool,
@@ -63,6 +70,7 @@ impl Default for FmtConfig {
             normalize_spacing: true,
             collapse_blank_lines: true,
             insert_blank_lines: true,
+            reflow: true,
             safe_mode: true,
         }
     }
@@ -107,6 +115,10 @@ fn format_lf(source: &str, config: &FmtConfig) -> String {
     if config.insert_blank_lines {
         // Purely additive (only inserts blank lines), so the significant-token net still holds.
         out = insert_def_blanks(&out, config);
+    }
+    if config.reflow {
+        // Length-driven wrapping; token-preserving (no trailing comma added).
+        out = reflow(&out, config);
     }
     if config.safe_mode {
         // The safety net is two-layered, because each catches what the other cannot:
@@ -863,6 +875,398 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
     out
 }
 
+// ===================== line reflow (length-driven wrapping) =====================
+//
+// A statement that does not fit in `line_width` and contains a bracketed group is wrapped the way
+// gdformat does: try the group **flat**; if it does not fit, **compact** (all elements on one
+// indented continuation line, close bracket on its own line); if even that does not fit, **exploded**
+// (one element per line, recursively). No trailing comma is added, so the token sequence is
+// preserved. Only statements that occupy a single physical line are reflowed (so the pass is trivially
+// idempotent — a wrapped statement spans bracket-continuation lines that are skipped on the next run).
+
+/// One rendered token: its text and whether a single space precedes it in the flat form.
+struct Atom {
+    text: String,
+    space: bool,
+}
+
+/// A reflow document node: a text run, or a bracketed group of comma-separated element sequences.
+enum ReflowDoc {
+    Text {
+        text: String,
+        space: bool,
+    },
+    Group {
+        space: bool,
+        open: String,
+        elems: Vec<Vec<ReflowDoc>>,
+        close: &'static str,
+    },
+}
+
+fn open_close(text: &str) -> Option<&'static str> {
+    match text {
+        "(" => Some(")"),
+        "[" => Some("]"),
+        "{" => Some("}"),
+        _ => None,
+    }
+}
+
+/// Display columns of a content string (no tabs — those only appear in leading indentation).
+fn cols(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Build the comma-separated element sequences of a group whose contents start at `atoms[*i]`,
+/// consuming through the matching `close` (or to the end when `close` is `None`, for the top level).
+fn build_elems(atoms: &[Atom], i: &mut usize, close: Option<&str>) -> Vec<Vec<ReflowDoc>> {
+    let mut elems: Vec<Vec<ReflowDoc>> = Vec::new();
+    let mut cur: Vec<ReflowDoc> = Vec::new();
+    let mut elem_start = true;
+    while *i < atoms.len() {
+        let a = &atoms[*i];
+        if close == Some(a.text.as_str()) {
+            *i += 1;
+            break;
+        }
+        if a.text == "," {
+            elems.push(std::mem::take(&mut cur));
+            elem_start = true;
+            *i += 1;
+            continue;
+        }
+        let space = !elem_start && a.space;
+        if let Some(cl) = open_close(&a.text) {
+            let open = a.text.clone();
+            *i += 1;
+            let inner = build_elems(atoms, i, Some(cl));
+            cur.push(ReflowDoc::Group {
+                space,
+                open,
+                elems: inner,
+                close: cl,
+            });
+        } else {
+            cur.push(ReflowDoc::Text {
+                text: a.text.clone(),
+                space,
+            });
+            *i += 1;
+        }
+        elem_start = false;
+    }
+    if !cur.is_empty() {
+        elems.push(cur);
+    }
+    elems
+}
+
+fn flat_seq(docs: &[ReflowDoc]) -> String {
+    let mut out = String::new();
+    for d in docs {
+        match d {
+            ReflowDoc::Text { text, space } => {
+                if *space {
+                    out.push(' ');
+                }
+                out.push_str(text);
+            }
+            ReflowDoc::Group {
+                space,
+                open,
+                elems,
+                close,
+            } => {
+                if *space {
+                    out.push(' ');
+                }
+                out.push_str(open);
+                out.push_str(&flat_group_contents(elems));
+                out.push_str(close);
+            }
+        }
+    }
+    out
+}
+
+fn flat_group_contents(elems: &[Vec<ReflowDoc>]) -> String {
+    elems
+        .iter()
+        .map(|e| flat_seq(e))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Render a sequence (one element) at base `indent`, starting at column `col`, wrapping any group
+/// that does not fit. Returns the text and the ending column.
+fn render_seq(
+    docs: &[ReflowDoc],
+    indent: usize,
+    mut col: usize,
+    cfg: &FmtConfig,
+    tw: usize,
+    unit: &str,
+) -> (String, usize) {
+    let mut out = String::new();
+    for d in docs {
+        match d {
+            ReflowDoc::Text { text, space } => {
+                if *space {
+                    out.push(' ');
+                    col += 1;
+                }
+                out.push_str(text);
+                col += cols(text);
+            }
+            ReflowDoc::Group {
+                space,
+                open,
+                elems,
+                close,
+            } => {
+                if *space {
+                    out.push(' ');
+                    col += 1;
+                }
+                let (g, end) = render_group(open, elems, close, indent, col, cfg, tw, unit);
+                out.push_str(&g);
+                col = end;
+            }
+        }
+    }
+    (out, col)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a focused internal renderer threading layout state"
+)]
+fn render_group(
+    open: &str,
+    elems: &[Vec<ReflowDoc>],
+    close: &str,
+    indent: usize,
+    col: usize,
+    cfg: &FmtConfig,
+    tw: usize,
+    unit: &str,
+) -> (String, usize) {
+    // flat: the whole group on the current line.
+    let flat = format!("{open}{}{close}", flat_group_contents(elems));
+    if col + cols(&flat) <= cfg.line_width || elems.is_empty() {
+        let end = col + cols(&flat);
+        return (flat, end);
+    }
+    let inner = indent + 1;
+    let inner_col = inner * tw;
+    let close_end = indent * tw + cols(close);
+    // compact: all elements on one indented continuation line.
+    let contents = flat_group_contents(elems);
+    if inner_col + cols(&contents) <= cfg.line_width {
+        let s = format!(
+            "{open}\n{ind}{contents}\n{base}{close}",
+            ind = unit.repeat(inner),
+            base = unit.repeat(indent),
+        );
+        return (s, close_end);
+    }
+    // exploded: one element per line (each rendered recursively); no trailing comma.
+    let mut s = String::from(open);
+    s.push('\n');
+    for (k, elem) in elems.iter().enumerate() {
+        s.push_str(&unit.repeat(inner));
+        let (es, _) = render_seq(elem, inner, inner_col, cfg, tw, unit);
+        s.push_str(&es);
+        if k + 1 < elems.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    s.push_str(&unit.repeat(indent));
+    s.push_str(close);
+    (s, close_end)
+}
+
+/// Parse a single physical line's content into reflow atoms, or `None` if it is not a clean,
+/// reflowable single-line statement (has a comment, an error/continuation token, unbalanced or
+/// negative bracket nesting, a magic trailing comma, or a flat reconstruction that does not match).
+fn line_atoms(body: &str) -> Option<Vec<Atom>> {
+    use SyntaxKind as S;
+    let toks = gdscript_syntax::tokenize(body);
+    let mut atoms: Vec<Atom> = Vec::new();
+    let mut space = false;
+    let mut depth: i32 = 0;
+    for t in &toks {
+        match t.kind {
+            S::Whitespace => space = true,
+            S::Bom => {}
+            S::LineComment
+            | S::DocComment
+            | S::RegionComment
+            | S::EndRegionComment
+            | S::LineContinuation => return None,
+            k => {
+                if matches!(k, S::LParen | S::LBrack | S::LBrace) {
+                    depth += 1;
+                } else if matches!(k, S::RParen | S::RBrack | S::RBrace) {
+                    depth -= 1;
+                    if depth < 0 {
+                        return None;
+                    }
+                    // A magic trailing comma forces gdformat's exploded-with-comma mode (token
+                    // mutating); we leave such a statement unwrapped rather than drop the comma.
+                    if atoms.last().is_some_and(|a| a.text == ",") {
+                        return None;
+                    }
+                }
+                atoms.push(Atom {
+                    text: body[t.range].to_string(),
+                    space,
+                });
+                space = false;
+            }
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    Some(atoms)
+}
+
+/// Reflow over-long single-line statements. Token-preserving; safe to run last.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cohesive pass: cross-line bracket/straddle bookkeeping then a per-line reflow decision"
+)]
+fn reflow(formatted: &str, config: &FmtConfig) -> String {
+    use SyntaxKind as S;
+    if config.line_width == 0 {
+        return formatted.to_owned();
+    }
+    let tw = if config.use_tabs {
+        4
+    } else {
+        config.indent_size.max(1)
+    };
+    let unit = config.indent_unit();
+    let lines: Vec<&str> = formatted.split('\n').collect();
+
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            formatted
+                .bytes()
+                .enumerate()
+                .filter_map(|(i, b)| (b == b'\n').then_some(i + 1)),
+        )
+        .collect();
+    let line_of = |off: usize| line_starts.partition_point(|&s| s <= off).saturating_sub(1);
+
+    // Cross-line bracket depth at each line's start + lines covered by a multi-line token (e.g. a
+    // `"""..."""` string) + lines ending in a `\` continuation — all disqualify a line from reflow.
+    let raw = gdscript_syntax::tokenize(formatted);
+    let mut start_depth = vec![i32::MIN; lines.len()];
+    let mut straddled = vec![false; lines.len()];
+    let mut ends_cont = vec![false; lines.len()];
+    let mut depth: i32 = 0;
+    for t in &raw {
+        let s = usize::from(t.range.start());
+        let e = usize::from(t.range.end()).saturating_sub(1).max(s);
+        let (sl, el) = (line_of(s), line_of(e));
+        if sl < start_depth.len() && start_depth[sl] == i32::MIN {
+            start_depth[sl] = depth;
+        }
+        if el > sl {
+            let end = el.min(lines.len().saturating_sub(1));
+            straddled[sl..=end].fill(true);
+        }
+        match t.kind {
+            S::LParen | S::LBrack | S::LBrace => depth += 1,
+            S::RParen | S::RBrack | S::RBrace => depth -= 1,
+            S::LineContinuation if sl < ends_cont.len() => ends_cont[sl] = true,
+            _ => {}
+        }
+    }
+
+    let mut out = String::with_capacity(formatted.len());
+    for (li, &line) in lines.iter().enumerate() {
+        let last = li + 1 == lines.len();
+        if let Some(wrapped) = try_reflow_line(
+            line,
+            li,
+            &start_depth,
+            &straddled,
+            &ends_cont,
+            config,
+            tw,
+            &unit,
+        ) {
+            out.push_str(&wrapped);
+        } else {
+            out.push_str(line);
+        }
+        if !last {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a focused single-call-site helper"
+)]
+fn try_reflow_line(
+    line: &str,
+    li: usize,
+    start_depth: &[i32],
+    straddled: &[bool],
+    ends_cont: &[bool],
+    config: &FmtConfig,
+    tw: usize,
+    unit: &str,
+) -> Option<String> {
+    if line.trim().is_empty()
+        || start_depth.get(li).copied().unwrap_or(0) != 0
+        || straddled.get(li).copied().unwrap_or(false)
+        || ends_cont.get(li).copied().unwrap_or(false)
+        || (li > 0 && ends_cont.get(li - 1).copied().unwrap_or(false))
+    {
+        return None;
+    }
+    let indent_chars = line.len() - line.trim_start_matches(['\t', ' ']).len();
+    let body = &line[indent_chars..];
+    let indent = if config.use_tabs {
+        line.bytes().take_while(|&b| b == b'\t').count()
+    } else {
+        line.bytes()
+            .take_while(|&b| b == b' ')
+            .count()
+            .checked_div(config.indent_size)
+            .unwrap_or(0)
+    };
+    let width = indent * tw + cols(body);
+    if width <= config.line_width {
+        return None;
+    }
+    let atoms = line_atoms(body)?;
+    if !atoms.iter().any(|a| open_close(&a.text).is_some()) {
+        return None; // nothing to wrap
+    }
+    let docs = build_elems(&atoms, &mut 0, None);
+    if docs.len() != 1 {
+        return None; // a top-level comma — not a normal statement; leave it
+    }
+    let top = &docs[0];
+    // Faithfulness check: only reflow when our flat reconstruction is byte-identical to the input.
+    if flat_seq(top) != *body {
+        return None;
+    }
+    let (rendered, _) = render_seq(top, indent, indent * tw, config, tw, unit);
+    let result = format!("{}{rendered}", unit.repeat(indent));
+    (result != line).then_some(result)
+}
+
 /// Trim trailing spaces/tabs from the end of `out` (the current line).
 fn trim_trailing_inline_ws(out: &mut String) {
     while out.ends_with(' ') || out.ends_with('\t') {
@@ -1419,5 +1823,87 @@ mod tests {
     fn lf_files_stay_lf() {
         let src = "func a():\n\tpass\n";
         assert!(!fmt(src).contains('\r'));
+    }
+
+    // ---- Phase-4 increment C: length-driven reflow ----
+
+    #[test]
+    fn reflow_compact_call() {
+        let src = "func f():\n\tvar long_call = some_function(argument_one, argument_two, argument_three, argument_four, arg_five)\n";
+        assert_eq!(
+            fmt(src),
+            "func f():\n\tvar long_call = some_function(\n\t\targument_one, argument_two, argument_three, argument_four, arg_five\n\t)\n"
+        );
+        assert_eq!(fmt(&fmt(src)), fmt(src), "idempotent");
+    }
+
+    #[test]
+    fn reflow_compact_array_and_dict() {
+        let arr = "func f():\n\tvar arr = [element_one, element_two, element_three, element_four, element_five, element_six, seven]\n";
+        assert_eq!(
+            fmt(arr),
+            "func f():\n\tvar arr = [\n\t\telement_one, element_two, element_three, element_four, element_five, element_six, seven\n\t]\n"
+        );
+        let dct = "func f():\n\tvar d = {\"key_one\": value_one, \"key_two\": value_two, \"key_three\": value_three, \"key4\": value_four}\n";
+        assert_eq!(
+            fmt(dct),
+            "func f():\n\tvar d = {\n\t\t\"key_one\": value_one, \"key_two\": value_two, \"key_three\": value_three, \"key4\": value_four\n\t}\n"
+        );
+    }
+
+    #[test]
+    fn reflow_exploded_when_compact_too_long() {
+        // When even the single compact continuation line exceeds the width, explode one per line —
+        // with NO trailing comma (length-driven). Byte-identical to gdformat.
+        let src = "func f():\n\tvar x = process_data(first_long_argument_name_here, second_long_argument_name_here, third_long_argument_name_here, fourth_argument)\n";
+        assert_eq!(
+            fmt(src),
+            "func f():\n\tvar x = process_data(\n\t\tfirst_long_argument_name_here,\n\t\tsecond_long_argument_name_here,\n\t\tthird_long_argument_name_here,\n\t\tfourth_argument\n\t)\n"
+        );
+        assert_eq!(fmt(&fmt(src)), fmt(src), "idempotent");
+    }
+
+    #[test]
+    fn reflow_nested_outer_explodes_inner_stays_inline() {
+        let src = "func f():\n\tvar n = outermost_call(inner_first(aaaa, bbbb, cccc, dddd), inner_second(eeee, ffff, gggg, hhhh), inner_third(iiii, jjjj, kkkk))\n";
+        assert_eq!(
+            fmt(src),
+            "func f():\n\tvar n = outermost_call(\n\t\tinner_first(aaaa, bbbb, cccc, dddd),\n\t\tinner_second(eeee, ffff, gggg, hhhh),\n\t\tinner_third(iiii, jjjj, kkkk)\n\t)\n"
+        );
+    }
+
+    #[test]
+    fn reflow_short_lines_stay_flat() {
+        let src = "func f():\n\tvar short = call(a, b, c)\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn reflow_magic_trailing_comma_is_left_unwrapped() {
+        // A magic trailing comma forces gdformat's exploded-WITH-comma mode (token-mutating); we
+        // leave it unwrapped rather than drop the comma. Token sequence is preserved.
+        let src = "func f():\n\tvar magic = some_call_here(aaaa, bbbb, cccc, dddd, eeee, ffff, gggg, hhhh, iiii, jjjj, kk,)\n";
+        let out = fmt(src);
+        assert!(out.contains("kk,)"), "trailing comma preserved: {out:?}");
+        assert!(super::same_significant_tokens(src, &out));
+    }
+
+    #[test]
+    fn reflow_off_leaves_long_lines() {
+        let cfg = FmtConfig {
+            reflow: false,
+            ..FmtConfig::default()
+        };
+        let src = "func f():\n\tvar long_call = some_function(argument_one, argument_two, argument_three, argument_four, arg_five)\n";
+        // spacing still normalized, but no wrapping
+        assert_eq!(format(src, &cfg), src);
+    }
+
+    #[test]
+    fn reflow_preserves_already_wrapped_statements() {
+        // A statement that is already wrapped (spans bracket-continuation lines) is left as-is — the
+        // reflow only touches single-physical-line statements, which is what makes it idempotent.
+        let src = "func f():\n\tvar n = outermost_call(\n\t\tinner_first(aaaa, bbbb, cccc, dddd),\n\t\tinner_second(eeee, ffff, gggg, hhhh),\n\t\tinner_third(iiii, jjjj, kkkk)\n\t)\n";
+        assert_eq!(fmt(src), src);
     }
 }
