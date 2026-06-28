@@ -358,6 +358,9 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         });
     }
 
+    // File-level (member) warnings that need the whole item-tree, not a single body.
+    raw_warnings.extend(member_level_warnings(db, api, root, &tree));
+
     // Pass 1 — class fields. Inferring each `var`/`const` seeds `member_types` so the function
     // pass sees the *inferred* field type (`var n := 0` → `int`), not just the annotation.
     //
@@ -437,6 +440,97 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         units,
         diagnostics,
         raw_warnings,
+    }
+}
+
+/// File-level (member) warnings that need the whole item-tree, not a single body (W1):
+/// `ENUM_VARIABLE_WITHOUT_DEFAULT` on an enum-typed field with no initializer, and `UNUSED_SIGNAL`
+/// on a signal never referenced anywhere in the file. Both are sound + conservative.
+fn member_level_warnings(
+    db: &dyn Db,
+    api: &EngineApi,
+    root: &GdNode,
+    tree: &ItemTree,
+) -> Vec<RawWarning> {
+    let mut out = Vec::new();
+    let has_signal = tree.members.iter().any(|m| matches!(m, Member::Signal(_)));
+    // Only pay for the whole-file name scan when there is a signal to judge.
+    let uses = has_signal.then(|| NameUses::collect(root));
+    for m in &tree.members {
+        match m {
+            // An enum-typed field with no initializer (the local case is in `infer_local_var`).
+            Member::Var(v) if !v.has_init => {
+                if let Some(tref) = &v.type_ref
+                    && matches!(resolve::resolve_type_name(db, api, tref), Ty::Enum(_))
+                {
+                    out.push(RawWarning {
+                        range: v.name_range,
+                        code: WarningCode::EnumVariableWithoutDefault,
+                        message: format!(
+                            "The enum variable \"{}\" has no default value (it defaults to 0, which may not be a valid enum value).",
+                            v.name
+                        ),
+                    });
+                }
+            }
+            // A signal never referenced in this file (emit/connect/string). Same-file only, like
+            // Godot — a signal connected purely from a scene/other file is invisible (the known
+            // limitation); the conservative scan only warns when the name appears nowhere else.
+            Member::Signal(s) => {
+                if let Some(uses) = &uses
+                    && !uses.is_referenced(&s.name)
+                {
+                    out.push(RawWarning {
+                        range: s.name_range,
+                        code: WarningCode::UnusedSignal,
+                        message: format!(
+                            "The signal \"{}\" is never emitted or connected in this file.",
+                            s.name
+                        ),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Identifier-occurrence counts + string-literal contents across a file's CST — the file-wide
+/// "is this name referenced anywhere?" check (drives `UNUSED_SIGNAL`).
+struct NameUses {
+    ident_counts: FxHashMap<SmolStr, u32>,
+    strings: FxHashSet<SmolStr>,
+}
+
+impl NameUses {
+    fn collect(root: &GdNode) -> Self {
+        let mut ident_counts: FxHashMap<SmolStr, u32> = FxHashMap::default();
+        let mut strings: FxHashSet<SmolStr> = FxHashSet::default();
+        for node in gdscript_syntax::ast::descendants(root) {
+            for el in node.children_with_tokens() {
+                let Some(tok) = el.into_token() else { continue };
+                match tok.kind() {
+                    gdscript_syntax::SyntaxKind::Ident => {
+                        *ident_counts.entry(SmolStr::new(tok.text())).or_insert(0) += 1;
+                    }
+                    gdscript_syntax::SyntaxKind::String => {
+                        strings.insert(SmolStr::new(tok.text().trim_matches(['"', '\''])));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            ident_counts,
+            strings,
+        }
+    }
+
+    /// Whether `name` is referenced beyond its single declaration — a 2nd identifier occurrence, or
+    /// any string literal naming it (covering `emit_signal("name")` / `connect("name", …)`).
+    fn is_referenced(&self, name: &str) -> bool {
+        self.ident_counts.get(name).copied().unwrap_or(0) > 1 || self.strings.contains(name)
     }
 }
 
@@ -2372,6 +2466,34 @@ mod tests {
             "{:?}",
             codes(&h)
         );
+    }
+
+    #[test]
+    fn enum_member_without_default_warns() {
+        let codes = file_codes("var err: Error\nfunc f():\n\tpass\n");
+        assert!(
+            codes.iter().any(|c| c == "ENUM_VARIABLE_WITHOUT_DEFAULT"),
+            "{:?}",
+            codes
+        );
+    }
+
+    #[test]
+    fn unused_signal_warns() {
+        let codes = file_codes("signal my_event\nfunc f():\n\tpass\n");
+        assert!(codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{:?}", codes);
+    }
+
+    #[test]
+    fn emitted_signal_is_not_unused() {
+        let codes = file_codes("signal my_event\nfunc f():\n\tmy_event.emit()\n");
+        assert!(!codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{:?}", codes);
+    }
+
+    #[test]
+    fn signal_connected_by_string_is_not_unused() {
+        let codes = file_codes("signal my_event\nfunc f():\n\tconnect(\"my_event\", Callable())\n");
+        assert!(!codes.iter().any(|c| c == "UNUSED_SIGNAL"), "{:?}", codes);
     }
 
     #[test]
