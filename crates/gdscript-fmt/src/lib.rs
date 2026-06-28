@@ -56,6 +56,10 @@ pub struct FmtConfig {
     /// bracketed group (call / array / dict / parameter list) — flat → compact → exploded, matching
     /// gdformat's length-driven layout. On by default. Token-preserving (no trailing comma added).
     pub reflow: bool,
+    /// Normalize string-literal quotes to gdformat's style: prefer `"`, fall back to `'` only when
+    /// the body has more `"` than `'`. On by default. Preserves the string's value (a token-mutating
+    /// rewrite guarded by the meaning-equivalence net).
+    pub normalize_strings: bool,
     /// Re-parse + significant-token-equality fallback to verbatim. Keep on unless you have a
     /// reason not to: it is the guarantee the formatter never changes meaning.
     pub safe_mode: bool,
@@ -71,6 +75,7 @@ impl Default for FmtConfig {
             collapse_blank_lines: true,
             insert_blank_lines: true,
             reflow: true,
+            normalize_strings: true,
             safe_mode: true,
         }
     }
@@ -122,8 +127,10 @@ fn format_lf(source: &str, config: &FmtConfig) -> String {
     }
     if config.safe_mode {
         // The safety net is two-layered, because each catches what the other cannot:
-        // (1) significant-token equality catches a dropped / reordered / corrupted *token*;
-        if !same_significant_tokens(source, &out) {
+        // (1) meaning-equivalence catches a dropped / reordered / corrupted *token* — while
+        //     normalising away the rewrites the formatter is allowed to make (string-quote style,
+        //     trailing commas);
+        if !meaning_preserved(source, &out) {
             return source.to_owned();
         }
         // (2) a parse-validity recheck catches a meaning-changing *indentation* edit — indentation
@@ -552,7 +559,18 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 }
                 pending_ws = None;
                 just_broke = false;
-                out.push_str(text);
+                // String literals are normalized to gdformat's canonical quote style (value-
+                // preserving; guarded by the meaning-equivalence net). Everything else is verbatim.
+                if config.normalize_strings
+                    && matches!(
+                        t.kind,
+                        SyntaxKind::String | SyntaxKind::StringName | SyntaxKind::NodePath
+                    )
+                {
+                    out.push_str(&canonical_string(text));
+                } else {
+                    out.push_str(text);
+                }
                 // Any token reaching here (a significant token or a comment) is line content.
                 line_had_content = true;
                 seen_content = true;
@@ -1274,10 +1292,9 @@ fn trim_trailing_inline_ws(out: &mut String) {
     }
 }
 
-/// Whether two sources lex to the same sequence of significant (non-trivia) tokens — the
-/// meaning-preservation check. Whitespace / newline / comment trivia are ignored (that is what the
-/// formatter is allowed to change); literals (including multi-line strings) are significant, so a
-/// corrupted string would be caught here.
+/// Whether two sources lex to the same sequence of significant (non-trivia) tokens — the strict
+/// token-preservation check, used by the token-*preserving* passes' tests.
+#[cfg(test)]
 fn same_significant_tokens(a: &str, b: &str) -> bool {
     fn sig(s: &str) -> Vec<(SyntaxKind, &str)> {
         gdscript_syntax::tokenize(s)
@@ -1287,6 +1304,122 @@ fn same_significant_tokens(a: &str, b: &str) -> bool {
             .collect()
     }
     sig(a) == sig(b)
+}
+
+/// Re-emit a string-literal token's text in gdformat's canonical quote style: prefer `"`, fall back
+/// to `'` only when the body has more `"` than `'` (fewer escapes), keeping the prefix (`r`/`&`/`^`)
+/// and the decoded value. Idempotent. Triple-quoted strings are left verbatim (rare; not normalized).
+fn canonical_string(text: &str) -> String {
+    let Some(qpos) = text.find(['"', '\'']) else {
+        return text.to_owned(); // defensive: not actually a string literal
+    };
+    let prefix = &text[..qpos];
+    let rest = &text[qpos..];
+    let rb = rest.as_bytes();
+    let quote = rb[0];
+    // Triple-quoted (`'''`/`"""`): leave verbatim.
+    if rb.len() >= 6 && rb[1] == quote && rb[2] == quote {
+        return text.to_owned();
+    }
+    if rest.len() < 2 || rb[rest.len() - 1] != quote {
+        return text.to_owned(); // unterminated / malformed: don't touch
+    }
+    let body = &rest[1..rest.len() - 1];
+    // Raw strings (`r"..."`) cannot escape — only switch quotes if the body lacks the target.
+    if prefix.contains('r') {
+        let target = if !body.contains('"') {
+            '"'
+        } else if !body.contains('\'') {
+            '\''
+        } else {
+            quote as char
+        };
+        return format!("{prefix}{target}{body}{target}");
+    }
+    // Parse the body into units (escaped or literal) and count the value's quote characters.
+    let mut units: Vec<(bool, char)> = Vec::new();
+    let (mut dq, mut sq) = (0usize, 0usize);
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                units.push((true, n));
+                match n {
+                    '"' => dq += 1,
+                    '\'' => sq += 1,
+                    _ => {}
+                }
+            } else {
+                units.push((false, '\\'));
+            }
+        } else {
+            units.push((false, c));
+            match c {
+                '"' => dq += 1,
+                '\'' => sq += 1,
+                _ => {}
+            }
+        }
+    }
+    let target = if dq > sq { '\'' } else { '"' };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(prefix);
+    out.push(target);
+    for (esc, c) in units {
+        if c == '"' || c == '\'' {
+            if c == target {
+                out.push('\\');
+            }
+            out.push(c);
+        } else {
+            if esc {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    out.push(target);
+    out
+}
+
+/// Whether `a` and `b` are **meaning-equivalent** — the relaxed safety net used once the formatter
+/// performs token-*mutating* rewrites. Equivalent to [`same_significant_tokens`] except it normalises
+/// away exactly the differences gdformat is allowed to introduce: a **trailing comma** (a `,`
+/// immediately before a closing bracket) is dropped, and **string literals are compared by their
+/// canonical quote form** (so `'x'` ≡ `"x"`). A dropped/added real token or a changed string *value*
+/// is still caught.
+fn meaning_preserved(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> Vec<(SyntaxKind, String)> {
+        let toks: Vec<_> = gdscript_syntax::tokenize(s)
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia())
+            .collect();
+        let mut out = Vec::with_capacity(toks.len());
+        for (i, t) in toks.iter().enumerate() {
+            if t.kind == SyntaxKind::Comma
+                && toks.get(i + 1).is_some_and(|n| {
+                    matches!(
+                        n.kind,
+                        SyntaxKind::RParen | SyntaxKind::RBrack | SyntaxKind::RBrace
+                    )
+                })
+            {
+                continue; // a trailing comma — gdformat may add or drop it
+            }
+            let text = &s[t.range];
+            let norm = if matches!(
+                t.kind,
+                SyntaxKind::String | SyntaxKind::StringName | SyntaxKind::NodePath
+            ) {
+                canonical_string(text)
+            } else {
+                text.to_owned()
+            };
+            out.push((t.kind, norm));
+        }
+        out
+    }
+    norm(a) == norm(b)
 }
 
 #[cfg(test)]
@@ -1905,5 +2038,51 @@ mod tests {
         // reflow only touches single-physical-line statements, which is what makes it idempotent.
         let src = "func f():\n\tvar n = outermost_call(\n\t\tinner_first(aaaa, bbbb, cccc, dddd),\n\t\tinner_second(eeee, ffff, gggg, hhhh),\n\t\tinner_third(iiii, jjjj, kkkk)\n\t)\n";
         assert_eq!(fmt(src), src);
+    }
+
+    // ---- Phase-4: string-quote normalization (gdformat / Black rule) ----
+
+    #[test]
+    fn canonical_string_rules() {
+        use super::canonical_string as c;
+        assert_eq!(c("'simple'"), "\"simple\""); // prefer double
+        assert_eq!(c("\"already\""), "\"already\""); // unchanged
+        assert_eq!(c("'has \"x\" in'"), "'has \"x\" in'"); // more " than ' -> keep single
+        assert_eq!(c("'a\\'b'"), "\"a'b\""); // escaped ' -> double, unescaped
+        assert_eq!(c("'both \" and \\' x'"), "\"both \\\" and ' x\""); // tie -> double, re-escape
+        assert_eq!(c("&'name'"), "&\"name\""); // StringName prefix kept
+        assert_eq!(c("^'a/b'"), "^\"a/b\""); // NodePath prefix kept
+        assert_eq!(c("r'raw\\n'"), "r\"raw\\n\""); // raw: body verbatim
+        assert_eq!(c("r'has \"x\"'"), "r'has \"x\"'"); // raw with " -> keep single (cannot escape)
+        assert_eq!(c("'''triple'''"), "'''triple'''"); // triple left verbatim
+        assert_eq!(c("'\\t\\n'"), "\"\\t\\n\""); // non-quote escapes preserved
+    }
+
+    #[test]
+    fn quote_normalization_in_format() {
+        assert_eq!(fmt("var a = 'simple'\n"), "var a = \"simple\"\n");
+        assert_eq!(fmt("var b = 'has \"x\" in'\n"), "var b = 'has \"x\" in'\n");
+        assert_eq!(fmt("var f = &'n'\n"), "var f = &\"n\"\n");
+        // idempotent
+        assert_eq!(fmt("var a = \"simple\"\n"), "var a = \"simple\"\n");
+    }
+
+    #[test]
+    fn quote_normalization_off() {
+        let cfg = FmtConfig {
+            normalize_strings: false,
+            ..FmtConfig::default()
+        };
+        assert_eq!(format("var a = 'simple'\n", &cfg), "var a = 'simple'\n");
+    }
+
+    #[test]
+    fn meaning_preserved_accepts_quote_and_trailing_comma_changes() {
+        assert!(super::meaning_preserved("var a = 'x'", "var a = \"x\""));
+        assert!(super::meaning_preserved("f(a, b,)", "f(a, b)"));
+        assert!(super::meaning_preserved("[1, 2,]", "[1, 2]"));
+        // but a real change is still caught
+        assert!(!super::meaning_preserved("var a = 'x'", "var a = \"y\""));
+        assert!(!super::meaning_preserved("f(a, b)", "f(a)"));
     }
 }

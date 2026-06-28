@@ -70,14 +70,25 @@ Gated behind `FmtConfig::reflow` (default on). *Only single-physical-line statem
 that are **left unwrapped** (a documented gap, not a bug): those with a magic trailing comma (see §2),
 a long bracketless operator chain (§3), an inline comment, or no bracket group at all.
 
-### Token-mutating behaviours (require relaxing the significant-token safety net to AST-equivalence)
+## Token-mutating behaviours — guarded by the meaning-equivalence net
 
-These change the token sequence, so they need the safety net to compare *normalised* trees (the way
-gdformat's own `check_tree_invariant` strips trailing commas) rather than exact tokens:
+Once the formatter rewrites the token sequence, the safety net relaxes from exact-token-equality to
+**meaning-equivalence** (`meaning_preserved`): it normalises away exactly the differences gdformat is
+allowed to introduce — a **trailing comma** before a closing bracket is dropped, and **string
+literals are compared by their canonical quote form** — while still catching a dropped/added real
+token or a changed string *value*.
+
+- **String-quote normalisation — IMPLEMENTED.** gdformat's (Black's) rule: prefer `"`, fall back to
+  `'` only when the body has more `"` than `'` (fewer escapes); prefixes (`r`/`&`/`^`/`$`) and the
+  decoded value are preserved; re-escaping handled. Byte-identical to gdformat on the probe cases.
+  Gated behind `FmtConfig::normalize_strings`. *Gap:* triple-quoted strings (`'''…'''`) are left
+  verbatim (rare; gdformat would switch them to `"""`).
+
+Still not implemented:
 
 2. **Magic trailing comma.** A source trailing comma (`call(a, b, c,)`) forces a collection to stay
    **exploded one-per-line, with** the trailing comma kept — even when it would fit on one line. We do
-   not yet add/keep trailing commas.
+   not yet add/keep trailing commas (the reflow leaves such a statement unwrapped).
 3. **Operator-chain wrapping.** A long bracketless boolean/arithmetic condition is wrapped by
    **injecting parentheses** and breaking operator-leading:
    ```gdscript
@@ -87,10 +98,8 @@ gdformat's own `check_tree_invariant` strips trailing commas) rather than exact 
        and condition_three
    ):
    ```
-   This adds `(`/`)` tokens. Not implemented.
-4. **String-quote normalisation.** gdformat rewrites `'single'` to `"double"`. We leave string
-   literals verbatim (a string's bytes are a significant token).
-5. **Leading-dot padding on wrapped method chains.** In a wrapped dot-chain gdformat emits `. method`
+   This adds `(`/`)` tokens (needs the net extended to ignore redundant grouping parens). Not yet done.
+4. **Leading-dot padding on wrapped method chains.** In a wrapped dot-chain gdformat emits `. method`
    (a space after the leading `.`). We keep member access tight.
 
 ### Smaller gaps
