@@ -43,8 +43,12 @@ pub struct FmtConfig {
     /// **indentation only** (the pre-increment-A behavior).
     pub normalize_spacing: bool,
     /// Collapse runs of blank lines (max 2 at top level, max 1 inside a block) and strip leading
-    /// blank lines. On by default. (Does not yet *insert* blank lines around definitions.)
+    /// blank lines. On by default.
     pub collapse_blank_lines: bool,
+    /// Insert blank lines around definitions to match gdformat (2 around top-level `func`/`class`/
+    /// `static func`, 1 around nested ones; comments/annotations attached to a def move with it). On
+    /// by default. Purely additive — never changes the significant token sequence.
+    pub insert_blank_lines: bool,
     /// Re-parse + significant-token-equality fallback to verbatim. Keep on unless you have a
     /// reason not to: it is the guarantee the formatter never changes meaning.
     pub safe_mode: bool,
@@ -58,6 +62,7 @@ impl Default for FmtConfig {
             line_width: 100,
             normalize_spacing: true,
             collapse_blank_lines: true,
+            insert_blank_lines: true,
             safe_mode: true,
         }
     }
@@ -85,7 +90,11 @@ pub fn format(source: &str, config: &FmtConfig) -> String {
     if config.safe_mode && !input_parses {
         return source.to_owned();
     }
-    let out = reindent(source, config);
+    let mut out = reindent(source, config);
+    if config.insert_blank_lines {
+        // Purely additive (only inserts blank lines), so the significant-token net still holds.
+        out = insert_def_blanks(&out, config);
+    }
     if config.safe_mode {
         // The safety net is two-layered, because each catches what the other cannot:
         // (1) significant-token equality catches a dropped / reordered / corrupted *token*;
@@ -250,6 +259,52 @@ fn emit_break(
     *line_had_content = false;
 }
 
+/// The depth and leading-indentation length of the next code line after token index `idx` (skipping
+/// comment / blank lines), given the current raw depth `cur`. Used to place a block-boundary comment.
+fn next_code_info(toks: &[gdscript_syntax::RawToken], idx: usize, cur: usize) -> (usize, usize) {
+    use SyntaxKind as S;
+    let mut delta: i32 = 0;
+    let mut indent_len = 0usize;
+    for t in &toks[idx + 1..] {
+        match t.kind {
+            S::Indent => delta += 1,
+            S::Dedent => delta -= 1,
+            S::NewlinePhys | S::Newline => indent_len = 0,
+            S::Whitespace => indent_len = usize::from(t.range.len()),
+            k if k.is_trivia() => {} // comments / line-continuation / BOM
+            _ => {
+                let d = usize::try_from(i32::try_from(cur).unwrap_or(0) + delta).unwrap_or(0);
+                return (d, indent_len);
+            }
+        }
+    }
+    (cur, 0)
+}
+
+/// The intended depth of a block-boundary comment, matching gdformat: its authored indentation
+/// clamped to the surrounding structure. We compare the comment's indentation *length* against the
+/// previous and next code lines' — if it reaches the deeper line's indentation it joins that block,
+/// otherwise it stays at the shallower one (so a column-0 comment stays at column 0 and an
+/// over-indented one snaps in). Comparing lengths (not levels) makes it indent-width agnostic.
+fn comment_depth(
+    comment_len: usize,
+    prev_depth: usize,
+    prev_len: usize,
+    next_depth: usize,
+    next_len: usize,
+) -> usize {
+    let ((deep_depth, deep_len), (shallow_depth, _)) = if prev_depth >= next_depth {
+        ((prev_depth, prev_len), (next_depth, next_len))
+    } else {
+        ((next_depth, next_len), (prev_depth, prev_len))
+    };
+    if comment_len >= deep_len {
+        deep_depth
+    } else {
+        shallow_depth
+    }
+}
+
 /// Re-emit the pre-pass token stream with normalized **indentation**, **intra-line spacing** (when
 /// `config.normalize_spacing`), trailing whitespace, and a single final newline. Significant token
 /// *text* is always emitted verbatim (so meaning is preserved); only the whitespace *between*
@@ -297,8 +352,14 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
     // Set after a physical newline *inside* brackets: the next line's leading whitespace (alignment)
     // is kept verbatim — increment A does not reflow bracketed continuations.
     let mut cont_line_start = false;
+    // The leading whitespace of the current logical line (used to recover a *comment*'s authored
+    // indentation, since the prepass attributes a block-boundary comment to the wrong raw `depth`).
+    let mut line_indent_ws: Option<&str> = None;
+    // The leading-indentation length of the most recent *code* line — the "previous code line" a
+    // block-boundary comment is placed against.
+    let mut prev_code_indent_len: usize = 0;
 
-    for t in &toks {
+    for (idx, t) in toks.iter().enumerate() {
         let text = &source[t.range];
         match t.kind {
             SyntaxKind::Indent => depth += 1,
@@ -332,6 +393,7 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 just_broke = true;
                 node_path = false;
                 pending_ws = None;
+                line_indent_ws = None;
             }
             SyntaxKind::NewlinePhys => {
                 if just_broke {
@@ -352,6 +414,7 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                         );
                         line_start = true;
                         prev_sig = None;
+                        line_indent_ws = None;
                     } else {
                         out.push('\n');
                         cont_line_start = true;
@@ -361,6 +424,8 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
             SyntaxKind::Whitespace => {
                 if line_start {
                     // Leading indentation — dropped; re-synthesized at the first significant token.
+                    // Remember it: a *comment*'s authored indentation is recovered from it below.
+                    line_indent_ws = Some(text);
                 } else if spacing_on {
                     pending_ws = Some(text); // buffered; the next token decides whether to keep it.
                 } else {
@@ -370,12 +435,37 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
             // A significant token or a comment.
             _ => {
                 if line_start {
-                    // Flush the buffered blank lines, capped to the *next* line's context: 2 at top
-                    // level, 1 inside a block, and 0 before the first content (leading blanks gone).
+                    // A block-boundary *comment* is attributed by the prepass to the wrong raw
+                    // `depth` (the `Indent`/`Dedent` lands on the next *code* line, not the comment).
+                    // Recover its intended depth the way gdformat does: its authored indentation,
+                    // clamped to the surrounding structure — `min(authored, max(prev, next))`.
+                    let is_comment = matches!(
+                        t.kind,
+                        SyntaxKind::LineComment
+                            | SyntaxKind::DocComment
+                            | SyntaxKind::RegionComment
+                            | SyntaxKind::EndRegionComment
+                    );
+                    let comment_len = line_indent_ws.map_or(0, str::len);
+                    let emit_depth = if is_comment {
+                        let (next_depth, next_len) = next_code_info(&toks, idx, depth);
+                        comment_depth(
+                            comment_len,
+                            depth,
+                            prev_code_indent_len,
+                            next_depth,
+                            next_len,
+                        )
+                    } else {
+                        prev_code_indent_len = comment_len;
+                        depth
+                    };
+                    // Flush the buffered blank lines, capped to this line's context: 2 at top level,
+                    // 1 inside a block, and 0 before the first content (leading blanks gone).
                     if collapse_on {
                         let cap = if !seen_content {
                             0
-                        } else if depth == 0 {
+                        } else if emit_depth == 0 {
                             2
                         } else {
                             1
@@ -385,7 +475,7 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                         }
                         pending_blanks = 0;
                     }
-                    for _ in 0..depth {
+                    for _ in 0..emit_depth {
                         out.push_str(&unit);
                     }
                     line_start = false;
@@ -477,6 +567,287 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
         result.push('\n');
     }
     result
+}
+
+/// The role a statement (logical) line plays in the blank-line-insertion policy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LineRole {
+    /// A `func` / `static func` / `class` declaration — gdformat surrounds these with blank lines.
+    Def,
+    /// A standalone comment line (`#` / `##`) — attaches to a following statement.
+    Comment,
+    /// A standalone annotation line (`@foo` with nothing else on the line) — attaches to a following
+    /// statement.
+    Annotation,
+    /// Any other statement (`var` / `const` / `signal` / `class_name` / an expression / …).
+    Other,
+}
+
+/// A statement-level "head" line discovered in already-formatted text: its 0-based physical line
+/// number, its block depth, and its [`LineRole`]. Bracket-continuation and lambda-body lines are
+/// not heads.
+#[derive(Clone, Copy)]
+struct HeadLine {
+    line: usize,
+    depth: usize,
+    role: LineRole,
+}
+
+/// One logical unit for the blank-line edge rule: a definition (or other statement) together with
+/// any comment/annotation prefix that attaches to it. `head_line` is the unit's first physical line.
+#[derive(Clone, Copy)]
+struct Unit {
+    head_line: usize,
+    depth: usize,
+    is_def: bool,
+}
+
+/// Classify the statement line whose first significant-or-comment token is `toks[start]`. Scans the
+/// rest of the logical line (across bracketed continuations) to look past an annotation prefix.
+fn classify_line(toks: &[gdscript_syntax::RawToken], start: usize) -> LineRole {
+    use SyntaxKind as S;
+    if matches!(
+        toks[start].kind,
+        S::LineComment | S::DocComment | S::RegionComment | S::EndRegionComment
+    ) {
+        return LineRole::Comment;
+    }
+    // Collect the line's significant token kinds (skip trivia; stop at the logical line end).
+    let mut kinds: Vec<S> = Vec::new();
+    let mut local_stack = 0usize;
+    for t in &toks[start..] {
+        match t.kind {
+            S::Newline => break,
+            S::NewlinePhys if local_stack == 0 => break,
+            S::LParen | S::LBrack | S::LBrace => {
+                local_stack += 1;
+                kinds.push(t.kind);
+            }
+            S::RParen | S::RBrack | S::RBrace => {
+                local_stack = local_stack.saturating_sub(1);
+                kinds.push(t.kind);
+            }
+            k if k.is_trivia() || k.is_synthetic_layout() => {}
+            k => kinds.push(k),
+        }
+    }
+    // Skip a leading annotation prefix: `@ Ident (balanced parens)?`, repeated.
+    let mut i = 0;
+    while kinds.get(i) == Some(&S::At) {
+        i += 1; // `@`
+        if kinds.get(i) == Some(&S::Ident) {
+            i += 1; // annotation name
+        }
+        if kinds.get(i) == Some(&S::LParen) {
+            // skip the balanced argument list
+            let mut d = 0usize;
+            while let Some(&k) = kinds.get(i) {
+                i += 1;
+                match k {
+                    S::LParen => d += 1,
+                    S::RParen => {
+                        d -= 1;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    match kinds.get(i) {
+        None => LineRole::Annotation, // an annotation alone on its line
+        Some(S::FuncKw | S::ClassKw) => LineRole::Def,
+        Some(S::StaticKw) if kinds.get(i + 1) == Some(&S::FuncKw) => LineRole::Def,
+        _ => LineRole::Other,
+    }
+}
+
+/// Insert blank lines around definitions to match gdformat's policy (2 around top-level defs, 1
+/// around nested defs), operating on already-formatted, already-collapsed text. Purely additive —
+/// it only inserts blank lines, so it never changes the significant token sequence. Idempotent: the
+/// blanks it would add are already present on a second pass.
+#[allow(
+    clippy::too_many_lines,
+    reason = "three cohesive sequential passes (find heads, group units, apply the edge rule) over the same token stream; clearer kept together than split"
+)]
+fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
+    use SyntaxKind as S;
+    let raw = gdscript_syntax::tokenize(formatted);
+    let (toks, _diags) = gdscript_syntax::run_prepass(&raw, formatted);
+
+    let lines: Vec<&str> = formatted.lines().collect();
+    let is_blank: Vec<bool> = lines.iter().map(|l| l.trim().is_empty()).collect();
+    let blank_above = |l: usize| l > 0 && is_blank.get(l - 1).copied().unwrap_or(false);
+
+    // Byte offset -> 0-based physical line number. Built from the raw bytes (so newlines *inside*
+    // multi-line string tokens count too) — `formatted.lines()` indices must align with this.
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            formatted
+                .bytes()
+                .enumerate()
+                .filter_map(|(i, b)| (b == b'\n').then_some(i + 1)),
+        )
+        .collect();
+    let line_of = |offset: usize| line_starts.partition_point(|&s| s <= offset) - 1;
+    // The (already-normalized) leading-indentation depth of a formatted line.
+    let line_depth = |l: usize| -> usize {
+        let s = lines.get(l).copied().unwrap_or("");
+        if config.use_tabs {
+            s.bytes().take_while(|&b| b == b'\t').count()
+        } else {
+            s.bytes()
+                .take_while(|&b| b == b' ')
+                .count()
+                .checked_div(config.indent_size)
+                .unwrap_or(0)
+        }
+    };
+
+    // --- pass 1: find statement-level head lines (skip bracket / lambda continuations) ---
+    let mut heads: Vec<HeadLine> = Vec::new();
+    let mut depth = 0usize;
+    let mut stack = 0usize;
+    let mut this_line_continues = false; // a trailing `\` continues onto the next physical line
+    let mut next_line_is_cont = false; // the logical line we are about to start is a continuation
+    let mut seen_first_on_line = false;
+    for (idx, t) in toks.iter().enumerate() {
+        match t.kind {
+            S::Indent => depth += 1,
+            S::Dedent => depth = depth.saturating_sub(1),
+            S::NewlinePhys => {
+                next_line_is_cont = stack > 0 || this_line_continues;
+                this_line_continues = false;
+                seen_first_on_line = false;
+            }
+            S::LineContinuation => this_line_continues = true,
+            S::Newline | S::Whitespace | S::Bom => {}
+            _ => {
+                if !seen_first_on_line {
+                    seen_first_on_line = true;
+                    if stack == 0 && !next_line_is_cont {
+                        let line = line_of(usize::from(t.range.start()));
+                        let role = classify_line(&toks, idx);
+                        // A comment's *structural* block (which one it belongs to, for the edge
+                        // rule) is not its visual indentation: a comment that *leads* a deeper block
+                        // (next code is deeper) belongs to that block — even at column 0 — so it is
+                        // not mistaken for a sibling of the preceding def; otherwise it sits at its
+                        // own (visual) depth, which correctly attaches a column-0 doc-comment to a
+                        // following *dedented* def.
+                        let head_depth = if role == LineRole::Comment {
+                            let next_depth = next_code_info(&toks, idx, depth).0;
+                            if next_depth > depth {
+                                next_depth
+                            } else {
+                                line_depth(line)
+                            }
+                        } else {
+                            depth
+                        };
+                        heads.push(HeadLine {
+                            line,
+                            depth: head_depth,
+                            role,
+                        });
+                    }
+                }
+                match t.kind {
+                    S::LParen | S::LBrack | S::LBrace => stack += 1,
+                    S::RParen | S::RBrack | S::RBrace => stack = stack.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // --- pass 2: group heads into units (a def/statement + its attached comment/annotation prefix) ---
+    let mut units: Vec<Unit> = Vec::new();
+    let mut i = 0;
+    while i < heads.len() {
+        let h = heads[i];
+        if matches!(h.role, LineRole::Comment | LineRole::Annotation) {
+            // Accumulate a contiguous, same-depth prefix run of comments/annotations.
+            let mut j = i + 1;
+            while j < heads.len()
+                && matches!(heads[j].role, LineRole::Comment | LineRole::Annotation)
+                && heads[j].depth == h.depth
+                && !blank_above(heads[j].line)
+            {
+                j += 1;
+            }
+            // Does a same-depth statement follow contiguously (no blank gap)? Then the run attaches.
+            if j < heads.len()
+                && heads[j].depth == h.depth
+                && !blank_above(heads[j].line)
+                && matches!(heads[j].role, LineRole::Def | LineRole::Other)
+            {
+                units.push(Unit {
+                    head_line: h.line,
+                    depth: h.depth,
+                    is_def: heads[j].role == LineRole::Def,
+                });
+                i = j + 1;
+            } else {
+                // Standalone comment/annotation lines (each its own non-def unit).
+                for h in &heads[i..j] {
+                    units.push(Unit {
+                        head_line: h.line,
+                        depth: h.depth,
+                        is_def: false,
+                    });
+                }
+                i = j;
+            }
+        } else {
+            units.push(Unit {
+                head_line: h.line,
+                depth: h.depth,
+                is_def: h.role == LineRole::Def,
+            });
+            i += 1;
+        }
+    }
+
+    // --- pass 3: the edge rule — N blanks before a unit whose own or previous sibling is a def ---
+    let mut required: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut last_is_def: Vec<Option<bool>> = Vec::new();
+    for u in &units {
+        while last_is_def.len() <= u.depth {
+            last_is_def.push(None);
+        }
+        let prev = last_is_def[u.depth];
+        let first_in_block = prev.is_none();
+        let n = if u.depth == 0 { 2 } else { 1 };
+        if !first_in_block && (u.is_def || prev == Some(true)) {
+            required.insert(u.head_line, n);
+        }
+        last_is_def[u.depth] = Some(u.is_def);
+        last_is_def.truncate(u.depth + 1); // entering a deeper block starts its siblings fresh
+    }
+    if required.is_empty() {
+        return formatted.to_owned();
+    }
+
+    // --- rebuild: top up the blank run before each required head to exactly N ---
+    let mut out = String::with_capacity(formatted.len() + required.len() * 2);
+    let mut trailing_blanks = 0usize;
+    for (lno, content) in lines.iter().enumerate() {
+        if let Some(&k) = required.get(&lno) {
+            for _ in trailing_blanks..k {
+                out.push('\n');
+            }
+        }
+        out.push_str(content);
+        out.push('\n');
+        trailing_blanks = if is_blank[lno] {
+            trailing_blanks + 1
+        } else {
+            0
+        };
+    }
+    out
 }
 
 /// Trim trailing spaces/tabs from the end of `out` (the current line).
@@ -600,17 +971,16 @@ mod tests {
     }
 
     #[test]
-    fn leading_body_comment_does_not_corrupt_the_body() {
-        // A comment that is the FIRST line of a block lands at column 0 (the prepass emits `Indent`
-        // only at the first *code* line, so the block depth isn't known yet — a documented cosmetic
-        // limitation, NOT a corruption). The CODE must still be correctly indented + parse clean.
+    fn leading_body_comment_is_indented_to_the_block() {
+        // A comment that is the FIRST line of a block: the prepass emits `Indent` only at the first
+        // *code* line, so the comment's raw depth is wrong — but it is re-indented to its intended
+        // block depth by comparing its authored indentation against the surrounding code lines
+        // (gdformat's rule). Works for the space-indented input here too (length comparison is
+        // indent-width agnostic).
         let src = "func g():\n  # c\n  var x = 1\n  var y = 2\n";
         let out = fmt(src);
-        assert_eq!(out, "func g():\n# c\n\tvar x = 1\n\tvar y = 2\n");
-        assert!(
-            parses_clean(&out),
-            "code must be correctly indented: {out:?}"
-        );
+        assert_eq!(out, "func g():\n\t# c\n\tvar x = 1\n\tvar y = 2\n");
+        assert!(parses_clean(&out), "{out:?}");
         assert_eq!(fmt(&out), out, "must be idempotent");
     }
 
@@ -864,9 +1234,10 @@ mod tests {
     }
 
     #[test]
-    fn single_blank_line_is_preserved() {
+    fn single_blank_between_top_defs_is_grown_to_two() {
+        // gdformat enforces exactly 2 blank lines around top-level defs; a single blank is grown.
         let src = "func a():\n\tpass\n\nfunc b():\n\tpass\n";
-        assert_eq!(fmt(src), src);
+        assert_eq!(fmt(src), "func a():\n\tpass\n\n\nfunc b():\n\tpass\n");
     }
 
     #[test]
@@ -902,5 +1273,110 @@ mod tests {
         };
         let src = "func f():\n    var x=a+b\n";
         assert_eq!(format(src, &cfg), "func f():\n\tvar x=a+b\n");
+    }
+
+    // ---- Phase-4 increment C: block-boundary comment indentation ----
+
+    #[test]
+    fn trailing_body_comment_stays_at_block_depth() {
+        // A comment after the last body statement, before a dedented def, stays at the body depth
+        // (gdformat keeps it attached to the block it was written in, not the following def).
+        let src = "func foo():\n\tpass\n\t# trailing\n\n\nfunc bar():\n\tpass\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "func foo():\n\tpass\n\t# trailing\n\n\nfunc bar():\n\tpass\n"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn comment_after_nested_block_stays_at_outer_body_depth() {
+        // The "after-if" case: a comment authored at body depth, sitting between a deeper block and
+        // a following body statement, keeps the body depth (not the deeper raw prepass depth).
+        let src = "func f():\n\tif x:\n\t\tpass\n\t# back at body level\n\treturn\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "func f():\n\tif x:\n\t\tpass\n\t# back at body level\n\treturn\n"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn over_indented_comment_snaps_to_block_and_col0_stays() {
+        // An over-indented comment snaps to the surrounding block; a column-0 comment stays at 0.
+        assert_eq!(
+            fmt("func f():\n\t\t\t# over\n\tpass\n"),
+            "func f():\n\t# over\n\tpass\n"
+        );
+        assert_eq!(
+            fmt("func f():\n# at col 0\n\tpass\n"),
+            "func f():\n# at col 0\n\tpass\n"
+        );
+    }
+
+    // ---- Phase-4 increment C: blank-line insertion around definitions ----
+
+    #[test]
+    fn two_blanks_inserted_around_top_level_defs() {
+        let src = "extends Node\nfunc a():\n\tpass\nfunc b():\n\tpass\n";
+        assert_eq!(
+            fmt(src),
+            "extends Node\n\n\nfunc a():\n\tpass\n\n\nfunc b():\n\tpass\n"
+        );
+    }
+
+    #[test]
+    fn one_blank_inserted_between_methods_in_a_class() {
+        // Inside a class: 1 blank between methods; none before the first member (after the header).
+        let src = "class C:\n\tfunc a():\n\t\tpass\n\tfunc b():\n\t\tpass\n";
+        assert_eq!(
+            fmt(src),
+            "class C:\n\tfunc a():\n\t\tpass\n\n\tfunc b():\n\t\tpass\n"
+        );
+    }
+
+    #[test]
+    fn blanks_go_before_an_attached_comment_or_annotation_prefix() {
+        // The 2 blanks land before the doc-comment/annotation that belongs to the def, not between.
+        let src = "func a():\n\tpass\n## docs for b\n@warning_ignore(\"x\")\nfunc b():\n\tpass\n";
+        assert_eq!(
+            fmt(src),
+            "func a():\n\tpass\n\n\n## docs for b\n@warning_ignore(\"x\")\nfunc b():\n\tpass\n"
+        );
+    }
+
+    #[test]
+    fn blanks_inserted_after_a_def_before_a_following_non_def() {
+        // gdformat surrounds a def: a top-level statement after a func body gets 2 blanks too.
+        let src = "func a():\n\tpass\nvar x = 1\n";
+        assert_eq!(fmt(src), "func a():\n\tpass\n\n\nvar x = 1\n");
+    }
+
+    #[test]
+    fn static_var_is_not_a_def_but_static_func_is() {
+        // `static var` is an ordinary member (no surrounding blanks); `static func` is a def.
+        let src = "var a = 1\nstatic var b = 2\nstatic func c():\n\tpass\n";
+        assert_eq!(
+            fmt(src),
+            "var a = 1\nstatic var b = 2\n\n\nstatic func c():\n\tpass\n"
+        );
+    }
+
+    #[test]
+    fn no_blank_before_the_first_def_in_the_file() {
+        let src = "func a():\n\tpass\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn blank_insertion_off_leaves_blanks_alone() {
+        let cfg = FmtConfig {
+            insert_blank_lines: false,
+            ..FmtConfig::default()
+        };
+        let src = "func a():\n\tpass\nfunc b():\n\tpass\n";
+        assert_eq!(format(src, &cfg), src);
     }
 }
