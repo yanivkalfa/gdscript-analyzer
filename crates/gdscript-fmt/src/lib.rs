@@ -898,8 +898,10 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
 // A statement that does not fit in `line_width` and contains a bracketed group is wrapped the way
 // gdformat does: try the group **flat**; if it does not fit, **compact** (all elements on one
 // indented continuation line, close bracket on its own line); if even that does not fit, **exploded**
-// (one element per line, recursively). No trailing comma is added, so the token sequence is
-// preserved. Only statements that occupy a single physical line are reflowed (so the pass is trivially
+// (one element per line, recursively). A **magic trailing comma** in the source forces a group
+// exploded-with-comma even when it would fit (and forces every enclosing group multi-line) — the one
+// case that mutates the token sequence (a trailing comma), guarded by the meaning-equivalence net.
+// Only statements that occupy a single physical line are reflowed (so the pass is trivially
 // idempotent — a wrapped statement spans bracket-continuation lines that are skipped on the next run).
 
 /// One rendered token: its text and whether a single space precedes it in the flat form.
@@ -919,7 +921,22 @@ enum ReflowDoc {
         open: String,
         elems: Vec<Vec<ReflowDoc>>,
         close: &'static str,
+        /// The source had a **magic trailing comma** — gdformat forces this group exploded one per
+        /// line *with* the trailing comma, even when it would fit.
+        magic: bool,
     },
+}
+
+/// Whether a group must be broken across lines: it has a magic trailing comma, or a descendant does
+/// (a magic comma anywhere forces every enclosing group multi-line, matching gdformat).
+fn group_forced(elems: &[Vec<ReflowDoc>], magic: bool) -> bool {
+    magic
+        || elems.iter().any(|e| {
+            e.iter().any(|d| match d {
+                ReflowDoc::Group { elems, magic, .. } => group_forced(elems, *magic),
+                ReflowDoc::Text { .. } => false,
+            })
+        })
 }
 
 fn open_close(text: &str) -> Option<&'static str> {
@@ -938,7 +955,8 @@ fn cols(s: &str) -> usize {
 
 /// Build the comma-separated element sequences of a group whose contents start at `atoms[*i]`,
 /// consuming through the matching `close` (or to the end when `close` is `None`, for the top level).
-fn build_elems(atoms: &[Atom], i: &mut usize, close: Option<&str>) -> Vec<Vec<ReflowDoc>> {
+/// Returns the elements and whether the group ended with a magic trailing comma.
+fn build_elems(atoms: &[Atom], i: &mut usize, close: Option<&str>) -> (Vec<Vec<ReflowDoc>>, bool) {
     let mut elems: Vec<Vec<ReflowDoc>> = Vec::new();
     let mut cur: Vec<ReflowDoc> = Vec::new();
     let mut elem_start = true;
@@ -958,12 +976,13 @@ fn build_elems(atoms: &[Atom], i: &mut usize, close: Option<&str>) -> Vec<Vec<Re
         if let Some(cl) = open_close(&a.text) {
             let open = a.text.clone();
             *i += 1;
-            let inner = build_elems(atoms, i, Some(cl));
+            let (inner, magic) = build_elems(atoms, i, Some(cl));
             cur.push(ReflowDoc::Group {
                 space,
                 open,
                 elems: inner,
                 close: cl,
+                magic,
             });
         } else {
             cur.push(ReflowDoc::Text {
@@ -974,10 +993,12 @@ fn build_elems(atoms: &[Atom], i: &mut usize, close: Option<&str>) -> Vec<Vec<Re
         }
         elem_start = false;
     }
+    // A trailing comma leaves `elem_start` set with `cur` empty after at least one real element.
+    let magic = elem_start && !elems.is_empty();
     if !cur.is_empty() {
         elems.push(cur);
     }
-    elems
+    (elems, magic)
 }
 
 fn flat_seq(docs: &[ReflowDoc]) -> String {
@@ -995,12 +1016,13 @@ fn flat_seq(docs: &[ReflowDoc]) -> String {
                 open,
                 elems,
                 close,
+                magic,
             } => {
                 if *space {
                     out.push(' ');
                 }
                 out.push_str(open);
-                out.push_str(&flat_group_contents(elems));
+                out.push_str(&flat_group_contents(elems, *magic));
                 out.push_str(close);
             }
         }
@@ -1008,12 +1030,16 @@ fn flat_seq(docs: &[ReflowDoc]) -> String {
     out
 }
 
-fn flat_group_contents(elems: &[Vec<ReflowDoc>]) -> String {
-    elems
+fn flat_group_contents(elems: &[Vec<ReflowDoc>], magic: bool) -> String {
+    let mut s = elems
         .iter()
         .map(|e| flat_seq(e))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    if magic && !elems.is_empty() {
+        s.push(',');
+    }
+    s
 }
 
 /// Render a sequence (one element) at base `indent`, starting at column `col`, wrapping any group
@@ -1042,12 +1068,13 @@ fn render_seq(
                 open,
                 elems,
                 close,
+                magic,
             } => {
                 if *space {
                     out.push(' ');
                     col += 1;
                 }
-                let (g, end) = render_group(open, elems, close, indent, col, cfg, tw, unit);
+                let (g, end) = render_group(open, elems, close, *magic, indent, col, cfg, tw, unit);
                 out.push_str(&g);
                 col = end;
             }
@@ -1064,39 +1091,44 @@ fn render_group(
     open: &str,
     elems: &[Vec<ReflowDoc>],
     close: &str,
+    magic: bool,
     indent: usize,
     col: usize,
     cfg: &FmtConfig,
     tw: usize,
     unit: &str,
 ) -> (String, usize) {
-    // flat: the whole group on the current line.
-    let flat = format!("{open}{}{close}", flat_group_contents(elems));
-    if col + cols(&flat) <= cfg.line_width || elems.is_empty() {
+    let forced = group_forced(elems, magic);
+    // flat: the whole group on the current line (only when not forced multi-line).
+    let flat = format!("{open}{}{close}", flat_group_contents(elems, magic));
+    if !forced && (col + cols(&flat) <= cfg.line_width || elems.is_empty()) {
         let end = col + cols(&flat);
         return (flat, end);
     }
     let inner = indent + 1;
     let inner_col = inner * tw;
     let close_end = indent * tw + cols(close);
-    // compact: all elements on one indented continuation line.
-    let contents = flat_group_contents(elems);
-    if inner_col + cols(&contents) <= cfg.line_width {
-        let s = format!(
-            "{open}\n{ind}{contents}\n{base}{close}",
-            ind = unit.repeat(inner),
-            base = unit.repeat(indent),
-        );
-        return (s, close_end);
+    // compact: all elements on one indented continuation line (not when forced exploded).
+    if !forced {
+        let contents = flat_group_contents(elems, magic);
+        if inner_col + cols(&contents) <= cfg.line_width {
+            let s = format!(
+                "{open}\n{ind}{contents}\n{base}{close}",
+                ind = unit.repeat(inner),
+                base = unit.repeat(indent),
+            );
+            return (s, close_end);
+        }
     }
-    // exploded: one element per line (each rendered recursively); no trailing comma.
+    // exploded: one element per line (each rendered recursively). A comma follows every element
+    // except the last — unless this group is magic, when it follows the last one too.
     let mut s = String::from(open);
     s.push('\n');
     for (k, elem) in elems.iter().enumerate() {
         s.push_str(&unit.repeat(inner));
         let (es, _) = render_seq(elem, inner, inner_col, cfg, tw, unit);
         s.push_str(&es);
-        if k + 1 < elems.len() {
+        if magic || k + 1 < elems.len() {
             s.push(',');
         }
         s.push('\n');
@@ -1107,8 +1139,8 @@ fn render_group(
 }
 
 /// Parse a single physical line's content into reflow atoms, or `None` if it is not a clean,
-/// reflowable single-line statement (has a comment, an error/continuation token, unbalanced or
-/// negative bracket nesting, a magic trailing comma, or a flat reconstruction that does not match).
+/// reflowable single-line statement (has a comment, an error/continuation token, or unbalanced /
+/// negative bracket nesting). A magic trailing comma is kept (it drives gdformat's exploded mode).
 fn line_atoms(body: &str) -> Option<Vec<Atom>> {
     use SyntaxKind as S;
     let toks = gdscript_syntax::tokenize(body);
@@ -1130,11 +1162,6 @@ fn line_atoms(body: &str) -> Option<Vec<Atom>> {
                 } else if matches!(k, S::RParen | S::RBrack | S::RBrace) {
                     depth -= 1;
                     if depth < 0 {
-                        return None;
-                    }
-                    // A magic trailing comma forces gdformat's exploded-with-comma mode (token
-                    // mutating); we leave such a statement unwrapped rather than drop the comma.
-                    if atoms.last().is_some_and(|a| a.text == ",") {
                         return None;
                     }
                 }
@@ -1263,21 +1290,25 @@ fn try_reflow_line(
             .checked_div(config.indent_size)
             .unwrap_or(0)
     };
-    let width = indent * tw + cols(body);
-    if width <= config.line_width {
-        return None;
-    }
     let atoms = line_atoms(body)?;
     if !atoms.iter().any(|a| open_close(&a.text).is_some()) {
         return None; // nothing to wrap
     }
-    let docs = build_elems(&atoms, &mut 0, None);
+    let (docs, _) = build_elems(&atoms, &mut 0, None);
     if docs.len() != 1 {
         return None; // a top-level comma — not a normal statement; leave it
     }
     let top = &docs[0];
     // Faithfulness check: only reflow when our flat reconstruction is byte-identical to the input.
     if flat_seq(top) != *body {
+        return None;
+    }
+    // Reflow when the line is too long OR a magic trailing comma forces it exploded.
+    let width = indent * tw + cols(body);
+    let forced = top
+        .iter()
+        .any(|d| matches!(d, ReflowDoc::Group { elems, magic, .. } if group_forced(elems, *magic)));
+    if width <= config.line_width && !forced {
         return None;
     }
     let (rendered, _) = render_seq(top, indent, indent * tw, config, tw, unit);
@@ -2012,16 +2043,6 @@ mod tests {
     }
 
     #[test]
-    fn reflow_magic_trailing_comma_is_left_unwrapped() {
-        // A magic trailing comma forces gdformat's exploded-WITH-comma mode (token-mutating); we
-        // leave it unwrapped rather than drop the comma. Token sequence is preserved.
-        let src = "func f():\n\tvar magic = some_call_here(aaaa, bbbb, cccc, dddd, eeee, ffff, gggg, hhhh, iiii, jjjj, kk,)\n";
-        let out = fmt(src);
-        assert!(out.contains("kk,)"), "trailing comma preserved: {out:?}");
-        assert!(super::same_significant_tokens(src, &out));
-    }
-
-    #[test]
     fn reflow_off_leaves_long_lines() {
         let cfg = FmtConfig {
             reflow: false,
@@ -2065,6 +2086,35 @@ mod tests {
         assert_eq!(fmt("var f = &'n'\n"), "var f = &\"n\"\n");
         // idempotent
         assert_eq!(fmt("var a = \"simple\"\n"), "var a = \"simple\"\n");
+    }
+
+    // ---- Phase-4: magic trailing comma ----
+
+    #[test]
+    fn magic_trailing_comma_explodes_with_comma() {
+        // A magic trailing comma forces exploded-one-per-line WITH the comma, even though it fits.
+        assert_eq!(
+            fmt("var a = call(x, y,)\n"),
+            "var a = call(\n\tx,\n\ty,\n)\n"
+        );
+        assert_eq!(fmt("var b = [1, 2,]\n"), "var b = [\n\t1,\n\t2,\n]\n");
+        assert_eq!(fmt("var g = call(only,)\n"), "var g = call(\n\tonly,\n)\n");
+    }
+
+    #[test]
+    fn magic_trailing_comma_nested_forces_outer_without_own_comma() {
+        // The inner magic group explodes WITH its comma; the outer is forced multi-line by the
+        // descendant but, not being magic itself, has no trailing comma after its last element.
+        assert_eq!(
+            fmt("var d = outer(inner(a, b,), c)\n"),
+            "var d = outer(\n\tinner(\n\t\ta,\n\t\tb,\n\t),\n\tc\n)\n"
+        );
+    }
+
+    #[test]
+    fn magic_trailing_comma_is_idempotent() {
+        let once = fmt("var a = call(x, y,)\n");
+        assert_eq!(fmt(&once), once);
     }
 
     #[test]

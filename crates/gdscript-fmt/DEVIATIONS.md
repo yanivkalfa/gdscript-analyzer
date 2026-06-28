@@ -84,11 +84,14 @@ token or a changed string *value*.
   Gated behind `FmtConfig::normalize_strings`. *Gap:* triple-quoted strings (`'''…'''`) are left
   verbatim (rare; gdformat would switch them to `"""`).
 
+- **Magic trailing comma — IMPLEMENTED.** A source trailing comma (`call(a, b, c,)`) forces the
+  group **exploded one-per-line with** the comma kept, even when it fits; a magic comma anywhere forces
+  every enclosing group multi-line (an enclosing group that is not itself magic gets no trailing comma).
+  Byte-identical to gdformat on the probe cases (incl. nested + lua-style dicts). Guarded by the
+  meaning-equivalence net (which treats trailing commas as removable, so the rewrite is safe).
+
 Still not implemented:
 
-2. **Magic trailing comma.** A source trailing comma (`call(a, b, c,)`) forces a collection to stay
-   **exploded one-per-line, with** the trailing comma kept — even when it would fit on one line. We do
-   not yet add/keep trailing commas (the reflow leaves such a statement unwrapped).
 3. **Operator-chain wrapping.** A long bracketless boolean/arithmetic condition is wrapped by
    **injecting parentheses** and breaking operator-leading:
    ```gdscript
