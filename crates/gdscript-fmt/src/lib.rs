@@ -904,8 +904,9 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
 // Only statements that occupy a single physical line are reflowed (so the pass is trivially
 // idempotent — a wrapped statement spans bracket-continuation lines that are skipped on the next run).
 
-/// One rendered token: its text and whether a single space precedes it in the flat form.
+/// One rendered token: its kind, text, and whether a single space precedes it in the flat form.
 struct Atom {
+    kind: SyntaxKind,
     text: String,
     space: bool,
 }
@@ -951,6 +952,11 @@ fn open_close(text: &str) -> Option<&'static str> {
 /// Display columns of a content string (no tabs — those only appear in leading indentation).
 fn cols(s: &str) -> usize {
     s.chars().count()
+}
+
+/// Display width of a full line, counting a leading tab as `tw` columns.
+fn display_cols(line: &str, tw: usize) -> usize {
+    line.chars().map(|c| if c == '\t' { tw } else { 1 }).sum()
 }
 
 /// Build the comma-separated element sequences of a group whose contents start at `atoms[*i]`,
@@ -1166,6 +1172,7 @@ fn line_atoms(body: &str) -> Option<Vec<Atom>> {
                     }
                 }
                 atoms.push(Atom {
+                    kind: k,
                     text: body[t.range].to_string(),
                     space,
                 });
@@ -1177,6 +1184,229 @@ fn line_atoms(body: &str) -> Option<Vec<Atom>> {
         return None;
     }
     Some(atoms)
+}
+
+/// Binary-operator precedence (lower binds looser → breaks first); `None` for non-binary tokens.
+/// Mirrors the parser's `infix_prec`.
+fn infix_prec(kind: SyntaxKind) -> Option<u8> {
+    use SyntaxKind as S;
+    Some(match kind {
+        S::OrKw | S::PipePipe => 4,
+        S::AndKw | S::AmpAmp => 5,
+        S::InKw => 7,
+        S::EqEq | S::Neq | S::Lt | S::Gt | S::Le | S::Ge => 8,
+        S::Pipe => 9,
+        S::Caret => 10,
+        S::Amp => 11,
+        S::Shl | S::Shr => 12,
+        S::Plus | S::Minus => 13,
+        S::Star | S::Slash | S::Percent => 14,
+        S::StarStar => 17,
+        _ => return None,
+    })
+}
+
+fn is_assign_op(kind: SyntaxKind) -> bool {
+    use SyntaxKind as S;
+    matches!(
+        kind,
+        S::Eq
+            | S::PlusEq
+            | S::MinusEq
+            | S::StarEq
+            | S::SlashEq
+            | S::StarStarEq
+            | S::PercentEq
+            | S::AmpEq
+            | S::PipeEq
+            | S::CaretEq
+            | S::ShlEq
+            | S::ShrEq
+            | S::ColonEq
+    )
+}
+
+/// Flat-render a run of atoms (the first atom never gets a leading space).
+fn flat_atoms(atoms: &[Atom]) -> String {
+    let mut s = String::new();
+    for (i, a) in atoms.iter().enumerate() {
+        if i > 0 && a.space {
+            s.push(' ');
+        }
+        s.push_str(&a.text);
+    }
+    s
+}
+
+/// The `[prefix_end, suffix_start)` boundaries of the wrappable expression inside a statement's
+/// atoms: the condition of `if`/`elif`/`while` (excluding the trailing `:`), the value of `return`,
+/// or the right-hand side of a top-level assignment. `None` if there is no such expression.
+fn expression_span(atoms: &[Atom]) -> Option<(usize, usize)> {
+    use SyntaxKind as S;
+    let first = atoms.first()?;
+    match first.kind {
+        S::IfKw | S::ElifKw | S::WhileKw => {
+            let suffix = if atoms.last()?.kind == S::Colon {
+                atoms.len() - 1
+            } else {
+                return None;
+            };
+            Some((1, suffix))
+        }
+        S::ReturnKw => Some((1, atoms.len())),
+        _ => {
+            let mut depth = 0i32;
+            for (i, a) in atoms.iter().enumerate() {
+                match a.kind {
+                    S::LParen | S::LBrack | S::LBrace => depth += 1,
+                    S::RParen | S::RBrack | S::RBrace => depth -= 1,
+                    k if depth == 0 && is_assign_op(k) => return Some((i + 1, atoms.len())),
+                    _ => {}
+                }
+            }
+            None
+        }
+    }
+}
+
+/// The indices (within `expr`) of top-level **binary** operators, paired with their precedence. A
+/// `+`/`-` etc. is binary only when it follows an operand (not at a unary position); and a `/`/`%`
+/// inside a **node-path run** (`$Node/Path`, `%Unique/Child`) is a path separator, not an operator —
+/// the parser reads `$A / B` as the same node-path as `$A/B`, so such a chain must never be split.
+fn top_level_binary_ops(expr: &[Atom]) -> Vec<(usize, u8)> {
+    use SyntaxKind as S;
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut node_path = false;
+    let mut prev_operand_end = false;
+    for (i, a) in expr.iter().enumerate() {
+        match a.kind {
+            S::LParen | S::LBrack | S::LBrace => depth += 1,
+            S::RParen | S::RBrack | S::RBrace => depth -= 1,
+            _ => {}
+        }
+        let in_path = node_path && matches!(a.kind, S::Ident | S::Slash | S::String);
+        let binary_here = depth == 0 && !in_path && i > 0 && prev_operand_end;
+        if let Some(p) = infix_prec(a.kind).filter(|_| binary_here) {
+            out.push((i, p));
+        }
+        if node_path && !matches!(a.kind, S::Ident | S::Slash | S::String) {
+            node_path = false;
+        }
+        if a.kind == S::Dollar || (a.kind == S::Percent && !prev_operand_end) {
+            node_path = true;
+        }
+        prev_operand_end = is_operand_end(a.kind);
+    }
+    out
+}
+
+/// Wrap a too-long statement whose wrappable expression is a top-level **binary-operator chain** the
+/// way gdformat does: inject parens and break at the lowest-precedence top-level operator,
+/// operator-leading (each operand rendered recursively, so its own brackets reflow). `None` when
+/// there is no wrappable binary-operator expression.
+fn operator_chain_wrap(
+    atoms: &[Atom],
+    indent: usize,
+    cfg: &FmtConfig,
+    tw: usize,
+    unit: &str,
+) -> Option<String> {
+    let (pre_end, suf_start) = expression_span(atoms)?;
+    if pre_end >= suf_start {
+        return None;
+    }
+    let expr = &atoms[pre_end..suf_start];
+    let ops = top_level_binary_ops(expr);
+    let min_prec = ops.iter().map(|&(_, p)| p).min()?;
+    let split: Vec<usize> = ops
+        .iter()
+        .filter(|&&(_, p)| p == min_prec)
+        .map(|&(i, _)| i)
+        .collect();
+
+    // Build (leading-operator, operand-atoms) segments; the operator leads its following operand.
+    let mut segs: Vec<(Option<&str>, &[Atom])> = Vec::new();
+    let mut start = 0;
+    let mut prev_op: Option<&str> = None;
+    for &oi in &split {
+        segs.push((prev_op, &expr[start..oi]));
+        prev_op = Some(expr[oi].text.as_str());
+        start = oi + 1;
+    }
+    segs.push((prev_op, &expr[start..]));
+
+    let prefix = flat_atoms(&atoms[..pre_end]);
+    let suffix = flat_atoms(&atoms[suf_start..]);
+    let mut out = String::new();
+    out.push_str(&unit.repeat(indent));
+    out.push_str(&prefix);
+    if !prefix.is_empty() {
+        out.push(' ');
+    }
+    out.push_str("(\n");
+    for (op, operand) in &segs {
+        out.push_str(&unit.repeat(indent + 1));
+        let mut col = (indent + 1) * tw;
+        if let Some(op) = op {
+            out.push_str(op);
+            out.push(' ');
+            col += cols(op) + 1;
+        }
+        let (od, _) = build_elems(operand, &mut 0, None);
+        if let Some(seq) = od.first() {
+            let (r, _) = render_seq(seq, indent + 1, col, cfg, tw, unit);
+            out.push_str(&r);
+        }
+        out.push('\n');
+    }
+    out.push_str(&unit.repeat(indent));
+    out.push(')');
+    out.push_str(&suffix);
+    Some(out)
+}
+
+/// Wrap the statement's expression in injected parens on a single indented continuation line (the
+/// **compact** form gdformat uses for a too-long expression with no top-level binary operator — e.g.
+/// a long method chain). `None` if there is no such expression, it has a top-level operator (handled
+/// by [`operator_chain_wrap`]), or even the compact line would still overflow.
+fn compact_paren_wrap(
+    atoms: &[Atom],
+    indent: usize,
+    cfg: &FmtConfig,
+    tw: usize,
+    unit: &str,
+) -> Option<String> {
+    let (pre_end, suf_start) = expression_span(atoms)?;
+    let expr = atoms.get(pre_end..suf_start)?;
+    // Only wrap an expression that has a bracketed group (e.g. a method chain) and no top-level
+    // binary operator: a bare expression / node-path is left on one line, as gdformat does.
+    if expr.is_empty()
+        || !top_level_binary_ops(expr).is_empty()
+        || !expr.iter().any(|a| open_close(&a.text).is_some())
+    {
+        return None;
+    }
+    let expr_flat = flat_atoms(expr);
+    if (indent + 1) * tw + cols(&expr_flat) > cfg.line_width {
+        return None;
+    }
+    let prefix = flat_atoms(&atoms[..pre_end]);
+    let suffix = flat_atoms(&atoms[suf_start..]);
+    let mut out = String::new();
+    out.push_str(&unit.repeat(indent));
+    out.push_str(&prefix);
+    if !prefix.is_empty() {
+        out.push(' ');
+    }
+    out.push_str("(\n");
+    out.push_str(&unit.repeat(indent + 1));
+    out.push_str(&expr_flat);
+    out.push('\n');
+    out.push_str(&unit.repeat(indent));
+    out.push(')');
+    out.push_str(&suffix);
+    Some(out)
 }
 
 /// Reflow over-long single-line statements. Token-preserving; safe to run last.
@@ -1291,8 +1521,19 @@ fn try_reflow_line(
             .unwrap_or(0)
     };
     let atoms = line_atoms(body)?;
+    let width = indent * tw + cols(body);
+    // A too-long statement whose expression is a top-level binary-operator chain is wrapped in
+    // injected parens, breaking at the lowest-precedence operator (the meaning-equivalence net
+    // accepts the redundant parens). This takes priority over bracket reflow.
+    if width > config.line_width {
+        let wrapped = operator_chain_wrap(&atoms, indent, config, tw, unit);
+        if let Some(oc) = wrapped {
+            return (oc != line).then_some(oc);
+        }
+    }
+    // Bracket reflow: needs a bracketed group and a faithful flat reconstruction.
     if !atoms.iter().any(|a| open_close(&a.text).is_some()) {
-        return None; // nothing to wrap
+        return None;
     }
     let (docs, _) = build_elems(&atoms, &mut 0, None);
     if docs.len() != 1 {
@@ -1304,7 +1545,6 @@ fn try_reflow_line(
         return None;
     }
     // Reflow when the line is too long OR a magic trailing comma forces it exploded.
-    let width = indent * tw + cols(body);
     let forced = top
         .iter()
         .any(|d| matches!(d, ReflowDoc::Group { elems, magic, .. } if group_forced(elems, *magic)));
@@ -1313,6 +1553,17 @@ fn try_reflow_line(
     }
     let (rendered, _) = render_seq(top, indent, indent * tw, config, tw, unit);
     let result = format!("{}{rendered}", unit.repeat(indent));
+    // If bracket reflow still leaves a line over the limit (e.g. a long method chain whose calls
+    // have no arguments to wrap), fall back to wrapping the whole expression in compact parens.
+    let overflows = result
+        .lines()
+        .any(|l| display_cols(l, tw) > config.line_width);
+    if overflows {
+        let cp = compact_paren_wrap(&atoms, indent, config, tw, unit);
+        if let Some(cp) = cp {
+            return Some(cp);
+        }
+    }
     (result != line).then_some(result)
 }
 
@@ -2149,6 +2400,46 @@ mod tests {
     fn magic_trailing_comma_is_idempotent() {
         let once = fmt("var a = call(x, y,)\n");
         assert_eq!(fmt(&once), once);
+    }
+
+    // ---- Phase-4: operator-chain wrapping ----
+
+    #[test]
+    fn operator_chain_if_condition_breaks_operator_leading() {
+        let src = "func f():\n\tif condition_number_one and condition_number_two and condition_number_three and condition_number_four:\n\t\tpass\n";
+        assert_eq!(
+            fmt(src),
+            "func f():\n\tif (\n\t\tcondition_number_one\n\t\tand condition_number_two\n\t\tand condition_number_three\n\t\tand condition_number_four\n\t):\n\t\tpass\n"
+        );
+        assert_eq!(fmt(&fmt(src)), fmt(src), "idempotent");
+    }
+
+    #[test]
+    fn operator_chain_breaks_at_lowest_precedence_only() {
+        // `a and b or c and d`: break at the lower-precedence `or`, keeping the `and` groups inline.
+        let src = "func f():\n\tif aaaaaaaaaaaaaaaaaaaaaaaa and bbbbbbbbbbbbbbbbbbbbbbbb or cccccccccccccccccccccccc and dddddddd:\n\t\tpass\n";
+        assert_eq!(
+            fmt(src),
+            "func f():\n\tif (\n\t\taaaaaaaaaaaaaaaaaaaaaaaa and bbbbbbbbbbbbbbbbbbbbbbbb\n\t\tor cccccccccccccccccccccccc and dddddddd\n\t):\n\t\tpass\n"
+        );
+    }
+
+    #[test]
+    fn operator_chain_dot_chain_wraps_compact() {
+        let src = "func f():\n\tvar chain = some_object.first_method().second_method().third_method().fourth_method().fifth_method_x()\n";
+        assert_eq!(
+            fmt(src),
+            "func f():\n\tvar chain = (\n\t\tsome_object.first_method().second_method().third_method().fourth_method().fifth_method_x()\n\t)\n"
+        );
+    }
+
+    #[test]
+    fn operator_chain_never_splits_a_node_path() {
+        // A node-path's `/` are path separators, not division — an over-long node-path must stay on
+        // one line (the parser reads `$A / B` as the same path as `$A/B`, so splitting it would be a
+        // silent meaning change in disguise — and gdformat leaves it alone anyway).
+        let src = "func f():\n\tvar n = $LongContainerNameHere/AnotherLongChildNode/YetAnotherChildNode/AndOneMoreChildNodeHere/FinalNode\n";
+        assert_eq!(fmt(src), src);
     }
 
     #[test]

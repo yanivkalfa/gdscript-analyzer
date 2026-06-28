@@ -90,20 +90,29 @@ token or a changed string *value*.
   Byte-identical to gdformat on the probe cases (incl. nested + lua-style dicts). Guarded by the
   meaning-equivalence net (which treats trailing commas as removable, so the rewrite is safe).
 
+- **Operator-chain wrapping — IMPLEMENTED.** A too-long statement whose expression (an `if`/`elif`/
+  `while` condition, a `return` value, or an assignment RHS) is a top-level **binary-operator chain**
+  is wrapped in injected parens, breaking at the **lowest-precedence** operator, operator-leading:
+  ```gdscript
+  if (
+      condition_one
+      and condition_two
+  ):
+  ```
+  Mixed precedence keeps the tighter groups inline (`a and b` / `or` / `c and d`). An expression with
+  no top-level binary operator but a bracketed group (a long method chain) wraps **compact** (one
+  indented continuation line). Byte-identical to gdformat on the probe cases. Guarded by the
+  meaning-equivalence net (which unwraps the redundant parens). **Node-paths are never split** — a
+  `$Node/Path`'s `/` are path separators, not division.
+
 Still not implemented:
 
-3. **Operator-chain wrapping.** A long bracketless boolean/arithmetic condition is wrapped by
-   **injecting parentheses** and breaking operator-leading:
-   ```gdscript
-   if (
-       condition_one
-       and condition_two
-       and condition_three
-   ):
-   ```
-   This adds `(`/`)` tokens (needs the net extended to ignore redundant grouping parens). Not yet done.
-4. **Leading-dot padding on wrapped method chains.** In a wrapped dot-chain gdformat emits `. method`
-   (a space after the leading `.`). We keep member access tight.
+3. **Enum-brace spacing.** gdformat spaces the inside of an **enum** body (`enum E { A, B }`) while
+   keeping **dict** braces tight (`{"k": v}`). We keep enum braces tight too.
+4. **Exploded method chains.** A method chain too long even for the compact paren-wrap is broken by
+   gdformat at each `.` with a leading-dot `. method` style. We leave such a (rare) chain on one line.
+5. **Leading-dot padding** on an already-wrapped dot-chain (`. method`) — we tighten it to `.method`
+   (the remaining `format(gold)!=gold` cases on chain-heavy files).
 
 ### Smaller gaps
 
