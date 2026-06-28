@@ -105,14 +105,16 @@ token or a changed string *value*.
   meaning-equivalence net (which unwraps the redundant parens). **Node-paths are never split** — a
   `$Node/Path`'s `/` are path separators, not division.
 
+- **Enum-brace spacing — IMPLEMENTED.** An enum body is spaced inside (`enum E { A, B }`) while a dict
+  stays tight (`{"k": v}`) and an empty enum is tight (`{}`). Byte-identical to gdformat.
+
 Still not implemented:
 
-3. **Enum-brace spacing.** gdformat spaces the inside of an **enum** body (`enum E { A, B }`) while
-   keeping **dict** braces tight (`{"k": v}`). We keep enum braces tight too.
-4. **Exploded method chains.** A method chain too long even for the compact paren-wrap is broken by
-   gdformat at each `.` with a leading-dot `. method` style. We leave such a (rare) chain on one line.
-5. **Leading-dot padding** on an already-wrapped dot-chain (`. method`) — we tighten it to `.method`
-   (the remaining `format(gold)!=gold` cases on chain-heavy files).
+3. **Exploded method chains + leading-dot padding.** A method chain too long even for the compact
+   paren-wrap is broken by gdformat at each `.`, leading-dot style (`. method`). We leave such a (rare)
+   chain on one line, and we tighten an *already*-wrapped chain's `. method` to `.method` — the main
+   remaining `format(gold)!=gold` cases (chain-heavy library code). Low practical impact (hand-written
+   code rarely pre-wraps chains).
 
 ### Smaller gaps
 

@@ -205,8 +205,19 @@ fn space_before(
     cur: SyntaxKind,
     top: Option<SyntaxKind>,
     prev_unary: bool,
+    top_enum: bool,
 ) -> Spacing {
     use SyntaxKind as S;
+    // An enum body is spaced inside (`{ A, B }`) — unlike a dict (`{"k": v}`) — but an empty `{}`
+    // stays tight. This overrides the bracket-hug rule below for the enum braces only.
+    if top_enum {
+        if prev == S::LBrace && cur != S::RBrace {
+            return Spacing::Single;
+        }
+        if cur == S::RBrace && prev != S::LBrace {
+            return Spacing::Single;
+        }
+    }
     // --- tight-forcing rules (these carve out every no-space case; the default is one space) ---
     // Hug the inside of brackets: `(x`, `x)`, `[1`, `1]`, `{k`, `v}`.
     if is_open_bracket(prev) || is_close_bracket(cur) {
@@ -374,6 +385,11 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
     // Innermost-first stack of open-bracket kinds: `.len()` is the old `bracket_depth` (drives the
     // continuation logic), `.last()` is the colon-context discriminator for spacing.
     let mut stack: Vec<SyntaxKind> = Vec::new();
+    // Parallel to the `{` entries in `stack`: whether each brace is an **enum body** (spaced inside,
+    // `{ A, B }`) rather than a dict (tight, `{"k": v}`). `pending_enum` is armed by an `enum` keyword
+    // and consumed by the brace it opens.
+    let mut brace_is_enum: Vec<bool> = Vec::new();
+    let mut pending_enum = false;
     // --- intra-line spacing state (all reset at a logical-line break) ---
     let mut prev_sig: Option<SyntaxKind> = None;
     let mut prev_unary = false;
@@ -426,6 +442,7 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 node_path = false;
                 pending_ws = None;
                 line_indent_ws = None;
+                pending_enum = false; // an `enum` keyword is consumed by its `{` within one line
             }
             SyntaxKind::NewlinePhys => {
                 if just_broke {
@@ -541,7 +558,15 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                             node_path = false; // any non-path token ends the run.
                             match prev_sig {
                                 Some(p) => {
-                                    space_before(p, t.kind, stack.last().copied(), prev_unary)
+                                    let top_enum = stack.last() == Some(&SyntaxKind::LBrace)
+                                        && brace_is_enum.last() == Some(&true);
+                                    space_before(
+                                        p,
+                                        t.kind,
+                                        stack.last().copied(),
+                                        prev_unary,
+                                        top_enum,
+                                    )
                                 }
                                 None => Spacing::None,
                             }
@@ -575,16 +600,28 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 line_had_content = true;
                 seen_content = true;
                 match t.kind {
-                    SyntaxKind::LParen | SyntaxKind::LBrack | SyntaxKind::LBrace => {
+                    SyntaxKind::LBrace => {
+                        stack.push(t.kind);
+                        brace_is_enum.push(pending_enum);
+                        pending_enum = false;
+                    }
+                    SyntaxKind::LParen | SyntaxKind::LBrack => {
                         stack.push(t.kind);
                     }
-                    SyntaxKind::RParen | SyntaxKind::RBrack | SyntaxKind::RBrace => {
+                    SyntaxKind::RBrace => {
+                        stack.pop();
+                        brace_is_enum.pop();
+                    }
+                    SyntaxKind::RParen | SyntaxKind::RBrack => {
                         stack.pop();
                     }
                     _ => {}
                 }
                 // Spacing state — significant tokens only (a comment is never an operand).
                 if !t.kind.is_trivia() {
+                    if t.kind == SyntaxKind::EnumKw {
+                        pending_enum = true; // the next `{` opens an enum body
+                    }
                     let unary_ctx = prev_sig.is_none_or(|p| !is_operand_end(p));
                     // Enter node-path mode after a `$` (always) or a `%` in sigil position (a `%`
                     // after an operand is modulo, and stays a normal binary operator).
@@ -2400,6 +2437,24 @@ mod tests {
     fn magic_trailing_comma_is_idempotent() {
         let once = fmt("var a = call(x, y,)\n");
         assert_eq!(fmt(&once), once);
+    }
+
+    // ---- Phase-4: enum-brace spacing ----
+
+    #[test]
+    fn enum_braces_are_spaced_dicts_are_not() {
+        assert_eq!(fmt("enum E {A, B, C}\n"), "enum E { A, B, C }\n");
+        assert_eq!(fmt("enum {A, B}\n"), "enum { A, B }\n"); // anonymous
+        assert_eq!(
+            fmt("enum Named {RED = 1, GREEN = 2}\n"),
+            "enum Named { RED = 1, GREEN = 2 }\n"
+        );
+        assert_eq!(fmt("enum Empty {}\n"), "enum Empty {}\n"); // empty stays tight
+        // a dict literal stays tight even right after an enum on the previous line
+        assert_eq!(
+            fmt("enum E {A}\nvar d = {\"k\": 1}\n"),
+            "enum E { A }\nvar d = {\"k\": 1}\n"
+        );
     }
 
     // ---- Phase-4: operator-chain wrapping ----
