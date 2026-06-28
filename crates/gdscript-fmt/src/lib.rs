@@ -307,15 +307,29 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
             // `Newline` only follows a statement, so it always terminates a content line.
             SyntaxKind::Newline => {
                 trim_trailing_inline_ws(&mut out);
-                emit_break(
-                    &mut out,
-                    collapse_on,
-                    &mut line_had_content,
-                    &mut pending_blanks,
-                );
-                line_start = true;
+                if stack.is_empty() {
+                    // A normal logical-line break: the next line is re-indented from `depth`.
+                    emit_break(
+                        &mut out,
+                        collapse_on,
+                        &mut line_had_content,
+                        &mut pending_blanks,
+                    );
+                    line_start = true;
+                    prev_sig = None;
+                } else {
+                    // A synthetic break *inside brackets* is a multi-line lambda-body line break:
+                    // the prepass suppresses synthetic layout inside brackets EXCEPT for a lambda
+                    // body, for which it re-emits `Newline`/`Indent`/`Dedent`. Treat it like a
+                    // `NewlinePhys` continuation and keep the bracketed interior verbatim — do NOT
+                    // re-indent the body from `depth`. The body's verbatim-aligned *header* arrives
+                    // via `NewlinePhys` (kept verbatim), so depth-re-indenting only the body makes
+                    // the two disagree and produces non-parsing output. Canonical reflow of a
+                    // bracketed lambda block is the increment-C reflow's job, not the indenter's.
+                    out.push('\n');
+                    cont_line_start = true;
+                }
                 just_broke = true;
-                prev_sig = None;
                 node_path = false;
                 pending_ws = None;
             }
@@ -736,21 +750,46 @@ mod tests {
     }
 
     #[test]
-    fn safe_mode_never_corrupts_multiline_lambda_argument() {
-        // A multi-line lambda passed as a call argument is a block *inside* brackets; the indenter
-        // re-indents its body to block depth, which can mis-structure it (a pre-existing indentation
-        // limitation, not a spacing one — to be handled by the increment-C reflow). safe_mode
-        // guarantees the output always parses: it falls back to the verbatim source on a
-        // non-parsing reformat. (Verified across the godot-demo-projects corpus: spacing changes
-        // never alter the token sequence or break idempotence; the only safe_mode fallbacks are
-        // these lambda-in-brackets files.)
+    fn multiline_lambda_argument_interior_is_kept_verbatim() {
+        // A multi-line lambda passed as a call argument is a block *inside* brackets. The prepass
+        // re-emits synthetic layout (`Newline`/`Indent`/`Dedent`) for the lambda body even inside
+        // the brackets; the indenter treats that synthetic break like a `NewlinePhys` continuation
+        // and keeps the whole bracketed interior **verbatim** — it does NOT re-indent the body from
+        // block depth (which used to disagree with the verbatim-aligned header and emit non-parsing
+        // code, the one pre-existing limitation that previously needed a safe_mode fallback).
+        // Canonical reflow of the bracketed block is the increment-C reflow's job.
         let src = "func _r():\n\tx.connect(func() -> void:\n\t\tdo_thing()\n\t)\n";
         let out = fmt(src);
-        assert!(
-            parses_clean(&out),
-            "must never emit non-parsing code: {out:?}"
+        assert_eq!(
+            out, src,
+            "bracketed lambda interior must be preserved verbatim"
         );
+        assert!(parses_clean(&out), "{out:?}");
         assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn over_indented_lambda_in_brackets_does_not_corrupt() {
+        // The exact corpus shapes (godot-demo-projects rhythm_game) that used to format to
+        // non-parsing code: the lambda HEADER sits on its own bracket-continuation line at an
+        // author-chosen over-indent, and the BODY (synthetic-Newline) must stay aligned with it,
+        // not snap back to block depth. Both are now kept verbatim and parse.
+        let note_manager = "func _ready() -> void:\n\t_play_stats.changed.connect(\n\t\t\tfunc() -> void:\n\t\t\t\tplay_stats_updated.emit(_play_stats)\n\t\t\t\t)\n";
+        let main_gd = "func _r() -> void:\n\tlatency_line_edit.text_submitted.connect(\n\t\tfunc(_text: String) -> void:\n\t\t\tlatency_line_edit.release_focus())\n";
+        for src in [note_manager, main_gd] {
+            // safe_mode OFF so a regression would surface as a real assert, not a silent fallback.
+            let cfg = FmtConfig {
+                safe_mode: false,
+                ..FmtConfig::default()
+            };
+            let out = format(src, &cfg);
+            assert!(parses_clean(&out), "lambda-in-brackets must parse: {out:?}");
+            assert!(
+                super::same_significant_tokens(src, &out),
+                "tokens changed: {out:?}"
+            );
+            assert_eq!(format(&out, &cfg), out, "idempotent: {out:?}");
+        }
     }
 
     #[test]
