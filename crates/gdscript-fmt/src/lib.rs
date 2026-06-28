@@ -6,14 +6,21 @@
 //! token (keywords, identifiers, literals — including multi-line strings, which are single tokens)
 //! is emitted **verbatim**, so meaning cannot change.
 //!
+//! It also normalizes **intra-line spacing** (Phase-4 increment A): one space around binary
+//! operators / assignments / `->` / `:=`, after `,` and `:` (in type-annotation and dict contexts),
+//! hugged brackets (`f(x, y)`, `[1, 2]`), tight member access (`a.b`), and tight unary `-x`. The
+//! decision is purely local (previous significant token + innermost bracket), and the genuinely
+//! ambiguous contexts — slice colons `arr[a:b]`, and node-path sigils `$Node/Path` / `%Unique`
+//! (where a stray space around `/` would silently change meaning **without** changing the token
+//! sequence) — are left **verbatim** / kept tight by a small node-path state machine.
+//!
 //! **Safe by construction.** In `safe_mode` (the default) the formatter (a) refuses to touch a
 //! file with syntax errors, and (b) re-lexes its own output and **falls back to the original** if
 //! the significant token sequence changed. So it never corrupts code, even input it doesn't fully
 //! understand. The result is idempotent: `format(format(x)) == format(x)`.
 //!
-//! Intra-line spacing normalization and line-reflow (full `gdformat` parity, the Wadler/Prettier
-//! `Doc`-IR pretty-printer) are the documented next step — see `TECH_DEBT.md`. Today the formatter
-//! owns indentation + whitespace, which is the most common formatting need and the safest subset.
+//! Line-reflow / wrapping (full `gdformat` parity via a Wadler/Prettier `Doc`-IR pretty-printer)
+//! is the documented next step — see `TECH_DEBT.md`.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use gdscript_syntax::SyntaxKind;
@@ -27,6 +34,10 @@ pub struct FmtConfig {
     pub indent_size: usize,
     /// The target line width for reflow. **Reserved** — line-wrapping is not yet implemented.
     pub line_width: usize,
+    /// Normalize intra-line spacing between tokens (one space around binary operators, after
+    /// `,`/`:`, hugged brackets, tight member access + unary). On by default. Turn off to format
+    /// **indentation only** (the pre-increment-A behavior).
+    pub normalize_spacing: bool,
     /// Re-parse + significant-token-equality fallback to verbatim. Keep on unless you have a
     /// reason not to: it is the guarantee the formatter never changes meaning.
     pub safe_mode: bool,
@@ -38,6 +49,7 @@ impl Default for FmtConfig {
             use_tabs: true,
             indent_size: 4,
             line_width: 100,
+            normalize_spacing: true,
             safe_mode: true,
         }
     }
@@ -82,29 +94,174 @@ pub fn format(source: &str, config: &FmtConfig) -> String {
     out
 }
 
-/// Re-emit the pre-pass token stream with normalized indentation + trailing whitespace + a single
-/// final newline. Significant tokens (and continuation lines inside bracketed expressions) are
-/// emitted verbatim; only a *logical* line's leading indentation is rewritten, to its block depth.
+/// Inter-token spacing: how to join two adjacent significant tokens on one logical line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spacing {
+    /// Tight — no space (`a.b`, `f(`, before `,`/`)`).
+    None,
+    /// Exactly one space (` + `, `, ` after a comma, ` = `).
+    Single,
+    /// Keep the original inter-token whitespace — the ambiguous contexts we refuse to normalize
+    /// (a slice colon `arr[a:b]`). Emits nothing when there was no original whitespace.
+    Verbatim,
+}
+
+/// A value-completing token: a following `+`/`-`/`~` is **binary** (not unary), and a following
+/// `(`/`[` is a **call**/**subscript** (not a grouping paren / array literal).
+fn is_operand_end(k: SyntaxKind) -> bool {
+    use SyntaxKind as S;
+    matches!(
+        k,
+        S::Int
+            | S::Float
+            | S::String
+            | S::StringName
+            | S::NodePath
+            | S::Ident
+            | S::True
+            | S::False
+            | S::Null
+            | S::ConstPi
+            | S::ConstTau
+            | S::ConstInf
+            | S::ConstNan
+            | S::SelfKw
+            | S::SuperKw
+            | S::RParen
+            | S::RBrack
+            | S::RBrace
+    )
+}
+
+fn is_open_bracket(k: SyntaxKind) -> bool {
+    matches!(
+        k,
+        SyntaxKind::LParen | SyntaxKind::LBrack | SyntaxKind::LBrace
+    )
+}
+
+fn is_close_bracket(k: SyntaxKind) -> bool {
+    matches!(
+        k,
+        SyntaxKind::RParen | SyntaxKind::RBrack | SyntaxKind::RBrace
+    )
+}
+
+/// The spacing to insert *before* `cur`, given the previous significant token `prev` on the same
+/// logical line, the innermost open-bracket kind `top`, and whether `prev` was a **unary** prefix
+/// operator. Node-path runs (`$Node/Path`, `%Unique`) are forced tight by the caller and never
+/// reach here, so a bare `Slash`/`Percent` here is always division/modulo.
+fn space_before(
+    prev: SyntaxKind,
+    cur: SyntaxKind,
+    top: Option<SyntaxKind>,
+    prev_unary: bool,
+) -> Spacing {
+    use SyntaxKind as S;
+    // --- tight-forcing rules (these carve out every no-space case; the default is one space) ---
+    // Hug the inside of brackets: `(x`, `x)`, `[1`, `1]`, `{k`, `v}`.
+    if is_open_bracket(prev) || is_close_bracket(cur) {
+        return Spacing::None;
+    }
+    // Member access is tight both sides (`.5` / `1.0` are single Float tokens, so a bare `Dot` is
+    // always member access).
+    if cur == S::Dot || prev == S::Dot {
+        return Spacing::None;
+    }
+    // No space before a separator; `@export` is tight after the `@`.
+    if cur == S::Comma || cur == S::Semicolon || prev == S::At {
+        return Spacing::None;
+    }
+    // Tight after a unary prefix operator: `-x`, `+x`, `~x`, `!x`.
+    if prev == S::Tilde || prev == S::Bang || ((prev == S::Minus || prev == S::Plus) && prev_unary)
+    {
+        return Spacing::None;
+    }
+    // Colon: never a space *before* it; *after* it, a dict/type-annotation colon gets one space,
+    // while a slice colon inside `[ ]` is left verbatim (a subscript and a slice are not
+    // distinguishable from local context). `:=` is its own token, handled by the default.
+    if cur == S::Colon {
+        return if top == Some(S::LBrack) {
+            Spacing::Verbatim
+        } else {
+            Spacing::None
+        };
+    }
+    if prev == S::Colon {
+        return if top == Some(S::LBrack) {
+            Spacing::Verbatim
+        } else {
+            Spacing::Single
+        };
+    }
+    // After a separator: one space (`a, b`).
+    if prev == S::Comma || prev == S::Semicolon {
+        return Spacing::Single;
+    }
+    // Open paren: a call hugs an operand callee (`f(`, `a.b(`, `preload(`, `assert(`), and a lambda
+    // header hugs its `func` (`func(x):` — a bare `func(` is always a lambda; a named func has
+    // `func name(`). A grouping paren after a value-keyword keeps its space (`return (x)`, `if (c)`).
+    if cur == S::LParen {
+        return if is_operand_end(prev)
+            || prev == S::PreloadKw
+            || prev == S::AssertKw
+            || prev == S::FuncKw
+        {
+            Spacing::None
+        } else {
+            Spacing::Single
+        };
+    }
+    // Open bracket: a subscript / typed-collection hugs an operand (`arr[i]`, `Array[int]`); an
+    // array literal after an operator/keyword/`,` is spaced.
+    if cur == S::LBrack {
+        return if is_operand_end(prev) {
+            Spacing::None
+        } else {
+            Spacing::Single
+        };
+    }
+    // Everything else — binary/keyword operators, assignments, `->`, `:=`, `{`, atoms, words, and a
+    // unary prefix *before* its operand — takes exactly one space.
+    Spacing::Single
+}
+
+/// Re-emit the pre-pass token stream with normalized **indentation**, **intra-line spacing** (when
+/// `config.normalize_spacing`), trailing whitespace, and a single final newline. Significant token
+/// *text* is always emitted verbatim (so meaning is preserved); only the whitespace *between*
+/// tokens — and a logical line's leading indentation — is rewritten. Bracketed-continuation
+/// interiors and node-path runs are kept verbatim / tight (see the module docs).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cohesive token-stream state machine; the indentation, spacing, bracket-stack and node-path transitions are interdependent and clearer kept together than split across helpers"
+)]
 fn reindent(source: &str, config: &FmtConfig) -> String {
     let raw = gdscript_syntax::tokenize(source);
     let (toks, _diags) = gdscript_syntax::run_prepass(&raw, source);
     let unit = config.indent_unit();
+    let spacing_on = config.normalize_spacing;
 
     let mut out = String::with_capacity(source.len() + 16);
     let mut depth: usize = 0;
-    // `true` while we are at the start of a logical line, before its first significant token — the
-    // point at which we (re)emit the indentation, once `depth` is final.
+    // `true` at the start of a logical line, before its first significant token (when we re-emit
+    // the indentation, `depth` being final by then).
     let mut line_start = true;
-    // A synthetic `Newline` (zero-width) precedes the real `NewlinePhys` that carries the line's
-    // bytes; this flag swallows that one `NewlinePhys` so the break is emitted exactly once. A
-    // `NewlinePhys` *not* so flagged is either a bracketed-continuation physical newline (kept
-    // verbatim, interior preserved) or the terminator of a comment-only/blank line the prepass
-    // copies verbatim *without* a synthetic `Newline` — those two are told apart by `bracket_depth`.
+    // A synthetic `Newline` precedes the `NewlinePhys` carrying the line's bytes; this swallows that
+    // one `NewlinePhys` so the break is emitted once. See the original notes below.
     let mut just_broke = false;
-    // Open-bracket nesting depth of the significant tokens emitted so far. The prepass suppresses
-    // synthetic line breaks inside brackets, so a `NewlinePhys` with `bracket_depth == 0` always
-    // ends a logical (or comment-only) line, and the *next* line's indentation must be re-emitted.
-    let mut bracket_depth: usize = 0;
+    // Innermost-first stack of open-bracket kinds: `.len()` is the old `bracket_depth` (drives the
+    // continuation logic), `.last()` is the colon-context discriminator for spacing.
+    let mut stack: Vec<SyntaxKind> = Vec::new();
+    // --- intra-line spacing state (all reset at a logical-line break) ---
+    let mut prev_sig: Option<SyntaxKind> = None;
+    let mut prev_unary = false;
+    let mut node_path = false;
+    // Original inter-token whitespace, buffered so the next token can keep it (`Verbatim`) or drop
+    // it (and re-synthesize). Only used when `spacing_on`.
+    let mut pending_ws: Option<&str> = None;
+    // Set after a physical newline *inside* brackets: the next line's leading whitespace (alignment)
+    // is kept verbatim — increment A does not reflow bracketed continuations.
+    let mut cont_line_start = false;
 
     for t in &toks {
         let text = &source[t.range];
@@ -117,6 +274,9 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 out.push('\n');
                 line_start = true;
                 just_broke = true;
+                prev_sig = None;
+                node_path = false;
+                pending_ws = None;
             }
             SyntaxKind::NewlinePhys => {
                 if just_broke {
@@ -124,20 +284,26 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 } else {
                     trim_trailing_inline_ws(&mut out);
                     out.push('\n');
-                    // Outside brackets this newline ends a comment-only / blank line the prepass
-                    // copied verbatim (no synthetic `Newline`), so the next line must be
-                    // re-indented. Inside brackets it is a real continuation — leave it verbatim.
-                    if bracket_depth == 0 {
+                    node_path = false;
+                    pending_ws = None;
+                    // Outside brackets this ends a comment-only / blank line copied verbatim (no
+                    // synthetic `Newline`), so the next line is re-indented. Inside brackets it is a
+                    // real continuation — keep the next line's alignment verbatim.
+                    if stack.is_empty() {
                         line_start = true;
+                        prev_sig = None;
+                    } else {
+                        cont_line_start = true;
                     }
                 }
             }
             SyntaxKind::Whitespace => {
                 if line_start {
-                    // A logical line's leading indentation — dropped; the normalized indentation is
-                    // emitted at the first significant token (so `depth` is final by then).
+                    // Leading indentation — dropped; re-synthesized at the first significant token.
+                } else if spacing_on {
+                    pending_ws = Some(text); // buffered; the next token decides whether to keep it.
                 } else {
-                    out.push_str(text);
+                    out.push_str(text); // indentation-only mode: original verbatim behavior.
                 }
             }
             // A significant token or a comment.
@@ -147,17 +313,79 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                         out.push_str(&unit);
                     }
                     line_start = false;
+                    cont_line_start = false;
+                } else if spacing_on {
+                    if cont_line_start {
+                        // First token of a bracketed continuation: keep its leading alignment.
+                        if let Some(ws) = pending_ws {
+                            out.push_str(ws);
+                        }
+                        cont_line_start = false;
+                    } else if t.kind.is_trivia() {
+                        // A comment / line-continuation / BOM: keep the original spacing before it.
+                        if let Some(ws) = pending_ws {
+                            out.push_str(ws);
+                        }
+                        node_path = false;
+                    } else {
+                        // A significant token: synthesize the spacing. Inside a node-path run we
+                        // keep the *original* spacing verbatim — a real `$Node/Path` is already
+                        // tight (so it stays tight), and we must never *collapse* a genuinely-spaced
+                        // `$A / b` (a division) into a node path, which would silently change meaning
+                        // with an identical token sequence (the safety net cannot catch it).
+                        let spacing = if node_path
+                            && matches!(
+                                t.kind,
+                                SyntaxKind::Ident | SyntaxKind::Slash | SyntaxKind::String
+                            ) {
+                            Spacing::Verbatim
+                        } else {
+                            node_path = false; // any non-path token ends the run.
+                            match prev_sig {
+                                Some(p) => {
+                                    space_before(p, t.kind, stack.last().copied(), prev_unary)
+                                }
+                                None => Spacing::None,
+                            }
+                        };
+                        match spacing {
+                            Spacing::None => {}
+                            Spacing::Single => out.push(' '),
+                            Spacing::Verbatim => {
+                                if let Some(ws) = pending_ws {
+                                    out.push_str(ws);
+                                }
+                            }
+                        }
+                    }
                 }
+                pending_ws = None;
                 just_broke = false;
                 out.push_str(text);
                 match t.kind {
                     SyntaxKind::LParen | SyntaxKind::LBrack | SyntaxKind::LBrace => {
-                        bracket_depth += 1;
+                        stack.push(t.kind);
                     }
                     SyntaxKind::RParen | SyntaxKind::RBrack | SyntaxKind::RBrace => {
-                        bracket_depth = bracket_depth.saturating_sub(1);
+                        stack.pop();
                     }
                     _ => {}
+                }
+                // Spacing state — significant tokens only (a comment is never an operand).
+                if !t.kind.is_trivia() {
+                    let unary_ctx = prev_sig.is_none_or(|p| !is_operand_end(p));
+                    // Enter node-path mode after a `$` (always) or a `%` in sigil position (a `%`
+                    // after an operand is modulo, and stays a normal binary operator).
+                    if t.kind == SyntaxKind::Dollar || (t.kind == SyntaxKind::Percent && unary_ctx)
+                    {
+                        node_path = true;
+                    }
+                    prev_unary = match t.kind {
+                        SyntaxKind::Minus | SyntaxKind::Plus => unary_ctx,
+                        SyntaxKind::Tilde | SyntaxKind::Bang => true,
+                        _ => false,
+                    };
+                    prev_sig = Some(t.kind);
                 }
             }
         }
@@ -326,5 +554,199 @@ mod tests {
         assert!(parses_clean(&out), "{out:?}");
         assert!(super::same_significant_tokens(src, &out));
         assert_eq!(fmt(&out), out, "must be idempotent");
+    }
+
+    // ---- Phase-4 increment A: intra-line spacing ----
+
+    /// Format a single statement inside a function body, returning just the (de-indented) body line.
+    /// Wrapping keeps `safe_mode` happy (a bare statement is not a valid top-level form).
+    fn fmt_stmt(stmt: &str) -> String {
+        let src = format!("func _f():\n\t{stmt}\n");
+        let out = fmt(&src);
+        out.strip_prefix("func _f():\n\t")
+            .and_then(|s| s.strip_suffix('\n'))
+            .unwrap_or(&out)
+            .to_owned()
+    }
+
+    #[test]
+    fn spacing_operators_and_assignment() {
+        assert_eq!(fmt_stmt("var x=a+b"), "var x = a + b");
+        assert_eq!(fmt_stmt("var x = a-b"), "var x = a - b"); // binary minus
+        assert_eq!(fmt_stmt("var t = a   *   b"), "var t = a * b"); // collapse runs
+        assert_eq!(
+            fmt_stmt("var z = a==b and c!=d"),
+            "var z = a == b and c != d"
+        );
+        assert_eq!(fmt_stmt("x+=1"), "x += 1");
+    }
+
+    #[test]
+    fn spacing_brackets_and_commas() {
+        assert_eq!(fmt_stmt("foo( x ,y )"), "foo(x, y)");
+        assert_eq!(fmt_stmt("var a = [1,2]"), "var a = [1, 2]");
+        assert_eq!(
+            fmt_stmt("var d = {\"x\":1,\"y\":2}"),
+            "var d = {\"x\": 1, \"y\": 2}"
+        );
+        assert_eq!(
+            fmt_stmt("var n = obj . field . method ( )"),
+            "var n = obj.field.method()"
+        );
+    }
+
+    #[test]
+    fn spacing_type_annotation_and_default_args() {
+        assert_eq!(fmt_stmt("var x:int=1"), "var x: int = 1");
+        // Typed default `=` is spaced (we do not replicate Black's untyped `x=1`); arrow + header colon.
+        assert_eq!(
+            fmt("func f(a,b:int=1)->int:\n\treturn 0\n"),
+            "func f(a, b: int = 1) -> int:\n\treturn 0\n"
+        );
+        assert_eq!(fmt_stmt("var a:Array[int]=[]"), "var a: Array[int] = []");
+    }
+
+    #[test]
+    fn spacing_unary_minus() {
+        assert_eq!(fmt_stmt("var x = -1"), "var x = -1"); // unary after `=`
+        assert_eq!(fmt_stmt("foo( -1 , -2 )"), "foo(-1, -2)"); // unary in call
+        assert_eq!(fmt_stmt("var a = [-1,-2]"), "var a = [-1, -2]"); // unary in array
+        assert_eq!(fmt_stmt("var n = -2**2"), "var n = -2 ** 2"); // unary then power
+        assert_eq!(fmt_stmt("var d = a - -b"), "var d = a - -b"); // binary then unary
+    }
+
+    #[test]
+    fn spacing_percent_is_modulo_or_format_when_after_an_operand() {
+        assert_eq!(fmt_stmt("var r = a%b"), "var r = a % b"); // modulo
+        assert_eq!(fmt_stmt("var s = \"%d\"%n"), "var s = \"%d\" % n"); // format operator
+    }
+
+    #[test]
+    fn spacing_node_paths_stay_tight() {
+        // The correctness-critical cases: a node path must NOT gain spaces around `/` (that would
+        // turn `$Player/Bone` into a division with an identical token sequence).
+        assert_eq!(
+            fmt_stmt("var n = get_node($Player/Bone)"),
+            "var n = get_node($Player/Bone)"
+        );
+        assert_eq!(fmt_stmt("var u = %Unique/Child"), "var u = %Unique/Child");
+        assert_eq!(
+            fmt_stmt("var p = $\"Player\".position"),
+            "var p = $\"Player\".position"
+        );
+        // StringName / NodePath literals are single tokens — untouched atoms.
+        assert_eq!(fmt_stmt("var v = &\"Name\""), "var v = &\"Name\"");
+        assert_eq!(fmt_stmt("var q = ^\"a/b\""), "var q = ^\"a/b\"");
+    }
+
+    #[test]
+    fn spacing_keywords_paren_callee_and_grouping() {
+        assert_eq!(
+            fmt_stmt("var p = preload ( \"res://x.gd\" )"),
+            "var p = preload(\"res://x.gd\")"
+        );
+        assert_eq!(fmt_stmt("var x = a if c else b"), "var x = a if c else b"); // ternary
+        assert_eq!(fmt_stmt("var y = not  flag"), "var y = not flag");
+        assert_eq!(fmt_stmt("var z = n is int"), "var z = n is int");
+        // a grouping paren after a value-keyword keeps its space; a call paren hugs.
+        assert_eq!(fmt_stmt("return ( x )"), "return (x)");
+    }
+
+    #[test]
+    fn spacing_lambda_func_paren_is_tight() {
+        // Corpus regression: a lambda `func(...)` must hug its `func` — `func (` does not parse.
+        // (A named function declaration has `func name(`, which is unaffected.)
+        assert_eq!(
+            fmt_stmt("var cb = func( ) -> void:\n\t\tpass"),
+            "var cb = func() -> void:\n\t\tpass"
+        );
+        assert_eq!(
+            fmt_stmt("var g = func(_text:String)->void:\n\t\tpass"),
+            "var g = func(_text: String) -> void:\n\t\tpass"
+        );
+        assert_eq!(
+            fmt("func named(a,b):\n\tpass\n"),
+            "func named(a, b):\n\tpass\n"
+        );
+    }
+
+    #[test]
+    fn safe_mode_never_corrupts_multiline_lambda_argument() {
+        // A multi-line lambda passed as a call argument is a block *inside* brackets; the indenter
+        // re-indents its body to block depth, which can mis-structure it (a pre-existing indentation
+        // limitation, not a spacing one — to be handled by the increment-C reflow). safe_mode
+        // guarantees the output always parses: it falls back to the verbatim source on a
+        // non-parsing reformat. (Verified across the godot-demo-projects corpus: spacing changes
+        // never alter the token sequence or break idempotence; the only safe_mode fallbacks are
+        // these lambda-in-brackets files.)
+        let src = "func _r():\n\tx.connect(func() -> void:\n\t\tdo_thing()\n\t)\n";
+        let out = fmt(src);
+        assert!(
+            parses_clean(&out),
+            "must never emit non-parsing code: {out:?}"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn spacing_annotation_is_tight() {
+        assert_eq!(
+            fmt("@export_range(0,100)\nvar speed = 1\n"),
+            "@export_range(0, 100)\nvar speed = 1\n"
+        );
+        assert_eq!(fmt("@export var hp=100\n"), "@export var hp = 100\n");
+    }
+
+    #[test]
+    fn spacing_colon_in_brackets_left_verbatim() {
+        // GDScript has no Python-style slice syntax, so a colon inside `[ ]` never appears in valid
+        // code — but defensively we leave its spacing verbatim (not locally distinguishable from
+        // other colon roles). Exercised with safe_mode OFF, since the construct does not parse; the
+        // rest of the line is still normalized while the `[a:b]` colon spacing is preserved.
+        let cfg = FmtConfig {
+            safe_mode: false,
+            ..FmtConfig::default()
+        };
+        assert_eq!(
+            format("func _f():\n\tvar d = data[a:b]\n", &cfg),
+            "func _f():\n\tvar d = data[a:b]\n"
+        );
+        assert_eq!(
+            format("func _f():\n\tvar e=data[a : b]\n", &cfg),
+            "func _f():\n\tvar e = data[a : b]\n"
+        );
+    }
+
+    #[test]
+    fn spacing_is_idempotent_across_cases() {
+        let cases = [
+            "var x = a+b*c-d",
+            "func f(a,b:int=1)->int:\n\treturn a",
+            "var n = get_node($Player/Bone).position",
+            "var d = {\"k\": foo(-1, 2), \"m\": items.slice(i, j)}",
+            "var z = a if b<c else -d",
+        ];
+        for c in cases {
+            let src = format!("func _w():\n\t{c}\n");
+            let once = fmt(&src);
+            assert_eq!(fmt(&once), once, "not idempotent for {c:?}: {once:?}");
+            assert!(parses_clean(&once), "did not parse: {once:?}");
+            assert!(
+                super::same_significant_tokens(&src, &once),
+                "tokens changed for {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spacing_off_is_indentation_only() {
+        // With `normalize_spacing` off, the formatter touches indentation only (the old behavior):
+        // intra-line spacing is left exactly as written.
+        let cfg = FmtConfig {
+            normalize_spacing: false,
+            ..FmtConfig::default()
+        };
+        let src = "func f():\n    var x=a+b\n";
+        assert_eq!(format(src, &cfg), "func f():\n\tvar x=a+b\n");
     }
 }

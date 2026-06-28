@@ -730,14 +730,30 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       token stream, every significant token verbatim, with a re-parse significant-token-equality
       fallback **plus** a parse-validity recheck — both added/hardened in the §1 pass), wired into
       `Analysis::format` + the CLI (`format --check/--write`/stdout) + LSP `textDocument/formatting`.
+      - [x] **Increment A — intra-line spacing — DONE (Phase 4, `feat/formatter-scene-rename`).** One
+        space around binary operators / assignments / `->` / `:=` / keyword operators, after `,` and a
+        type-annotation/dict `:`, hugged brackets (`f(x, y)`, `[1, 2]`), tight member access (`a.b`),
+        tight unary (`-x`), tight call/lambda parens (`f(`, `func(`, `preload(`, `assert(`). Purely
+        local (prev significant token + innermost bracket); the genuinely ambiguous contexts are left
+        verbatim/tight: a **slice colon** `arr[a:b]` (and GDScript has no slice syntax anyway, so it
+        never appears in valid code), and **node-path sigils** `$Node/Path` / `%Unique` via a small
+        state machine that keeps them *verbatim* — never collapsing a spaced `$A / b` (a division)
+        into a path, the one meaning-change the token-equality net cannot catch. Gated behind
+        `FmtConfig::normalize_spacing` (default on). **Verified** over the **godot-demo-projects +
+        ReactiveUI-Gadot corpus (502 clean-parsing files), safe_mode OFF: 0 token-sequence changes,
+        0 idempotence breaks.** The lambda-`func()` paren bug was found there and fixed.
+      - [ ] *Pre-existing indentation limitation (surfaced by the corpus, NOT a spacing issue, →
+        increment C):* a **multi-line lambda body passed as a call argument** is a block *inside*
+        brackets; the indenter re-indents its body to block depth and mis-structures it. The 2 such
+        corpus files are returned **verbatim** by safe_mode (it parse-rechecks the output) — so it is
+        safe today, but the right fix is the increment-C reflow that models bracketed blocks.
       *Cosmetic limitation (documented in `lib.rs`):* a comment that is the first line of a block is
-      left at column 0. Deferred (the bulk of `gdformat` parity): the **Wadler/Prettier `Doc` IR +
-      line-reflow** (wrapping long calls/arrays/dicts to `line_width`), **intra-line spacing
-      normalization** (one space around binary operators, after commas/colons), a blank-line policy
-      (2 between top-level defs / 1 inside), and `format_range`. **Concrete blocker for validation:**
-      a `gdformat`-differential golden corpus + a `DEVIATIONS.md` — without it, shipping reflow that
-      silently diverges from `gdformat` is worse than not having it. The reflow tail is additive on
-      the established `format()` API + safety net.
+      left at column 0. Deferred (the rest of `gdformat` parity): **B — blank-line policy** (2 between
+      top-level defs / 1 inside), and **C — the Wadler/Prettier `Doc` IR + line-reflow** (wrapping long
+      calls/arrays/dicts to `line_width`) + `format_range`. **Concrete blocker for C's validation:** a
+      `gdformat`-differential golden corpus + a `DEVIATIONS.md` — shipping reflow that silently diverges
+      from `gdformat` is worse than not having it. The reflow tail is additive on the established
+      `format()` API + safety net.
 - [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
 - [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
