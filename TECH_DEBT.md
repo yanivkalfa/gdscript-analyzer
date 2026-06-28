@@ -277,9 +277,24 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       ignores by default (§5). Broaden to the Godot demo-projects corpus before v1.
 
 ### FFI ergonomics
-- [ ] **Bindings return JSON strings,** not typed `#[napi(object)]` / `serde-wasm-bindgen`
-      objects. Works and is minimal; consider typed results for better TS/JS DX once the
-      result shapes stabilize.
+- [x] **Bindings return native JS values, not JSON strings — DONE (Phase 3, `feat/w1-warnings`).**
+      `gdscript-session` now returns `serde_json::Value` (was a JSON `String`); the napi binding
+      converts it directly via the `serde-json` feature and the wasm binding via
+      `serde_wasm_bindgen` (`Serializer::json_compatible()` — REQUIRED, else `Value::Object`
+      serializes as a JS `Map`, breaking `result.field`). No client-side `JSON.parse`. The single
+      source of truth stays the `gdscript-base` POD (no `#[napi(object)]`/POD re-declaration in the
+      binding crates — the `Value` route keeps them trivial delegators). Verified locally: 15
+      `gdscript-session` unit tests + the wasm32 build/clippy + the full `xtask ci` gate. The napi
+      `.node` itself is still CI-built only (no MSVC C++ build tools / no `libnode` locally — see
+      below); `bindings/node/hello.mjs` exercises the new contract in the CI node-smoke job.
+  - [x] **Mirror-free navigation.** The session injects a `"uri"` next to every `"file"` id in a
+        serialized result (a generic walk over `NavTarget`/`Reference`/`FileEdit`/`WouldCollide`),
+        so a client (guitkx) resolves cross-file targets without maintaining its own `FileId`→URI
+        mirror. Zero false-positive surface (every `gdscript-base` `file` field is a `FileId`).
+  - [ ] **Fully-typed TS surface (deferred, low value).** napi `serde_json::Value` types as `any`
+        in the generated `.d.ts`. Real TS types would need `#[napi(object)]` POD re-declaration (or
+        a generated-types step), trading the single-source-of-truth for DX. The client (guitkx) owns
+        its own TS interfaces today; revisit only if a published `.d.ts` becomes a requirement.
 
 ### Validation
 - [ ] **Differential corpus is small + error-agreement only.** The tree-sitter oracle

@@ -9,8 +9,10 @@
 //!
 //! All real logic lives in the pure-Rust, fully unit-tested `gdscript-session`; this crate just
 //! exposes it to JS. The page holds one [`Analyzer`], pushes documents by **URI string**, and
-//! queries by URI + **byte offset**; every query returns a **JSON string** of the engine-neutral
-//! `gdscript-base` POD (the page `JSON.parse`s it and maps byte offsets to UTF-16 — §4.3).
+//! queries by URI + **byte offset**; every query returns a **native JS object** — the session's
+//! [`serde_json::Value`] converted via `serde_wasm_bindgen` (json-compatible, so objects are plain
+//! objects, not JS `Map`s) — so the page does **not** `JSON.parse`. Navigation/edit results carry a
+//! `uri` per file (mirror-free). The page still maps byte offsets to UTF-16 (§4.3).
 //!
 //! **Engine model:** the `extension_api` blob is **not** embedded on `wasm32` (Playbook §4.4); the
 //! page `fetch`es it and installs it via [`Analyzer::load_engine_api`] before its first query, so
@@ -26,12 +28,24 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use gdscript_session::Session;
+use serde::Serialize;
+use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 /// Install a panic hook that routes Rust panics to the browser console (dev aid).
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
+}
+
+/// Convert a serializable value (the session's `serde_json::Value` results) into a native JS value.
+/// Uses `Serializer::json_compatible()` so a `serde_json::Value::Object` becomes a plain JS object
+/// (the default serializer would emit a JS `Map`, breaking `result.field` access). On the
+/// practically-impossible conversion failure, yields `null`.
+fn to_js<T: Serialize>(value: &T) -> JsValue {
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap_or(JsValue::NULL)
 }
 
 /// A live, URI-keyed analysis session in the browser. Construct once with `new Analyzer()`, push
@@ -96,87 +110,94 @@ impl Analyzer {
         self.session.is_open(&uri)
     }
 
-    // ---- queries (JSON strings of `gdscript-base` POD) ----
+    // ---- queries (native JS objects: `serde_json::Value` of `gdscript-base` POD) ----
 
-    /// Parse + type diagnostics for `uri`, as a JSON array string.
+    /// Parse + type diagnostics for `uri`, as a JS array.
     #[must_use]
-    pub fn diagnostics(&self, uri: String) -> String {
-        self.session.diagnostics(&uri)
+    pub fn diagnostics(&self, uri: String) -> JsValue {
+        to_js(&self.session.diagnostics(&uri))
     }
 
-    /// The document outline for `uri`, as a JSON array string.
+    /// The document outline for `uri`, as a JS array.
     #[wasm_bindgen(js_name = documentSymbols)]
     #[must_use]
-    pub fn document_symbols(&self, uri: String) -> String {
-        self.session.document_symbols(&uri)
+    pub fn document_symbols(&self, uri: String) -> JsValue {
+        to_js(&self.session.document_symbols(&uri))
     }
 
-    /// Foldable ranges for `uri`, as a JSON array string.
+    /// Foldable ranges for `uri`, as a JS array.
     #[wasm_bindgen(js_name = foldingRanges)]
     #[must_use]
-    pub fn folding_ranges(&self, uri: String) -> String {
-        self.session.folding_ranges(&uri)
+    pub fn folding_ranges(&self, uri: String) -> JsValue {
+        to_js(&self.session.folding_ranges(&uri))
     }
 
-    /// Inlay hints for `uri`, as a JSON array string.
+    /// Inlay hints for `uri`, as a JS array.
     #[wasm_bindgen(js_name = inlayHints)]
     #[must_use]
-    pub fn inlay_hints(&self, uri: String) -> String {
-        self.session.inlay_hints(&uri)
+    pub fn inlay_hints(&self, uri: String) -> JsValue {
+        to_js(&self.session.inlay_hints(&uri))
     }
 
-    /// Completions at a byte `offset` in `uri`, as a JSON array string.
+    /// Completions at a byte `offset` in `uri`, as a JS array.
     #[must_use]
-    pub fn completions(&self, uri: String, offset: u32) -> String {
-        self.session.completions(&uri, offset)
+    pub fn completions(&self, uri: String, offset: u32) -> JsValue {
+        to_js(&self.session.completions(&uri, offset))
     }
 
-    /// Hover at a byte `offset` in `uri`; `undefined` when there is nothing typed there.
+    /// Hover at a byte `offset` in `uri`; `null` when there is nothing typed there.
     #[must_use]
-    pub fn hover(&self, uri: String, offset: u32) -> Option<String> {
-        self.session.hover(&uri, offset)
+    pub fn hover(&self, uri: String, offset: u32) -> JsValue {
+        match self.session.hover(&uri, offset) {
+            Some(v) => to_js(&v),
+            None => JsValue::NULL,
+        }
     }
 
-    /// Signature help at a byte `offset` in `uri`; `undefined` when not at a call site.
+    /// Signature help at a byte `offset` in `uri`; `null` when not at a call site.
     #[wasm_bindgen(js_name = signatureHelp)]
     #[must_use]
-    pub fn signature_help(&self, uri: String, offset: u32) -> Option<String> {
-        self.session.signature_help(&uri, offset)
+    pub fn signature_help(&self, uri: String, offset: u32) -> JsValue {
+        match self.session.signature_help(&uri, offset) {
+            Some(v) => to_js(&v),
+            None => JsValue::NULL,
+        }
     }
 
-    /// Code actions at a byte `offset` in `uri`, as a JSON array string.
+    /// Code actions at a byte `offset` in `uri`, as a JS array.
     #[wasm_bindgen(js_name = codeActions)]
     #[must_use]
-    pub fn code_actions(&self, uri: String, offset: u32) -> String {
-        self.session.code_actions(&uri, offset)
+    pub fn code_actions(&self, uri: String, offset: u32) -> JsValue {
+        to_js(&self.session.code_actions(&uri, offset))
     }
 
-    /// Go-to-definition target(s) for the symbol at a byte `offset` in `uri`, as a JSON array string.
+    /// Go-to-definition target(s) for the symbol at a byte `offset` in `uri`, as a JS array (each
+    /// target carries a `uri`).
     #[wasm_bindgen(js_name = gotoDefinition)]
     #[must_use]
-    pub fn goto_definition(&self, uri: String, offset: u32) -> String {
-        self.session.goto_definition(&uri, offset)
+    pub fn goto_definition(&self, uri: String, offset: u32) -> JsValue {
+        to_js(&self.session.goto_definition(&uri, offset))
     }
 
-    /// Every reference to the symbol at a byte `offset` in `uri`, as a JSON array string.
+    /// Every reference to the symbol at a byte `offset` in `uri`, as a JS array (each carries a `uri`).
     #[wasm_bindgen(js_name = findReferences)]
     #[must_use]
-    pub fn find_references(&self, uri: String, offset: u32) -> String {
-        self.session.find_references(&uri, offset)
+    pub fn find_references(&self, uri: String, offset: u32) -> JsValue {
+        to_js(&self.session.find_references(&uri, offset))
     }
 
-    /// Rename the symbol at a byte `offset` in `uri` to `newName`. JSON object string:
-    /// `{"ok": <SourceChange>}` | `{"error": <RenameError | reason>}`.
+    /// Rename the symbol at a byte `offset` in `uri` to `newName`. A JS object:
+    /// `{ ok: <SourceChange> }` | `{ error: <RenameError | reason> }` (edits carry a `uri`).
     #[must_use]
-    pub fn rename(&self, uri: String, offset: u32, new_name: String) -> String {
-        self.session.rename(&uri, offset, &new_name)
+    pub fn rename(&self, uri: String, offset: u32, new_name: String) -> JsValue {
+        to_js(&self.session.rename(&uri, offset, &new_name))
     }
 
-    /// Project-wide symbols matching `query`, as a JSON array string.
+    /// Project-wide symbols matching `query`, as a JS array.
     #[wasm_bindgen(js_name = workspaceSymbols)]
     #[must_use]
-    pub fn workspace_symbols(&self, query: String) -> String {
-        self.session.workspace_symbols(&query)
+    pub fn workspace_symbols(&self, query: String) -> JsValue {
+        to_js(&self.session.workspace_symbols(&query))
     }
 
     /// The pretty-printed syntax tree for `uri` (debugging); `undefined` for an unknown `uri`.

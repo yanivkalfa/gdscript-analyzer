@@ -15,8 +15,11 @@ crate-type = ["cdylib", "lib"]
 # All real logic lives in the pure-Rust, fully-tested `gdscript-session`; this crate is a thin
 # #[napi] delegator (a napi crate can't be `cargo test`ed natively — no libnode at link time).
 gdscript-session = { workspace = true }
-napi = { workspace = true }
+# `serde-json` makes napi convert a `serde_json::Value` return straight into a native JS object (no
+# JSON.parse on the client); `serde_json` is needed to *name* `Value` in the binding signatures.
+napi = { workspace = true, features = ["serde-json"] }
 napi-derive = { workspace = true }
+serde_json = { workspace = true }
 
 [build-dependencies]
 napi-build = { workspace = true }

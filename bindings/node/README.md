@@ -35,13 +35,14 @@ func _ready() -> void:
 	print(half)
 `, null);
 
-// Diagnostics come back as a JSON string.
-console.log(JSON.parse(az.diagnostics(uri)));
+// Diagnostics come back as a native JS array — no JSON.parse.
+console.log(az.diagnostics(uri));
 // → [{ code: "INTEGER_DIVISION", severity: "warning", range: { start, end }, message: ... }]
 ```
 
-Every query that returns data returns a **JSON string** (parse it). Positions are
-**UTF-8 byte offsets** (see [Positions](#positions-byte-offsets) below).
+Every query returns a **native JS value** (object / array / `null`) — no
+`JSON.parse`. Positions are **UTF-8 byte offsets** (see
+[Positions](#positions-byte-offsets) below).
 
 ---
 
@@ -84,31 +85,33 @@ URI (re-sending would needlessly invalidate the resource-path registry). Use
 ## API
 
 All queries take a `uri`; offset-based queries take a UTF-8 **byte** `offset`.
-Array/object queries return a **JSON string**; the `… | null` ones return JS
-`null` when there's nothing at the offset.
+Array/object queries return a **native JS value**; the `… | null` ones return JS
+`null` when there's nothing at the offset. Navigation/edit results
+(`gotoDefinition`, `findReferences`, `rename`) carry a `uri` per target, so you
+need no `FileId`→URI mapping of your own.
 
 | Method | Returns | What |
 | --- | --- | --- |
-| `diagnostics(uri)` | JSON array | parse + type diagnostics |
-| `documentSymbols(uri)` | JSON array | the document outline |
-| `foldingRanges(uri)` | JSON array | foldable ranges |
-| `inlayHints(uri)` | JSON array | inferred-type / param inlay hints |
-| `completions(uri, offset)` | JSON array | completions at `offset` |
-| `hover(uri, offset)` | JSON string \| `null` | type + docs at `offset` |
-| `signatureHelp(uri, offset)` | JSON string \| `null` | active call signature |
-| `codeActions(uri, offset)` | JSON array | quick fixes at `offset` |
-| `gotoDefinition(uri, offset)` | JSON array | definition target(s) |
-| `findReferences(uri, offset)` | JSON array | all references |
-| `rename(uri, offset, newName)` | JSON string | `{"ok": SourceChange}` or `{"error": RenameError}` |
-| `workspaceSymbols(query)` | JSON array | project-wide symbol search |
-| `syntaxTree(uri)` | JSON string \| `null` | pretty-printed CST (debugging) |
+| `diagnostics(uri)` | array | parse + type diagnostics |
+| `documentSymbols(uri)` | array | the document outline |
+| `foldingRanges(uri)` | array | foldable ranges |
+| `inlayHints(uri)` | array | inferred-type / param inlay hints |
+| `completions(uri, offset)` | array | completions at `offset` |
+| `hover(uri, offset)` | object \| `null` | type + docs at `offset` |
+| `signatureHelp(uri, offset)` | object \| `null` | active call signature |
+| `codeActions(uri, offset)` | array | quick fixes at `offset` |
+| `gotoDefinition(uri, offset)` | array | definition target(s) (each with a `uri`) |
+| `findReferences(uri, offset)` | array | all references (each with a `uri`) |
+| `rename(uri, offset, newName)` | object | `{ ok: SourceChange }` or `{ error: RenameError }` |
+| `workspaceSymbols(query)` | array | project-wide symbol search |
+| `syntaxTree(uri)` | string \| `null` | pretty-printed CST (debugging) |
 
 ```js
 const offset = 38; // a UTF-8 byte offset into the document
-JSON.parse(az.completions(uri, offset));
-const hover = az.hover(uri, offset);          // string | null
-if (hover) console.log(JSON.parse(hover));
-JSON.parse(az.gotoDefinition(uri, offset));
+az.completions(uri, offset);                  // array
+const hover = az.hover(uri, offset);          // object | null
+if (hover) console.log(hover);
+az.gotoDefinition(uri, offset);               // array, each target has a `uri`
 ```
 
 ### Positions (byte offsets)

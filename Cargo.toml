@@ -97,6 +97,9 @@ napi-build = "2"
 # FFI — browser (wasm-bindgen + wasm-pack --target web). The static-page path.
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
+# Converts a `serde_json::Value` query result into a native JS object. MUST be driven via
+# `Serializer::json_compatible()` so `Value::Object` becomes a plain JS object, not a JS `Map`.
+serde-wasm-bindgen = "0.6"
 # Differential oracle — native-only, opt-in via the `tree-sitter-oracle` feature.
 # MSRV 1.90 > the workspace's 1.88, so it MUST stay optional + off by default (the
 # MSRV/wasm CI lanes use default features and never build it). Compiles a C parser via
