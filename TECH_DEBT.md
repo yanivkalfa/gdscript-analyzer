@@ -747,10 +747,18 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
         brackets; the indenter re-indents its body to block depth and mis-structures it. The 2 such
         corpus files are returned **verbatim** by safe_mode (it parse-rechecks the output) — so it is
         safe today, but the right fix is the increment-C reflow that models bracketed blocks.
+      - [x] **Increment B — blank-line policy — DONE (Phase 4, same branch).** Collapses runs of
+        blank lines (max 2 at top level, max 1 inside a block — capped against the *next* line's depth,
+        since the `Dedent` lands after the blanks) and strips leading blank lines. Done at the **token**
+        level (buffered blank-line counter flushed on the next content line), so a `\n` inside a
+        `"""..."""` multi-line string is never mistaken for a blank line. Gated behind
+        `FmtConfig::collapse_blank_lines` (default on). Corpus-reverified (502 files, safe_mode OFF: 0
+        token changes, 0 idempotence breaks). *Not yet done (→ a follow-up or increment C):* **inserting**
+        blank lines around top-level definitions (the additive half of gdformat's rule).
       *Cosmetic limitation (documented in `lib.rs`):* a comment that is the first line of a block is
-      left at column 0. Deferred (the rest of `gdformat` parity): **B — blank-line policy** (2 between
-      top-level defs / 1 inside), and **C — the Wadler/Prettier `Doc` IR + line-reflow** (wrapping long
-      calls/arrays/dicts to `line_width`) + `format_range`. **Concrete blocker for C's validation:** a
+      left at column 0. Deferred (the rest of `gdformat` parity): **C — the Wadler/Prettier `Doc` IR +
+      line-reflow** (wrapping long calls/arrays/dicts to `line_width`) + `format_range`, plus the
+      blank-line *insertion* half. **Concrete blocker for C's validation:** a
       `gdformat`-differential golden corpus + a `DEVIATIONS.md` — shipping reflow that silently diverges
       from `gdformat` is worse than not having it. The reflow tail is additive on the established
       `format()` API + safety net.

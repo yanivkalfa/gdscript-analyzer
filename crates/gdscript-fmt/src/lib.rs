@@ -27,6 +27,10 @@ use gdscript_syntax::SyntaxKind;
 
 /// Formatter options. Defaults match the Godot convention (tabs) and keep the safety net on.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "a plain user-facing options bag; each bool is an independent formatter toggle, not a state machine"
+)]
 pub struct FmtConfig {
     /// Indent with tabs (the Godot convention). `false` indents with [`indent_size`](Self::indent_size) spaces.
     pub use_tabs: bool,
@@ -38,6 +42,9 @@ pub struct FmtConfig {
     /// `,`/`:`, hugged brackets, tight member access + unary). On by default. Turn off to format
     /// **indentation only** (the pre-increment-A behavior).
     pub normalize_spacing: bool,
+    /// Collapse runs of blank lines (max 2 at top level, max 1 inside a block) and strip leading
+    /// blank lines. On by default. (Does not yet *insert* blank lines around definitions.)
+    pub collapse_blank_lines: bool,
     /// Re-parse + significant-token-equality fallback to verbatim. Keep on unless you have a
     /// reason not to: it is the guarantee the formatter never changes meaning.
     pub safe_mode: bool,
@@ -50,6 +57,7 @@ impl Default for FmtConfig {
             indent_size: 4,
             line_width: 100,
             normalize_spacing: true,
+            collapse_blank_lines: true,
             safe_mode: true,
         }
     }
@@ -226,6 +234,22 @@ fn space_before(
     Spacing::Single
 }
 
+/// Emit a logical-line break: a real `\n` for a content line, or — when collapsing blank lines —
+/// buffer a blank line into `pending_blanks` (flushed, capped, before the next content line).
+fn emit_break(
+    out: &mut String,
+    collapse_on: bool,
+    line_had_content: &mut bool,
+    pending_blanks: &mut usize,
+) {
+    if collapse_on && !*line_had_content {
+        *pending_blanks += 1; // a blank line — capped + flushed when the next content line starts.
+    } else {
+        out.push('\n');
+    }
+    *line_had_content = false;
+}
+
 /// Re-emit the pre-pass token stream with normalized **indentation**, **intra-line spacing** (when
 /// `config.normalize_spacing`), trailing whitespace, and a single final newline. Significant token
 /// *text* is always emitted verbatim (so meaning is preserved); only the whitespace *between*
@@ -240,9 +264,20 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
     let (toks, _diags) = gdscript_syntax::run_prepass(&raw, source);
     let unit = config.indent_unit();
     let spacing_on = config.normalize_spacing;
+    let collapse_on = config.collapse_blank_lines;
 
     let mut out = String::with_capacity(source.len() + 16);
     let mut depth: usize = 0;
+    // --- blank-line state (only used when `collapse_on`) ---
+    // Blank lines are buffered, not emitted, until the next content line: we then flush at most
+    // `cap` of them (2 at top level, 1 nested) — knowing the *next* line's depth, since the prepass
+    // emits the `Dedent` between a block and a following top-level line AFTER the blank lines.
+    let mut pending_blanks: usize = 0;
+    // Whether the current logical line emitted any content (a significant token or a comment) — a
+    // line that did not is a blank line.
+    let mut line_had_content = false;
+    // Whether any content has been emitted yet (leading blank lines are stripped entirely).
+    let mut seen_content = false;
     // `true` at the start of a logical line, before its first significant token (when we re-emit
     // the indentation, `depth` being final by then).
     let mut line_start = true;
@@ -268,10 +303,16 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
         match t.kind {
             SyntaxKind::Indent => depth += 1,
             SyntaxKind::Dedent => depth = depth.saturating_sub(1),
-            // A synthetic line break: ends the logical line; the next one is re-indented.
+            // A synthetic line break: ends the logical line; the next one is re-indented. A synthetic
+            // `Newline` only follows a statement, so it always terminates a content line.
             SyntaxKind::Newline => {
                 trim_trailing_inline_ws(&mut out);
-                out.push('\n');
+                emit_break(
+                    &mut out,
+                    collapse_on,
+                    &mut line_had_content,
+                    &mut pending_blanks,
+                );
                 line_start = true;
                 just_broke = true;
                 prev_sig = None;
@@ -283,16 +324,22 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                     just_broke = false; // its bytes belong to the synthetic break already emitted
                 } else {
                     trim_trailing_inline_ws(&mut out);
-                    out.push('\n');
                     node_path = false;
                     pending_ws = None;
-                    // Outside brackets this ends a comment-only / blank line copied verbatim (no
-                    // synthetic `Newline`), so the next line is re-indented. Inside brackets it is a
-                    // real continuation — keep the next line's alignment verbatim.
+                    // Outside brackets this ends a comment-only line (content) or a blank line, and
+                    // the next line is re-indented. Inside brackets it is a real continuation — keep
+                    // the next line's alignment verbatim and never collapse it.
                     if stack.is_empty() {
+                        emit_break(
+                            &mut out,
+                            collapse_on,
+                            &mut line_had_content,
+                            &mut pending_blanks,
+                        );
                         line_start = true;
                         prev_sig = None;
                     } else {
+                        out.push('\n');
                         cont_line_start = true;
                     }
                 }
@@ -309,6 +356,21 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
             // A significant token or a comment.
             _ => {
                 if line_start {
+                    // Flush the buffered blank lines, capped to the *next* line's context: 2 at top
+                    // level, 1 inside a block, and 0 before the first content (leading blanks gone).
+                    if collapse_on {
+                        let cap = if !seen_content {
+                            0
+                        } else if depth == 0 {
+                            2
+                        } else {
+                            1
+                        };
+                        for _ in 0..pending_blanks.min(cap) {
+                            out.push('\n');
+                        }
+                        pending_blanks = 0;
+                    }
                     for _ in 0..depth {
                         out.push_str(&unit);
                     }
@@ -362,6 +424,9 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 pending_ws = None;
                 just_broke = false;
                 out.push_str(text);
+                // Any token reaching here (a significant token or a comment) is line content.
+                line_had_content = true;
+                seen_content = true;
                 match t.kind {
                     SyntaxKind::LParen | SyntaxKind::LBrack | SyntaxKind::LBrace => {
                         stack.push(t.kind);
@@ -736,6 +801,56 @@ mod tests {
                 "tokens changed for {c:?}"
             );
         }
+    }
+
+    // ---- Phase-4 increment B: blank-line policy ----
+
+    #[test]
+    fn blank_lines_collapsed_top_level_to_two() {
+        // 4 blank lines between two top-level functions collapse to 2 (the cap uses the *next*
+        // line's depth — 0 here — even though the Dedent lands after the blanks).
+        let src = "func a():\n\tpass\n\n\n\n\nfunc b():\n\tpass\n";
+        assert_eq!(fmt(src), "func a():\n\tpass\n\n\nfunc b():\n\tpass\n");
+    }
+
+    #[test]
+    fn blank_lines_collapsed_inside_block_to_one() {
+        let src = "func a():\n\tvar x = 1\n\n\n\n\tvar y = 2\n";
+        assert_eq!(fmt(src), "func a():\n\tvar x = 1\n\n\tvar y = 2\n");
+    }
+
+    #[test]
+    fn leading_blank_lines_stripped() {
+        assert_eq!(fmt("\n\n\nfunc a():\n\tpass\n"), "func a():\n\tpass\n");
+    }
+
+    #[test]
+    fn single_blank_line_is_preserved() {
+        let src = "func a():\n\tpass\n\nfunc b():\n\tpass\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn blank_lines_inside_a_multiline_string_are_untouched() {
+        // The blank line lives inside a `"""..."""` token, NOT between logical lines — the
+        // token-level pass must never see it as a collapsible blank.
+        let src = "func a():\n\tvar s = \"\"\"x\n\n\n\ny\"\"\"\n\treturn s\n";
+        let out = fmt(src);
+        assert!(
+            out.contains("x\n\n\n\ny"),
+            "string interior collapsed: {out:?}"
+        );
+        assert!(super::same_significant_tokens(src, &out));
+    }
+
+    #[test]
+    fn blank_lines_off_preserved() {
+        let cfg = FmtConfig {
+            collapse_blank_lines: false,
+            ..FmtConfig::default()
+        };
+        let src = "func a():\n\tpass\n\n\n\n\nfunc b():\n\tpass\n";
+        assert_eq!(format(src, &cfg), src);
     }
 
     #[test]
