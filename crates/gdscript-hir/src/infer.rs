@@ -127,6 +127,22 @@ impl InferenceResult {
 /// Infer a lowered `body` (its `tail` initializer expression and/or its statement block).
 /// `return_ty` is the function's declared return type (`Variant` if none / for an
 /// initializer body).
+/// Every assignment-LHS `ExprId` in a body (`x = …` / `x += …`, all lowered to `BinOp::Assign`) —
+/// a *write* site, excluded from the `UNASSIGNED_VARIABLE` read-before-assign check.
+fn collect_assign_lhs(body: &Body) -> FxHashSet<ExprId> {
+    body.exprs
+        .iter()
+        .filter_map(|e| match e {
+            Expr::Bin {
+                op: BinOp::Assign,
+                lhs,
+                ..
+            } => Some(*lhs),
+            _ => None,
+        })
+        .collect()
+}
+
 #[must_use]
 pub fn infer(
     db: &dyn Db,
@@ -155,6 +171,17 @@ pub fn infer(
         narrowing: FxHashMap::default(),
         flow: flow::analyze(body),
         is_func_body,
+        assigned: flow::analyze_assigned(
+            body,
+            &body
+                .params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+        ),
+        cur_stmt: None,
+        needs_assignment: FxHashSet::default(),
+        assign_lhs: collect_assign_lhs(body),
     };
     // Parameters bind first (their defaults can reference earlier params).
     let params = body.params.clone();
@@ -741,6 +768,19 @@ struct Cx<'a> {
     /// body-only checks (`UNUSED_*`, `SHADOWED_VARIABLE`) so a field initializer doesn't, e.g.,
     /// "shadow itself" against its own member entry.
     is_func_body: bool,
+    /// Definite-assignment facts (Workstream 2) — the locals assigned before each statement, for
+    /// `UNASSIGNED_VARIABLE`. Consulted at a read via [`Cx::cur_stmt`].
+    assigned: flow::AssignedAnalysis,
+    /// The statement currently being inferred (set in `infer_stmt`), so a read can look up
+    /// [`Cx::assigned`].
+    cur_stmt: Option<body::StmtId>,
+    /// Typed locals declared **without** an initializer — the only locals `UNASSIGNED_VARIABLE`
+    /// considers (an untyped/`:=`/initialized local is never read-before-assign). Grows as the walk
+    /// passes each declaration.
+    needs_assignment: FxHashSet<SmolStr>,
+    /// Names that are the direct LHS of an assignment (`x = …`/`x += …`) — a *write*, not a read, so
+    /// excluded from the `UNASSIGNED_VARIABLE` check even though inference resolves the LHS.
+    assign_lhs: FxHashSet<ExprId>,
 }
 
 impl Cx<'_> {
@@ -903,6 +943,7 @@ impl Cx<'_> {
         // Install the narrowing in force *before* this statement (Workstream 2). Recomputed per
         // statement from the precomputed flow facts — replaces the old ad-hoc `in_branch` frames.
         self.narrowing = self.facts_to_narrowing(id);
+        self.cur_stmt = Some(id); // for the read-before-assign (UNASSIGNED_VARIABLE) check
         match self.body.stmt(id).clone() {
             Stmt::Expr(e) => {
                 self.infer_expr(e, &Expectation::None);
@@ -1102,6 +1143,11 @@ impl Cx<'_> {
                         v.name
                     ),
                 );
+            }
+            // A typed local declared WITHOUT an initializer is the only `UNASSIGNED_VARIABLE`
+            // candidate (an untyped / `:=` / initialized local is never read-before-assign).
+            if v.type_ref.is_some() && v.init.is_none() {
+                self.needs_assignment.insert(v.name.clone());
             }
         }
         self.bindings.push(Binding {
@@ -2169,6 +2215,24 @@ impl Cx<'_> {
         if self.locals.contains_key(name) {
             self.used_locals.insert(SmolStr::new(name));
         }
+        // UNASSIGNED_VARIABLE (Workstream 2) — a *read* of a typed-no-init local that is not
+        // definitely assigned on every path reaching here. Excludes the LHS of an assignment (a
+        // write) and reads inside a lambda body (which `assigned_before` leaves `None`, unchecked).
+        if self.is_func_body
+            && self.needs_assignment.contains(name)
+            && !self.assign_lhs.contains(&id)
+            && let Some(cur) = self.cur_stmt
+            && self
+                .assigned
+                .assigned_before(cur)
+                .is_some_and(|a| !a.contains(name))
+        {
+            self.warn(
+                self.range_of(id),
+                WarningCode::UnassignedVariable,
+                format!("The variable \"{name}\" may be used before it is assigned a value."),
+            );
+        }
         // Flow narrowing wins over the binding's declared type.
         if let Some(key) = self.narrow_key(id)
             && let Some(t) = self.narrowing.get(&key)
@@ -2525,6 +2589,72 @@ mod tests {
         );
         assert!(
             !codes(&h).contains(&"SHADOWED_VARIABLE_BASE_CLASS"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn typed_local_read_before_assignment_warns() {
+        let h = infer_first_func("func f() -> int:\n\tvar x: int\n\treturn x\n");
+        assert!(
+            codes(&h).contains(&"UNASSIGNED_VARIABLE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn typed_local_assigned_then_read_does_not_warn() {
+        let h = infer_first_func("func f() -> int:\n\tvar x: int\n\tx = 5\n\treturn x\n");
+        assert!(
+            !codes(&h).contains(&"UNASSIGNED_VARIABLE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn typed_local_with_initializer_is_not_unassigned() {
+        let h = infer_first_func("func f() -> int:\n\tvar x: int = 0\n\treturn x\n");
+        assert!(
+            !codes(&h).contains(&"UNASSIGNED_VARIABLE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn untyped_local_is_not_unassigned_checked() {
+        // An untyped `var x` is not an UNASSIGNED_VARIABLE candidate (no declared slot type).
+        let h = infer_first_func("func f():\n\tvar x\n\tvar y = x\n\treturn y\n");
+        assert!(
+            !codes(&h).contains(&"UNASSIGNED_VARIABLE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn typed_local_assigned_in_all_branches_then_read_does_not_warn() {
+        // Both branches assign before the merge ⇒ definitely assigned ⇒ no warning (the join).
+        let h = infer_first_func(
+            "func f(c) -> int:\n\tvar x: int\n\tif c:\n\t\tx = 1\n\telse:\n\t\tx = 2\n\treturn x\n",
+        );
+        assert!(
+            !codes(&h).contains(&"UNASSIGNED_VARIABLE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn typed_local_assigned_in_one_branch_then_read_warns() {
+        // Assigned only in the `then` branch ⇒ may be unassigned at the read ⇒ warns (matches Godot).
+        let h =
+            infer_first_func("func f(c) -> int:\n\tvar x: int\n\tif c:\n\t\tx = 1\n\treturn x\n");
+        assert!(
+            codes(&h).contains(&"UNASSIGNED_VARIABLE"),
             "{:?}",
             codes(&h)
         );

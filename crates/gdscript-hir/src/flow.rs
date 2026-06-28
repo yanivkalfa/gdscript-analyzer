@@ -19,7 +19,7 @@
 //! (M1) and the warning layer (M3 `UNREACHABLE_*`) consume: per-statement entry facts +
 //! reachability.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use gdscript_base::TextRange;
@@ -589,6 +589,147 @@ fn join_exits(exits: Vec<Option<FlowFacts>>) -> Option<FlowFacts> {
     let mut iter = exits.into_iter().flatten();
     let first = iter.next()?;
     Some(iter.fold(first, |acc, f| acc.join(&f)))
+}
+
+// ---- Definite-assignment (Workstream 2, for `UNASSIGNED_VARIABLE`) ------------------------------
+
+/// The locals **definitely** assigned a value at each statement's entry — the intersection over all
+/// incoming control-flow paths. A typed-no-initializer local read while absent here is a
+/// read-before-assign. The sound dual of narrowing: grow-only + intersect-at-merge, and *simpler* —
+/// a callee cannot assign a caller's function-scoped local, so there is no opaque-call / aliasing /
+/// self-rooted handling (do **not** copy those arms from the narrowing analyzer).
+#[derive(Debug, Clone, Default)]
+pub struct AssignedAnalysis {
+    entry: FxHashMap<StmtId, FxHashSet<SmolStr>>,
+}
+
+impl AssignedAnalysis {
+    /// The locals definitely assigned before `stmt`, or `None` if `stmt` was not analyzed (a
+    /// statement inside a lambda body — those are left unchecked, so the caller skips them).
+    #[must_use]
+    pub fn assigned_before(&self, stmt: StmtId) -> Option<&FxHashSet<SmolStr>> {
+        self.entry.get(&stmt)
+    }
+}
+
+/// Run definite-assignment over `body`'s top-level statements (recursing into `if`/`for`/`while`/
+/// `match` blocks but **not** lambda bodies — those get a fresh scope and are left unchecked),
+/// seeded with the function's `params` (always assigned).
+#[must_use]
+pub fn analyze_assigned(body: &Body, params: &[SmolStr]) -> AssignedAnalysis {
+    let mut a = AssignAnalyzer {
+        body,
+        entry: FxHashMap::default(),
+    };
+    let seed: FxHashSet<SmolStr> = params.iter().cloned().collect();
+    a.block(seed, &body.block);
+    AssignedAnalysis { entry: a.entry }
+}
+
+struct AssignAnalyzer<'a> {
+    body: &'a Body,
+    entry: FxHashMap<StmtId, FxHashSet<SmolStr>>,
+}
+
+impl AssignAnalyzer<'_> {
+    /// Thread the assigned-set through a block; `None` if every path diverges.
+    fn block(
+        &mut self,
+        assigned: FxHashSet<SmolStr>,
+        block: &[StmtId],
+    ) -> Option<FxHashSet<SmolStr>> {
+        let mut cur = Some(assigned);
+        for &sid in block {
+            let a = cur?;
+            cur = self.stmt(a, sid);
+        }
+        cur
+    }
+
+    fn stmt(&mut self, assigned: FxHashSet<SmolStr>, sid: StmtId) -> Option<FxHashSet<SmolStr>> {
+        self.entry.insert(sid, assigned.clone());
+        match self.body.stmt(sid) {
+            Stmt::Return(_) | Stmt::Break | Stmt::Continue => None,
+            Stmt::Pass | Stmt::Assert(_) => Some(assigned),
+            Stmt::Expr(e) => {
+                let mut a = assigned;
+                self.record_assign(&mut a, *e);
+                Some(a)
+            }
+            // `var x = e` / `var x := e` assigns; a bare `var x` / `var x: T` does not (and a
+            // re-declaration resets the slot to unassigned).
+            Stmt::Var(v) => {
+                let mut a = assigned;
+                if v.init.is_some() {
+                    a.insert(v.name.clone());
+                } else {
+                    a.remove(&v.name);
+                }
+                Some(a)
+            }
+            Stmt::If {
+                then_branch,
+                elifs,
+                else_branch,
+                ..
+            } => {
+                let mut exits = vec![self.block(assigned.clone(), then_branch)];
+                for (_, eblock) in elifs {
+                    exits.push(self.block(assigned.clone(), eblock));
+                }
+                exits.push(match else_branch {
+                    Some(eb) => self.block(assigned.clone(), eb),
+                    None => Some(assigned.clone()),
+                });
+                intersect_exits(exits)
+            }
+            // A loop body may run zero times — its assignments are NOT guaranteed after the loop.
+            Stmt::While { body, .. } => {
+                let _ = self.block(assigned.clone(), body);
+                Some(assigned)
+            }
+            Stmt::For(f) => {
+                // The loop variable is bound each iteration (assigned inside the body).
+                let mut body_in = assigned.clone();
+                body_in.insert(f.var.clone());
+                let _ = self.block(body_in, &f.body);
+                Some(assigned)
+            }
+            // No exhaustiveness proof — after the match only the pre-match assignments hold; each
+            // arm body is entered with the arm's `var` captures bound.
+            Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    let mut arm_in = assigned.clone();
+                    for b in &arm.binds {
+                        arm_in.insert(b.name.clone());
+                    }
+                    let _ = self.block(arm_in, &arm.body);
+                }
+                Some(assigned)
+            }
+        }
+    }
+
+    /// Record an assignment to a bare local (`x = e` / `x += e` — all lowered to `BinOp::Assign`).
+    fn record_assign(&self, assigned: &mut FxHashSet<SmolStr>, e: ExprId) {
+        if let Expr::Bin {
+            op: BinOp::Assign,
+            lhs,
+            ..
+        } = self.body.expr(e)
+            && let Expr::Name(n) = self.body.expr(*lhs)
+        {
+            assigned.insert(n.clone());
+        }
+    }
+}
+
+/// The intersection of the fall-through exits (a local is assigned after a merge only if assigned on
+/// every path that falls through), or `None` if every path diverges.
+fn intersect_exits(exits: Vec<Option<FxHashSet<SmolStr>>>) -> Option<FxHashSet<SmolStr>> {
+    let mut iter = exits.into_iter().flatten();
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, s| acc.intersection(&s).cloned().collect()))
 }
 
 #[cfg(test)]
