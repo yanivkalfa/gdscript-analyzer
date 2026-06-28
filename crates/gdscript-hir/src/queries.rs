@@ -221,6 +221,7 @@ pub fn warning_settings(db: &dyn Db, config: ProjectConfig) -> Arc<WarningSettin
 pub fn suppression_map(db: &dyn Db, file: FileText) -> Arc<SuppressionMap> {
     Arc::new(crate::warnings::build_suppression_map(
         &parse(db, file).syntax_node(),
+        file.text(db),
     ))
 }
 

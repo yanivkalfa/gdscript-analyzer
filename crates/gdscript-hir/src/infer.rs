@@ -1734,16 +1734,23 @@ impl Cx<'_> {
 
     /// The type of a class enum **value** accessed statically (`Control.PRESET_FULL_RECT`):
     /// the engine exposes enum values as class members, so search every (inherited) enum's
-    /// values. Returns `int` when found.
+    /// values. Returns the value's **declaring enum type** (`Ty::Enum`) — mirroring how a
+    /// `Class.Enum` *annotation* resolves (`resolve::resolve_named`), so an enum member assigned
+    /// to a slot of that same enum is `Assign::Ok`, not a false `INT_AS_ENUM_WITHOUT_CAST`. (An
+    /// enum value is still freely assignable to `int` — see `ty::is_assignable`.)
     fn class_enum_value(&self, class: gdscript_api::ClassId, name: &str) -> Option<Ty> {
         let mut cur = Some(class);
         while let Some(cid) = cur {
             let c = self.api.class(cid);
-            if c.enums
+            if let Some(e) = c
+                .enums
                 .iter()
-                .any(|e| e.values.iter().any(|v| v.name == name))
+                .find(|e| e.values.iter().any(|v| v.name == name))
             {
-                return Some(self.int_ty());
+                return Some(Ty::Enum(EnumRef {
+                    qualified: SmolStr::new(format!("{}.{}", c.name, e.name)),
+                    bitfield: e.is_bitfield,
+                }));
             }
             cur = c.base;
         }
@@ -2158,6 +2165,32 @@ mod tests {
     fn int_to_float_is_silent() {
         let h = infer_first_func("func f():\n\tvar x: float = 3\n\treturn x\n");
         assert!(codes(&h).is_empty(), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn enum_member_into_its_own_enum_slot_is_not_int_as_enum() {
+        // `var m: Tween.TweenProcessMode = Tween.TWEEN_PROCESS_IDLE` is valid GDScript with no
+        // cast — the enum member must type as its enum (not bare `int`), so `check_assign` sees
+        // `Enum → Enum` (Ok). A regression here would false-warn on extremely common engine code.
+        let h = infer_first_func(
+            "func f():\n\tvar m: Tween.TweenProcessMode = Tween.TWEEN_PROCESS_IDLE\n\treturn m\n",
+        );
+        assert!(
+            !codes(&h).contains(&"INT_AS_ENUM_WITHOUT_CAST"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn bare_int_into_enum_slot_still_warns() {
+        // The fix must not over-suppress: a genuine uncast `int` into an enum slot still warns.
+        let h = infer_first_func("func f():\n\tvar m: Tween.TweenProcessMode = 0\n\treturn m\n");
+        assert!(
+            codes(&h).contains(&"INT_AS_ENUM_WITHOUT_CAST"),
+            "{:?}",
+            codes(&h)
+        );
     }
 
     #[test]

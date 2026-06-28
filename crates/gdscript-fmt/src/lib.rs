@@ -60,14 +60,24 @@ impl FmtConfig {
 /// significant tokens differ from the input's).
 #[must_use]
 pub fn format(source: &str, config: &FmtConfig) -> String {
+    let input_parses = gdscript_syntax::parse(source).errors().is_empty();
     // Safe mode: never reformat around a syntax error — we'd risk mis-indenting a mis-parsed block.
-    if config.safe_mode && !gdscript_syntax::parse(source).errors().is_empty() {
+    if config.safe_mode && !input_parses {
         return source.to_owned();
     }
     let out = reindent(source, config);
-    // The safety net: formatting must preserve the significant (non-trivia) token stream exactly.
-    if config.safe_mode && !same_significant_tokens(source, &out) {
-        return source.to_owned();
+    if config.safe_mode {
+        // The safety net is two-layered, because each catches what the other cannot:
+        // (1) significant-token equality catches a dropped / reordered / corrupted *token*;
+        if !same_significant_tokens(source, &out) {
+            return source.to_owned();
+        }
+        // (2) a parse-validity recheck catches a meaning-changing *indentation* edit — indentation
+        //     lives entirely in trivia/synthetic layout, so it is invisible to (1). If the input
+        //     parsed clean, the output must too, else we fall back to the verbatim source.
+        if input_parses && !gdscript_syntax::parse(&out).errors().is_empty() {
+            return source.to_owned();
+        }
     }
     out
 }
@@ -87,8 +97,14 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
     let mut line_start = true;
     // A synthetic `Newline` (zero-width) precedes the real `NewlinePhys` that carries the line's
     // bytes; this flag swallows that one `NewlinePhys` so the break is emitted exactly once. A
-    // `NewlinePhys` *not* so flagged is a bracketed-continuation physical newline (kept verbatim).
+    // `NewlinePhys` *not* so flagged is either a bracketed-continuation physical newline (kept
+    // verbatim, interior preserved) or the terminator of a comment-only/blank line the prepass
+    // copies verbatim *without* a synthetic `Newline` — those two are told apart by `bracket_depth`.
     let mut just_broke = false;
+    // Open-bracket nesting depth of the significant tokens emitted so far. The prepass suppresses
+    // synthetic line breaks inside brackets, so a `NewlinePhys` with `bracket_depth == 0` always
+    // ends a logical (or comment-only) line, and the *next* line's indentation must be re-emitted.
+    let mut bracket_depth: usize = 0;
 
     for t in &toks {
         let text = &source[t.range];
@@ -106,9 +122,14 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 if just_broke {
                     just_broke = false; // its bytes belong to the synthetic break already emitted
                 } else {
-                    // A physical newline inside a logical line (a bracketed continuation).
                     trim_trailing_inline_ws(&mut out);
                     out.push('\n');
+                    // Outside brackets this newline ends a comment-only / blank line the prepass
+                    // copied verbatim (no synthetic `Newline`), so the next line must be
+                    // re-indented. Inside brackets it is a real continuation — leave it verbatim.
+                    if bracket_depth == 0 {
+                        line_start = true;
+                    }
                 }
             }
             SyntaxKind::Whitespace => {
@@ -129,6 +150,15 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 }
                 just_broke = false;
                 out.push_str(text);
+                match t.kind {
+                    SyntaxKind::LParen | SyntaxKind::LBrack | SyntaxKind::LBrace => {
+                        bracket_depth += 1;
+                    }
+                    SyntaxKind::RParen | SyntaxKind::RBrack | SyntaxKind::RBrace => {
+                        bracket_depth = bracket_depth.saturating_sub(1);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -238,5 +268,63 @@ mod tests {
         };
         let src = "func f():\n\treturn 1\n";
         assert_eq!(format(src, &cfg), "func f():\n  return 1\n");
+    }
+
+    /// `parse(src).errors()` must be empty — the formatter must never emit code that fails to parse.
+    fn parses_clean(src: &str) -> bool {
+        gdscript_syntax::parse(src).errors().is_empty()
+    }
+
+    #[test]
+    fn comment_between_statements_does_not_corrupt_the_next_line() {
+        // A comment-only line is copied verbatim by the prepass (no synthetic Newline); the line
+        // AFTER it must still be re-indented to the block depth, not left at its original spacing.
+        let src = "func g():\n  var a = 1\n  # c\n  var x = 1\n  var y = 2\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "func g():\n\tvar a = 1\n\t# c\n\tvar x = 1\n\tvar y = 2\n"
+        );
+        assert!(
+            parses_clean(&out),
+            "formatter must not emit mixed indent: {out:?}"
+        );
+        assert_eq!(fmt(&out), out, "must be idempotent");
+    }
+
+    #[test]
+    fn leading_body_comment_does_not_corrupt_the_body() {
+        // A comment that is the FIRST line of a block lands at column 0 (the prepass emits `Indent`
+        // only at the first *code* line, so the block depth isn't known yet — a documented cosmetic
+        // limitation, NOT a corruption). The CODE must still be correctly indented + parse clean.
+        let src = "func g():\n  # c\n  var x = 1\n  var y = 2\n";
+        let out = fmt(src);
+        assert_eq!(out, "func g():\n# c\n\tvar x = 1\n\tvar y = 2\n");
+        assert!(
+            parses_clean(&out),
+            "code must be correctly indented: {out:?}"
+        );
+        assert_eq!(fmt(&out), out, "must be idempotent");
+    }
+
+    #[test]
+    fn doc_comment_between_statements_is_reindented_and_does_not_corrupt() {
+        // A doc comment AFTER a code line (depth known) is re-indented like any line, and the line
+        // following it must not be mis-indented.
+        let src = "func g():\n  var a = 1\n  ## doc\n  var x = 1\n";
+        let out = fmt(src);
+        assert_eq!(out, "func g():\n\tvar a = 1\n\t## doc\n\tvar x = 1\n");
+        assert!(parses_clean(&out), "{out:?}");
+    }
+
+    #[test]
+    fn bracketed_continuation_interior_is_preserved() {
+        // A physical newline INSIDE brackets is a real continuation — its interior spacing must be
+        // kept verbatim (not treated like a comment-line terminator that re-indents the next line).
+        let src = "func f():\n\tvar a = [\n\t\t1,\n\t\t2,\n\t]\n\treturn a\n";
+        let out = fmt(src);
+        assert!(parses_clean(&out), "{out:?}");
+        assert!(super::same_significant_tokens(src, &out));
+        assert_eq!(fmt(&out), out, "must be idempotent");
     }
 }

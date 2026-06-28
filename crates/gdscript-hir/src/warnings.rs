@@ -531,7 +531,7 @@ impl SuppressionMap {
 /// pair suppresses a region (EOF-terminated if unrestored). Unknown code names are skipped (the
 /// unknown-name meta-diagnostic is deferred — see `TECH_DEBT.md`).
 #[must_use]
-pub fn build_suppression_map(root: &GdNode) -> SuppressionMap {
+pub fn build_suppression_map(root: &GdNode, source: &str) -> SuppressionMap {
     let mut map = SuppressionMap::default();
     // Annotations in source order.
     let mut anns: Vec<GdNode> = gdscript_syntax::ast::descendants(root)
@@ -540,8 +540,12 @@ pub fn build_suppression_map(root: &GdNode) -> SuppressionMap {
         .collect();
     anns.sort_by_key(|n| u32::from(n.text_range().start()));
 
-    // Open region starts for `_start`/`_restore`, by code (most-recent-wins on restore).
-    let mut open: Vec<(WarningCode, u32)> = Vec::new();
+    // Open region starts for `_start`/`_restore`, keyed by code. Godot's
+    // `warning_ignore_start_lines` is a map keyed by warning code, so a repeated
+    // `@warning_ignore_start("x")` OVERWRITES the prior start for `x` (it is not a stack) — a
+    // single `@warning_ignore_restore("x")` ends the region at that latest start, and any earlier
+    // start does not leak past it.
+    let mut open: FxHashMap<WarningCode, u32> = FxHashMap::default();
     let eof = u32::from(root.text_range().end());
 
     for ann in &anns {
@@ -556,32 +560,38 @@ pub fn build_suppression_map(root: &GdNode) -> SuppressionMap {
             "warning_ignore" => {
                 if let Some(target) = next_decorated_sibling(ann) {
                     let r = target.text_range();
-                    map.push(
-                        TextRange::new(u32::from(r.start()), u32::from(r.end())),
-                        codes,
-                    );
+                    let start = u32::from(r.start());
+                    // Cover the whole physical line of the decorated statement — Godot tracks
+                    // `@warning_ignore` by line, so `;`-joined statements sharing that line are all
+                    // suppressed. Scan from the statement's END (its range START may include the
+                    // preceding newline as leading trivia); the next `\n` at-or-after the code ends
+                    // the line and always covers the full statement (incl. a multi-line one).
+                    let end = line_end_from(source, u32::from(r.end()));
+                    map.push(TextRange::new(start, end), codes);
                 }
             }
             "warning_ignore_start" => {
                 let start = u32::from(ann.text_range().end());
                 for c in codes {
-                    open.push((c, start));
+                    open.insert(c, start); // overwrite any prior open start for this code
                 }
             }
             "warning_ignore_restore" => {
                 let end = u32::from(ann.text_range().start());
                 for c in &codes {
-                    if let Some(pos) = open.iter().rposition(|(oc, _)| oc == c) {
-                        let (oc, start) = open.remove(pos);
-                        map.push(TextRange::new(start, end), vec![oc]);
+                    if let Some(start) = open.remove(c) {
+                        map.push(TextRange::new(start, end), vec![*c]);
                     }
                 }
             }
             _ => {}
         }
     }
-    // Unrestored regions run to end of file.
-    for (c, start) in open {
+    // Unrestored regions run to end of file. Sort for a deterministic span order (the map feeds a
+    // salsa query whose value is compared by equality).
+    let mut leftover: Vec<(WarningCode, u32)> = open.into_iter().collect();
+    leftover.sort_by_key(|&(_, start)| start);
+    for (c, start) in leftover {
         map.push(TextRange::new(start, eof), vec![c]);
     }
     map
@@ -618,6 +628,16 @@ fn annotation_warning_codes(ann: &GdNode) -> Vec<WarningCode> {
         }
     }
     codes
+}
+
+/// The byte offset of the end of the physical line containing `start` (the next `\n`, or EOF). Used
+/// to widen a one-shot `@warning_ignore` to cover every `;`-joined statement on the decorated line.
+fn line_end_from(source: &str, start: u32) -> u32 {
+    let s = start as usize;
+    match source.get(s..).and_then(|rest| rest.find('\n')) {
+        Some(i) => u32::try_from(s + i).unwrap_or(u32::MAX),
+        None => u32::try_from(source.len()).unwrap_or(u32::MAX),
+    }
 }
 
 /// The single statement/declaration a `@warning_ignore` decorates — the next sibling node that is
@@ -731,9 +751,12 @@ pub fn render_warning_reference() -> String {
     s
 }
 
-/// Whether `path` is under a `res://addons/**` directory (the `exclude_addons` scope).
+/// Whether `path` is under the project-root `res://addons/**` directory (the `exclude_addons`
+/// scope). Matches Godot exactly — `script_path.begins_with("res://addons/")` — so a *nested*
+/// user directory named `addons` (e.g. `res://game/addons/x.gd`) is **not** excluded (an earlier
+/// `contains("/addons/")` over-match silently dropped genuine warnings there).
 fn is_addon_path(path: &str) -> bool {
-    path.starts_with("res://addons/") || path.contains("/addons/")
+    path.starts_with("res://addons/")
 }
 
 /// The bundled engine `(major, minor)` — the default project version and the `Since::Master`
@@ -794,7 +817,7 @@ mod tests {
     #[test]
     fn warning_ignore_suppresses_the_next_statement() {
         let src = "func f():\n\t@warning_ignore(\"integer_division\")\n\tvar x = 5 / 2\n";
-        let map = build_suppression_map(&parse(src).syntax_node());
+        let map = build_suppression_map(&parse(src).syntax_node(), src);
         let at = off(src, "5 / 2");
         assert!(map.is_suppressed(WarningCode::IntegerDivision, TextRange::new(at, at + 5)));
         // A different code at the same place is not suppressed.
@@ -802,14 +825,94 @@ mod tests {
     }
 
     #[test]
+    fn warning_ignore_covers_semicolon_joined_statements_on_the_line() {
+        // Godot tracks `@warning_ignore` by line, so a one-shot ignore must cover BOTH `;`-joined
+        // statements on the decorated line — not just the first.
+        let src = "func f():\n\t@warning_ignore(\"unused_variable\")\n\tvar a = 1; var b = 2\n\tvar c = 3\n";
+        let map = build_suppression_map(&parse(src).syntax_node(), src);
+        let a = off(src, "var a");
+        let b = off(src, "var b");
+        let c = off(src, "var c");
+        assert!(map.is_suppressed(WarningCode::UnusedVariable, TextRange::new(a, a + 1)));
+        assert!(
+            map.is_suppressed(WarningCode::UnusedVariable, TextRange::new(b, b + 1)),
+            "the second `;`-joined statement on the line must be covered"
+        );
+        // The next line is NOT covered (the ignore is one line only).
+        assert!(!map.is_suppressed(WarningCode::UnusedVariable, TextRange::new(c, c + 1)));
+    }
+
+    #[test]
     fn warning_ignore_start_restore_suppresses_a_region() {
         let src = "@warning_ignore_start(\"unused_variable\")\nfunc f():\n\tvar a = 1\n@warning_ignore_restore(\"unused_variable\")\nfunc g():\n\tvar b = 2\n";
-        let map = build_suppression_map(&parse(src).syntax_node());
+        let map = build_suppression_map(&parse(src).syntax_node(), src);
         let a = off(src, "var a");
         let b = off(src, "var b");
         assert!(map.is_suppressed(WarningCode::UnusedVariable, TextRange::new(a, a + 1)));
         // After the restore, the same code is no longer suppressed.
         assert!(!map.is_suppressed(WarningCode::UnusedVariable, TextRange::new(b, b + 1)));
+    }
+
+    #[test]
+    fn repeated_start_for_one_code_overwrites_and_does_not_leak_past_restore() {
+        // Godot keys `warning_ignore_start` by code, so a 2nd start OVERWRITES the 1st. Only the
+        // region [latest_start .. restore] is suppressed; code BEFORE the 2nd start and AFTER the
+        // restore is still checked. The old Vec-stack leaked start#1 to EOF, over-suppressing both.
+        let src = "@warning_ignore_start(\"unused_variable\")\nvar before = 1\n@warning_ignore_start(\"unused_variable\")\nvar inside = 2\n@warning_ignore_restore(\"unused_variable\")\nvar after = 3\n";
+        let map = build_suppression_map(&parse(src).syntax_node(), src);
+        let before = off(src, "before");
+        let inside = off(src, "inside");
+        let after = off(src, "after");
+        assert!(
+            map.is_suppressed(
+                WarningCode::UnusedVariable,
+                TextRange::new(inside, inside + 1)
+            ),
+            "the active [start2 .. restore] region must be suppressed"
+        );
+        assert!(
+            !map.is_suppressed(
+                WarningCode::UnusedVariable,
+                TextRange::new(after, after + 1)
+            ),
+            "code after the restore must NOT be suppressed (no leak to EOF)"
+        );
+        assert!(
+            !map.is_suppressed(
+                WarningCode::UnusedVariable,
+                TextRange::new(before, before + 1)
+            ),
+            "code before the overwriting start must NOT be suppressed"
+        );
+    }
+
+    #[test]
+    fn exclude_addons_only_matches_the_root_addons_dir() {
+        let none = SuppressionMap::default();
+        let mut s = WarningSettings::engine_default((4, 5));
+        s.per_code
+            .insert(WarningCode::IntegerDivision, WarnLevel::Warn);
+        // A *nested* dir merely named `addons` is NOT an addon path (Godot: begins_with res://addons/).
+        assert!(
+            gate(
+                &raw(WarningCode::IntegerDivision),
+                &s,
+                &none,
+                Some("res://game/addons/spawner.gd")
+            )
+            .is_some(),
+            "a nested addons/ dir must still be checked"
+        );
+        // The real root addons dir is excluded.
+        assert!(
+            gate(
+                &raw(WarningCode::IntegerDivision),
+                &s,
+                &none,
+                Some("res://addons/plugin/x.gd")
+            )
+            .is_none()
+        );
     }
 
     fn raw(code: WarningCode) -> RawWarning {

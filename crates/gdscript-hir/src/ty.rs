@@ -214,6 +214,9 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
         },
         Ty::Enum(to_enum) => match from {
             Ty::Enum(from_enum) if from_enum == to_enum => Assign::Ok,
+            // A *different* enum's value is an `int` at runtime: Godot wants a cast
+            // (`INT_AS_ENUM_WITHOUT_CAST`) — never a hard `TYPE_MISMATCH`.
+            Ty::Enum(_) => Assign::IntAsEnum,
             // `int` → enum without a cast.
             Ty::Builtin(id) if api.builtin(*id).name == "int" => Assign::IntAsEnum,
             _ => Assign::No,
