@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gdscript-base",
  "rkyv",
@@ -605,14 +605,14 @@ dependencies = [
 
 [[package]]
 name = "gdscript-base"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "gdscript-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-db"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dashmap",
  "gdscript-api",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-ffi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gdscript-session",
  "napi",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-fmt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gdscript-base",
  "gdscript-syntax",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-hir"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cstree",
  "gdscript-api",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-ide"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "cstree",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-lsp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-scene"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gdscript-base",
  "rustc-hash",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-session"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gdscript-base",
  "gdscript-ide",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-syntax"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cstree",
  "expect-test",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "gdscript-wasm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "console_error_panic_hook",
  "gdscript-session",
@@ -2006,7 +2006,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "gdscript-api",
