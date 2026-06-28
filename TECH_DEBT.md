@@ -633,9 +633,11 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       real value (the `UNSAFE_*` codes) already ships. Adding them also needs a `codes()` test helper
       that filters the opt-in group (else they pollute every focused infer fixture).
 - [x] **`SHADOWED_VARIABLE` — DONE (§1 pass).** A local `var`/`const` shadowing a param or own
-      value-member (var/const/signal/anon-enum). **`SHADOWED_VARIABLE_BASE_CLASS`** (a member
-      shadowing a *base*-class member) stays deferred — it needs the base item-tree walk via
-      `script_class` (engine base via `api.lookup_member`, user base via the `ScriptRef` chain).
+      value-member (var/const/signal/anon-enum). **`SHADOWED_VARIABLE_BASE_CLASS` — DONE engine-base
+      (Phase 1):** a local shadowing a value member of the resolved ENGINE base
+      (`engine_base_has_value_member`), silent on an unresolved base. The **user-base** slice (a
+      member shadowing a base declared by another script) stays deferred — the cross-file `MemberSig`
+      is lossy (no kind/params), so a sound user-base walk needs it enriched first.
 - [ ] **`SHADOWED_GLOBAL_IDENTIFIER` (extend)** — currently fires only for a `class_name` collision
       (file-level, ungated, direct `Diagnostic`). Godot also fires for a local/member shadowing a
       global; extend + route through `gate` as a real `WarningCode`.
@@ -646,18 +648,29 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       `_TEMPORARY_MODIFICATION`** — Unicode mixed-script/homoglyph detection; needs a confusables
       table (`unicode-security` crate or the Unicode confusables data). `_TEMPORARY_MODIFICATION` is
       master-only (already `since=Master`).
-- [ ] **Deprecated-misuse trio** (`PROPERTY_USED_AS_FUNCTION`, `CONSTANT_USED_AS_FUNCTION`,
-      `FUNCTION_USED_AS_PROPERTY`) — call/property-kind mismatch on a resolved member.
-- [ ] **`NATIVE_METHOD_OVERRIDE`** — overriding a native virtual with an incompatible signature
-      (needs param-type comparison against the engine virtual).
-- [ ] **`STATIC_CALLED_ON_INSTANCE`**, **`MISSING_TOOL`**, **`REDUNDANT_STATIC_UNLOAD`**,
-      **`REDUNDANT_AWAIT`**, **`ENUM_VARIABLE_WITHOUT_DEFAULT`**, **`UNSAFE_VOID_RETURN`**,
-      **`UNSAFE_CAST`**, **`RETURN_VALUE_DISCARDED`**, **`INT_AS_ENUM_WITHOUT_MATCH`**,
-      **`DEPRECATED_KEYWORD`** (`yield` — parser must surface it), **`ONREADY_WITH_EXPORT`** (an
-      annotation pair on one member; needs item-tree annotation info), **`UNPRIVATE…`** etc. — each is
-      a small, self-contained check; sequenced by value after the M1 subset.
-- [ ] **`UNUSED_SIGNAL`**, **`UNUSED_PRIVATE_CLASS_VARIABLE`** — member-level unused analysis (needs
-      a whole-file member-read scan, like the local `used_locals` set but across methods).
+- [x] **Deprecated-misuse trio — `PROPERTY_USED_AS_FUNCTION` / `CONSTANT_USED_AS_FUNCTION` DONE
+      (Phase 1, `feat/w1-warnings`).** Calling a statically-resolved engine property/const as a
+      function, guarded against Callable/Signal/uninformative members. **`FUNCTION_USED_AS_PROPERTY`
+      stays deferred** — a bare `obj.method` is an idiomatic `Callable` reference (every signal
+      `.connect`), indistinguishable from a misuse without call-context, so it would false-positive
+      everywhere. Needs the value-vs-call-context distinction the current `as_method` flag can't make.
+- [x] **`NATIVE_METHOD_OVERRIDE` — DONE engine-base (Phase 1), conservative.** Warns (ERROR-default)
+      only on a *definite type clash* at an overlapping typed param (both resolve to known engine
+      types, mutually non-assignable, neither an enum). Arity/defaults/vararg/variance + the
+      **user-base** override (needs the lossy cross-file `MemberSig` enriched with is_virtual/params)
+      under-warn — deferred.
+- [x] **`STATIC_CALLED_ON_INSTANCE` + `ENUM_VARIABLE_WITHOUT_DEFAULT` — DONE (Phase 1).** Static-on-
+      instance fires only for a typed local instance (skips a type-aliased local). Enum-without-
+      default fires for a local OR member field. Still deferred: **`MISSING_TOOL`**,
+      **`REDUNDANT_STATIC_UNLOAD`**, **`ONREADY_WITH_EXPORT`** (all need the item-tree to capture
+      annotations — `@tool`/`@static_unload`/`@onready`/`@export` are sibling CST nodes today),
+      **`REDUNDANT_AWAIT`**, **`UNSAFE_VOID_RETURN`**, **`UNSAFE_CAST`**, **`RETURN_VALUE_DISCARDED`**,
+      **`INT_AS_ENUM_WITHOUT_MATCH`**, **`DEPRECATED_KEYWORD`** (`yield` — parser must surface it).
+- [x] **`UNUSED_SIGNAL` — DONE (Phase 1, same-file).** A signal never referenced anywhere in its own
+      file (a whole-file `NameUses` identifier + string-literal scan). Same-file only, like Godot — a
+      signal connected purely from a scene/other file is invisible (the Godot-parity limitation).
+      **`UNUSED_PRIVATE_CLASS_VARIABLE`** still deferred (the same `NameUses` scan now exists to build
+      it on).
 - [ ] **`UNASSIGNED_VARIABLE` / `_OP_ASSIGN`** — read-before-assign of a typed local; needs the W2
       CFG's definite-assignment pass (a natural W2 extension — reachability is there, definite-assign
       is not yet). **Deferred from the §1 pass (FP risk):** a sound, no-false-positive version must
@@ -710,4 +723,8 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       the established `format()` API + safety net.
 - [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
-- [ ] **CLI `--strict` / `--engine-defaults` override.** Today the strictness is chosen by `project.godot` presence (standalone = strict, project = engine defaults). An explicit CLI flag to force either mode regardless needs a host-level settings override (the gate's settings selection is in `type_diagnostics`, keyed on `project_config()`); thread a "force strict" toggle through the `Db` or inject a synthetic `WarningSettings`.
+- [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
+      (non-salsa) `WarningOverride` field on the `Db` (read only by the downstream `type_diagnostics`,
+      so the W1 firewall holds), `WarningSettings::with_strict_opt_in` flipping only the opt-in
+      promotion (an explicit project per-code level still wins), `AnalysisHost::set_warning_override`,
+      and mutually-exclusive `--strict` / `--engine-defaults` CLI flags.
