@@ -628,11 +628,18 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                         // tight (so it stays tight), and we must never *collapse* a genuinely-spaced
                         // `$A / b` (a division) into a node path, which would silently change meaning
                         // with an identical token sequence (the safety net cannot catch it).
-                        let spacing = if node_path
-                            && matches!(
+                        let path_continue = node_path
+                            && (matches!(
                                 t.kind,
                                 SyntaxKind::Ident | SyntaxKind::Slash | SyntaxKind::String
-                            ) {
+                            ) || (t.kind == SyntaxKind::Percent
+                                && matches!(
+                                    prev_sig,
+                                    Some(SyntaxKind::Dollar | SyntaxKind::Slash)
+                                )));
+                        let spacing = if path_continue {
+                            // A `%` in sigil position (`$%Unique`, `$A/%Unique`) continues the path; a
+                            // `%` after an identifier is modulo and falls through to `space_before`.
                             Spacing::Verbatim
                         } else {
                             node_path = false; // any non-path token ends the run.
@@ -1913,8 +1920,16 @@ pub(crate) fn canonical_string(text: &str) -> String {
     let rest = &text[qpos..];
     let rb = rest.as_bytes();
     let quote = rb[0];
-    // Triple-quoted (`'''`/`"""`): leave verbatim.
+    // Triple-quoted. gdformat converts a *single-line* triple-**single**-quoted string (`'''…'''`)
+    // to a regular string (strip the outer `''` and apply the regular quote rule to `'…'`); a
+    // triple-**double** (`"""…"""`) and any *multi-line* triple-quoted string are left verbatim.
     if rb.len() >= 6 && rb[1] == quote && rb[2] == quote {
+        if quote == b'\'' && rest.ends_with("'''") {
+            let body = &rest[3..rest.len() - 3];
+            if !body.contains('\n') {
+                return canonical_string(&format!("{prefix}'{body}'"));
+            }
+        }
         return text.to_owned();
     }
     if rest.len() < 2 || rb[rest.len() - 1] != quote {
@@ -2772,7 +2787,12 @@ mod tests {
         assert_eq!(c("^'a/b'"), "^\"a/b\""); // NodePath prefix kept
         assert_eq!(c("r'raw\\n'"), "r\"raw\\n\""); // raw: body verbatim
         assert_eq!(c("r'has \"x\"'"), "r'has \"x\"'"); // raw with " -> keep single (cannot escape)
-        assert_eq!(c("'''triple'''"), "'''triple'''"); // triple left verbatim
+        // gdformat collapses a single-line triple-SINGLE to a regular string; triple-double + any
+        // multi-line triple are left verbatim.
+        assert_eq!(c("'''triple'''"), "\"triple\"");
+        assert_eq!(c("'''say \"hi\"'''"), "'say \"hi\"'"); // body has " -> regular single
+        assert_eq!(c("\"\"\"triple\"\"\""), "\"\"\"triple\"\"\""); // triple-double verbatim
+        assert_eq!(c("'''line1\nline2'''"), "'''line1\nline2'''"); // multi-line verbatim
         assert_eq!(c("'\\t\\n'"), "\"\\t\\n\""); // non-quote escapes preserved
     }
 
