@@ -4,16 +4,17 @@ The running backlog of deferred work, known limitations, and queued next steps. 
 honest — anything we knowingly defer or stub goes here with enough context to pick it up
 later.
 
-> **Marker legend.** `[ ]` = open + actionable. `[x]` = done. `[~]` = a **deliberate
-> deviation** (a documented, intentional non-parity / wontfix — *not* debt). The deviations are
-> also collected in the section directly below so the open-item count reflects only real work.
+> **Marker legend.** `[ ]` = open + actionable work. `[x]` = done. `[~]` = done locally but
+> ship-gated on an external step (e.g. a publish). **Deliberate deviations** (intentional
+> non-parity / wontfix) are *not* tracked in the backlog at all — they live only in the section
+> directly below, so the open-item count reflects only real, actionable work.
 
 ---
 
-## Deliberate deviations (wontfix — documented decisions, not debt)
+## Deliberate deviations (wontfix — documented decisions, NOT part of the backlog)
 
-These are intentional, researched choices — kept here so they don't inflate the actionable
-backlog. Each links to the full inline context (marked `[~]` at its original site).
+These are intentional, researched choices — recorded here only so they aren't re-litigated. They
+are **not** open work and do **not** appear in the phase backlogs below.
 
 - **`is`-narrowing is a Pyright-style value-add, not Godot parity.** Godot's `reduce_type_test`
   does no flow narrowing; ours is **widen-only** (never narrows to a type Godot would reject).
@@ -57,20 +58,10 @@ matrix + a vendored real-file corpus), and **524/524 godot-demo-projects scenes 
       (`infer::instance_root_ty` follows the ext-resource path, depth-bounded). See M3 below.
 - [x] **Project-wide `script→scene` reverse index + salsa caching → DONE (M1).** `script_scene_index`
       (firewalled, keyed on `SourceRoot`) + the `scene_model(db, FileText)` tracked query. See M1.
-- [~] **`uid://` resolution → DEFERRED (Phase-5, user-approved rationale).** *(Deliberate deviation —
-      see the top-of-file deviations section.)* M0 records `uid`;
-      resolving a uid-*only* `ext_resource` would need a project UID map. **Near-zero real value:** in
-      Godot 4.x every `ext_resource` is written with BOTH `path=` and `uid=`, so path-first resolution
-      (already implemented) handles every real case — a uid-only resource essentially never occurs. A
-      firewall-safe impl needs a new `uid` field on the `FileText` salsa input (a `uid` derived from
-      `scene_model` would couple the registry to body-text edits and break the cross-file firewall)
-      plus loader plumbing in BOTH the LSP and CLI. Deferred: bad cost/value ratio. M0 prefers `path=`.
 - [ ] **Inline `script = SubResource("…")` records no attachment.** An inline GDScript sub-resource
       has no external path; M0 sets `script = None` (M1 types the node by its declared `type=`). Rare.
 - [x] **`name_span` quote-trim → DONE (W8).** The node `name_span` is trimmed to the bare identifier
       (quotes excluded) via `inner_span`, so a node's own declaration tags as a precise reference.
-- [~] **A literal `/` inside a node name** would break `/`-segmented path matching (Godot disallows
-      it at edit time). *(Deliberate deviation — see top-of-file. Treated as opaque segments.)*
 - [ ] **No in-repo full corpus.** 5 representative real fixtures are vendored under
       `crates/gdscript-scene/tests/corpus/`; the broad robustness run is ad hoc via
       `cargo run -p gdscript-scene --example scene_corpus -- <dir>` (not in CI).
@@ -91,8 +82,6 @@ Deferred (low / cosmetic / engine-impossible):
       path matching still works); display/go-to-def only. Rare. Extend `unescape` if it surfaces.
 - [ ] **Cascading dangling:** a node parented to a sibling whose own parent dangled is itself
       flagged. Secondary effect; rare. Track an "upstream-dangling" set to suppress the secondary.
-- [~] **A node literally named `"."`** makes `by_path["."]` that `resolve_path` can't return —
-      engine-impossible input; **wontfix**. *(Deliberate deviation — see top-of-file.)*
 
 ### M1 — scene-aware node-path typing — **DONE**
 `$Path` / `%Unique` / `@onready var x := $Path` / `get_node("literal")` resolve to the node's concrete
@@ -335,10 +324,6 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
         serialized result (a generic walk over `NavTarget`/`Reference`/`FileEdit`/`WouldCollide`),
         so a client (guitkx) resolves cross-file targets without maintaining its own `FileId`→URI
         mirror. Zero false-positive surface (every `gdscript-base` `file` field is a `FileId`).
-  - [~] **Fully-typed TS surface (deliberate deviation, low value).** napi `serde_json::Value` types
-        as `any` in the generated `.d.ts`. Real TS types would need `#[napi(object)]` POD
-        re-declaration (or a generated-types step), trading the single-source-of-truth for DX. The
-        client (guitkx) owns its own TS interfaces today. *(See top-of-file deviations.)*
 
 ### Validation
 - [ ] **Differential corpus is small + error-agreement only.** The tree-sitter oracle
@@ -449,10 +434,6 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
 - [ ] **Non-`*` autoloads are not resolvable by name (nor via `get_node("/root/Name")`).** We seed
       globals only for `*`-singletons (matches the engine: no `*` ⇒ not a global constant). The
       `/root/Name` node-path access is Phase-4 scene/node work. No false positives, just imprecision.
-- [~] **`is`-narrowing is a deliberate divergence from upstream Godot.** Godot's `reduce_type_test` does
-      **no** flow narrowing (CONFIRMED against `gdscript_analyzer.cpp`); our `is`-narrowing is a Pyright-style
-      UX value-add, kept **widen-only** (never narrows to a type Godot's checker would reject). Intentional
-      non-parity. *(Deliberate deviation — see top-of-file.)*
 - [x] **`project.godot` `config/features` parsing → DONE (Phase-5 hardening §6).** The engine version
       line is parsed into the `engine_version()` salsa query + `project_engine_version()` plumbing
       (informational until Phase-6 multi-version API bundling). `[autoload]` is no longer the only line read.
@@ -841,9 +822,6 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
           one-element-per-line and keeps the `[index]` on the close line; we keep the array compact and
           drop the subscript onto its own line below. A `format_index` layout nuance for an indexed
           *literal* (an indexed *call* chain is already handled via `format_dot_chain`).
-      - [ ] **gdformat's BOM limitation — by design, unmatchable.** gdformat errors on a leading BOM and
-        leaves the file unchanged, so its "gold" for a BOM file is the raw source; we reformat it (BOM
-        preserved) and legitimately differ. Excluded from the parity counts above.
 - [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
 - [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
