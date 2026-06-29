@@ -449,9 +449,12 @@ fn collect_inline_splits(
                 splits.push((bs, 0, format!("\n{}", unit.repeat(depth + 1))));
             }
         }
-        // A child is one indent level deeper when it is a suite, or a `match` arm (arms sit a level
-        // below the `match` with no intervening `Block` node).
-        let deeper = suite || (node.kind() == S::MatchStmt && child.kind() == S::MatchArm);
+        // A child is one indent level deeper when it is a suite, an inner class's `ClassBody` (whose
+        // members sit a level below the `class` header), or a `match` arm (arms sit a level below the
+        // `match` with no intervening `Block` node).
+        let deeper = suite
+            || child.kind() == S::ClassBody
+            || (node.kind() == S::MatchStmt && child.kind() == S::MatchArm);
         collect_inline_splits(child, src, depth + usize::from(deeper), unit, splits);
     }
 }
@@ -3439,6 +3442,20 @@ mod tests {
         // precedence parens kept; an expr-statement assignment RHS keeps its parens (gdformat does too)
         assert_eq!(fmt("var a = (b + c) * d\n"), "var a = (b + c) * d\n");
         assert_eq!(fmt("func f():\n\tx = (y)\n"), "func f():\n\tx = (y)\n");
+    }
+
+    #[test]
+    fn inline_blocks_inside_inner_class_methods_expand_at_correct_depth() {
+        // An inner class's `ClassBody` is one indent level deep, so `;`-separated statements and an
+        // inline suite body inside its methods must expand at the method-body depth, not one short.
+        assert_eq!(
+            fmt("class P:\n\tfunc release():\n\t\ta = 1; b = 2\n"),
+            "class P:\n\tfunc release():\n\t\ta = 1\n\t\tb = 2\n"
+        );
+        assert_eq!(
+            fmt("class P:\n\tfunc release():\n\t\tif not x: return\n"),
+            "class P:\n\tfunc release():\n\t\tif not x:\n\t\t\treturn\n"
+        );
     }
 
     #[test]
