@@ -25,11 +25,32 @@ pub struct ClassId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
 
-/// Index into the lazy documentation store. The Phase-2 thin slice never populates the
-/// store, so every `doc` field is `None`; the fields exist now so wiring docs in is additive
-/// (Playbook §4.6).
+/// Index into the [`DocStore`] documentation table. A symbol with no doc text has `doc: None`;
+/// every populated handle addresses a non-empty Markdown entry (Playbook §4.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
 pub struct DocId(pub u32);
+
+/// The engine documentation store: per-symbol Markdown doc text addressed by [`DocId`].
+///
+/// Encoded into a **separate** `engine_docs.bin` blob (deliberately *not* a field of [`ApiData`])
+/// and embedded native-only behind the `bundled-docs` feature. This keeps the doc prose out of the
+/// `engine_api.bin` blob the wasm playground `fetch`es — populating the `doc: Option<DocId>` fields
+/// is a fixed-size change to that blob, so the wasm download never grows with the docs (Playbook
+/// §4.6; `crates/gdscript-api/src/lib.rs`).
+#[derive(Debug, Archive, Serialize, Deserialize)]
+pub struct DocStore {
+    /// Markdown entries; `DocId(i)` addresses `entries[i]`. Every entry is non-empty — a symbol
+    /// with no documentation carries `doc: None`, never an index to an empty string.
+    pub entries: Vec<String>,
+}
+
+impl DocStore {
+    /// The Markdown for a doc handle, or `None` if the index is out of range.
+    #[must_use]
+    pub fn get(&self, id: DocId) -> Option<&str> {
+        self.entries.get(id.0 as usize).map(String::as_str)
+    }
+}
 
 /// The Godot version the model was generated from.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]

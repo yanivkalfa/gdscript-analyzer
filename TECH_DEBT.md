@@ -294,14 +294,22 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       Phase 2 ships the MVP subset (INFERENCE_ON_VARIANT, TYPE_MISMATCH, NARROWING_CONVERSION,
       INTEGER_DIVISION, UNSAFE_PROPERTY/METHOD_ACCESS); `is`-narrowing is lexical/syntactic,
       not a real control-flow graph; `@warning_ignore` gating is not applied.
-- [ ] **Hover docs are signatures-only — BLOCKED ON A DATA DECISION (needs the user).** The
-      `DocId`-keyed doc store is wired into the model but not populated. The pipeline (a BBCode→Markdown
-      converter + a codegen doc-XML reader + hover wiring) is straightforward, BUT it needs the Godot
-      `doc/classes/*.xml` corpus, which is **deliberately not vendored** (`vendor/godot/4.5-stable/
-      SOURCE.txt`: ~900 files / ~6–8 MB) — and baking the descriptions into the bundled engine blob
-      grows the **wasm bundle** the playground downloads. So enabling hover docs is a repo-size + wasm-
-      size tradeoff the team explicitly avoided in Phase 0; **reversing it should be an explicit
-      decision**, not a unilateral burndown edit. (Deferred here, surfaced to the user — not skipped.)
+- [x] **Hover docs → DONE (burndown Stage 2, user-approved the vendoring tradeoff).** The Godot
+      `doc/classes/*.xml` corpus is now **vendored** (1013 files: core + module + platform classes +
+      `@GDScript`/`@GlobalScope` pseudo-classes, at tag `4.5-stable` matching the API JSON).
+      `xtask::docs` parses it (`roxmltree`, codegen-time only), converts **BBCode → Markdown** (emphasis,
+      inline code, fenced `[gdscript]` codeblocks with `[csharp]` dropped, `[url]`/`$DOCS_URL`,
+      cross-refs `[method X]`/`[member X]`/`[constant X]`/`[ClassName]`/`[param x]` → backticked symbols,
+      unknown tags stripped), interns the per-symbol Markdown (deduped) into a **separate**
+      `gdscript-api::DocStore` (`engine_docs.bin`, 2.9 MB / 13.5k entries), and tags each model symbol's
+      `doc: Option<DocId>`. **Zero wasm cost — verified:** `engine_api.bin` is byte-for-byte the same
+      *size* (the `Option<DocId>` fields are fixed-width in the rkyv archive), and the doc blob is a
+      native-only `include_bytes!` behind the new `bundled-docs` feature (gated `not(wasm32)`), so the
+      wasm-fetched API blob never carries the doc prose. `EngineApi::doc(DocId)` serves it; `ide::hover`
+      resolves the cursor's engine symbol scope-aware (member via the receiver type — walking the
+      `extends` chain to the engine base, refusing an overriding user member; bare names via `classify`
+      → `GodotDef::Engine`) and surfaces `HoverResult.doc`. Golden-validated at codegen (`Node.add_child`
+      doc resolves, no BBCode leak) + hover/api/converter unit tests.
 
 ### Genuine workarounds to revisit (flagged honestly)
 - [x] **Lambda-call parser bug — FIXED at the root.** A multi-line lambda followed by a line

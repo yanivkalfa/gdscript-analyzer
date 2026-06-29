@@ -15,3 +15,11 @@
 # don't let editors/linters reformat it.
 vendor/godot/**/extension_api.json text eol=lf linguist-generated=true
 crates/gdscript-api/src/generated.rs text eol=lf linguist-generated=true
+
+# The vendored Godot doc XML (the hover-doc source) is upstream data, not our code — keep it out
+# of language stats and don't let it be reformatted.
+vendor/godot/**/doc/classes/*.xml text eol=lf linguist-vendored=true
+
+# The generated rkyv blobs are binary artifacts (`cargo xtask codegen-api`); never diff/merge them.
+crates/gdscript-api/src/engine_api.bin  binary
+crates/gdscript-api/src/engine_docs.bin binary

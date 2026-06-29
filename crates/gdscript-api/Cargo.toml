@@ -18,12 +18,17 @@ rkyv = { workspace = true }
 rustc-hash = { workspace = true }
 
 [features]
-default = ["bundled-api"]
+default = ["bundled-api", "bundled-docs"]
 # `bundled-api` embeds the prebuilt engine-API blob via `include_bytes!` (native only — see
 # `src/lib.rs`). `xtask` builds this crate with `--no-default-features` because it *writes*
 # the blob and so must compile before the blob exists; the wasm binding also leaves it off
 # and fetches the blob as a separate asset (Playbook §4.5).
 bundled-api = []
+# `bundled-docs` additionally embeds the separate `engine_docs.bin` hover-doc blob (native only,
+# gated `not(wasm32)` inside `bundled()`). It is a *separate* blob from `engine_api.bin`, so it
+# never grows the wasm download. `xtask` leaves it off (same bootstrap reason as `bundled-api`);
+# a size-sensitive native consumer can drop it via `--no-default-features --features bundled-api`.
+bundled-docs = ["bundled-api"]
 
 [lints]
 workspace = true

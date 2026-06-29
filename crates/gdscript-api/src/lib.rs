@@ -29,8 +29,8 @@ use rustc_hash::FxHashMap;
 pub use lookup::MemberRef;
 pub use model::{
     ApiData, ApiType, ApiVersion, BuiltinData, BuiltinId, BuiltinMember, ClassData, ClassId,
-    ConstInfo, DocId, ElemRef, EnumInfo, EnumValue, MethodSig, OperatorSig, Param, PropertyInfo,
-    SignalSig, TyRef, UtilityFn,
+    ConstInfo, DocId, DocStore, ElemRef, EnumInfo, EnumValue, MethodSig, OperatorSig, Param,
+    PropertyInfo, SignalSig, TyRef, UtilityFn,
 };
 
 /// The Godot version string the bundled engine-API artifact was generated from.
@@ -75,6 +75,10 @@ pub struct EngineApi {
     pub(crate) gdscript_builtins: Vec<gdscript_layer::BuiltinFn>,
     /// Cached id of the `int` builtin (used to type engine-class integer constants).
     pub(crate) int_builtin: Option<BuiltinId>,
+    /// Per-symbol Markdown documentation, when loaded (native `bundled-docs` embed, or a host
+    /// `set_docs` call). `None` on `wasm32`/when docs aren't bundled — hover then shows the
+    /// signature only, never an error.
+    pub(crate) docs: Option<DocStore>,
 }
 
 impl EngineApi {
@@ -121,7 +125,21 @@ impl EngineApi {
             global_consts: gdscript_layer::global_consts(),
             gdscript_builtins: gdscript_layer::builtin_fns(),
             int_builtin,
+            docs: None,
         }
+    }
+
+    /// Install a documentation store (the native `bundled-docs` blob, or a host-supplied one).
+    pub fn set_docs(&mut self, docs: DocStore) {
+        self.docs = Some(docs);
+    }
+
+    /// The Markdown documentation for a [`DocId`], if a doc store is loaded and the handle is in
+    /// range. Returns `None` when docs aren't available (e.g. `wasm32` without a host `set_docs`),
+    /// so every caller degrades to a signature-only hover.
+    #[must_use]
+    pub fn doc(&self, id: DocId) -> Option<&str> {
+        self.docs.as_ref()?.get(id)
     }
 
     /// Decode and index an engine-API blob produced by `xtask codegen-api`.
@@ -146,6 +164,22 @@ impl EngineApi {
     }
 }
 
+impl DocStore {
+    /// Decode an `engine_docs.bin` blob produced by `xtask codegen-api`.
+    ///
+    /// The bytes are copied into a 16-byte-aligned buffer before validation, mirroring
+    /// [`EngineApi::from_bytes`], so a misaligned source decodes correctly.
+    ///
+    /// # Errors
+    /// Returns [`LoadError::Decode`] if the blob fails `rkyv` validation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, LoadError> {
+        let mut aligned = rkyv::util::AlignedVec::<16>::new();
+        aligned.extend_from_slice(bytes);
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(aligned.as_slice())
+            .map_err(|e| LoadError::Decode(e.to_string()))
+    }
+}
+
 /// The bundled engine-API model, decoded once on first use.
 ///
 /// Native-only and gated on the default `bundled-api` feature: the blob is embedded via
@@ -163,7 +197,19 @@ pub fn bundled() -> &'static EngineApi {
     static BUNDLED: OnceLock<EngineApi> = OnceLock::new();
     static BYTES: &[u8] = include_bytes!("engine_api.bin");
     BUNDLED.get_or_init(|| {
-        EngineApi::from_bytes(BYTES).expect("the bundled engine-API blob must be valid")
+        let mut api =
+            EngineApi::from_bytes(BYTES).expect("the bundled engine-API blob must be valid");
+        // The doc store is a separate, native-only embed (`bundled-docs`): it never enters the
+        // wasm-fetched `engine_api.bin`, so the playground download stays lean. A decode failure
+        // is non-fatal — hover simply falls back to signature-only.
+        #[cfg(feature = "bundled-docs")]
+        {
+            static DOC_BYTES: &[u8] = include_bytes!("engine_docs.bin");
+            if let Ok(docs) = DocStore::from_bytes(DOC_BYTES) {
+                api.set_docs(docs);
+            }
+        }
+        api
     })
 }
 
@@ -221,5 +267,29 @@ mod tests {
         // The hand-authored GDScript layer merged at load.
         assert!(api.global_const("PI").is_some());
         assert!(api.gdscript_builtin("preload").is_some());
+    }
+
+    // Hover docs are a separate native-only embed (`bundled-docs`).
+    #[cfg(all(feature = "bundled-docs", not(target_arch = "wasm32")))]
+    #[test]
+    fn bundled_docs_resolve_and_are_converted() {
+        use crate::MemberRef;
+        let api = crate::bundled();
+        let node = api.class_by_name("Node").expect("Node class");
+
+        // The class itself and a well-known method carry Markdown hover docs.
+        assert!(
+            api.class(node).doc.and_then(|id| api.doc(id)).is_some(),
+            "Node has a class hover doc"
+        );
+        let MemberRef::Method(m) = api.lookup_member(node, "add_child").expect("add_child") else {
+            panic!("add_child is a method");
+        };
+        let doc = m
+            .doc
+            .and_then(|id| api.doc(id))
+            .expect("add_child hover doc");
+        // BBCode was converted to Markdown — no `[/…]` closing tags survive.
+        assert!(!doc.contains("[/"), "BBCode leaked into hover: {doc:?}");
     }
 }

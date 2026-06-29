@@ -14,14 +14,19 @@ use serde::Deserialize;
 
 use gdscript_api::{
     ApiData, ApiType, ApiVersion, BuiltinData, BuiltinId, BuiltinMember, ClassData, ClassId,
-    ConstInfo, ElemRef, EngineApi, EnumInfo, EnumValue, MethodSig, OperatorSig, Param,
+    ConstInfo, ElemRef, EngineApi, EnumInfo, EnumValue, MemberRef, MethodSig, OperatorSig, Param,
     PropertyInfo, SignalSig, TyRef, UtilityFn,
 };
 
-/// The codegen result: the encoded blob plus summary metadata for `generated.rs`.
+/// The codegen result: the encoded blobs plus summary metadata for `generated.rs`.
 pub struct Generated {
-    /// The `rkyv`-encoded [`ApiData`] blob.
+    /// The `rkyv`-encoded [`ApiData`] blob (`engine_api.bin`).
     pub blob: Vec<u8>,
+    /// The `rkyv`-encoded [`gdscript_api::DocStore`] blob (`engine_docs.bin`) — a *separate*,
+    /// native-only artifact so it never grows the wasm-fetched `engine_api.bin`.
+    pub docs_blob: Vec<u8>,
+    /// Number of distinct doc entries interned into the doc store.
+    pub doc_count: usize,
     /// The Godot version string (`4.5.0-stable`).
     pub version: String,
     /// Number of engine classes.
@@ -30,8 +35,8 @@ pub struct Generated {
     pub builtin_count: usize,
 }
 
-/// Parse, normalize, validate, and encode `extension_api.json`.
-pub fn generate(json: &str) -> Result<Generated> {
+/// Parse, normalize, attach docs, validate, and encode `extension_api.json` (+ the doc XML).
+pub fn generate(json: &str, docs: &crate::docs::DocSet) -> Result<Generated> {
     let raw: RawApi = serde_json::from_str(json).context("parsing extension_api.json")?;
     let version = format!(
         "{}.{}.{}-{}",
@@ -43,18 +48,31 @@ pub fn generate(json: &str) -> Result<Generated> {
     let class_count = raw.classes.len();
     let builtin_count = raw.builtin_classes.len();
 
-    let api = normalize(&raw);
+    let mut api = normalize(&raw);
+    // Second pass: tag each symbol with a `DocId` and build the separate doc store.
+    let doc_store = crate::docs::attach_docs(&mut api, docs);
+    let doc_count = doc_store.entries.len();
+
     let blob = rkyv::to_bytes::<rkyv::rancor::Error>(&api)
         .map_err(|e| anyhow!("rkyv-encoding the engine model: {e}"))?
         .to_vec();
+    let docs_blob = rkyv::to_bytes::<rkyv::rancor::Error>(&doc_store)
+        .map_err(|e| anyhow!("rkyv-encoding the doc store: {e}"))?
+        .to_vec();
 
-    // Validate the *actual artifact* round-trips and the golden symbols resolve, so a bad
-    // regen fails loudly here rather than at the analyzer's first query (Playbook §4.5).
-    let engine = EngineApi::from_bytes(&blob).context("decoding the freshly-encoded blob")?;
+    // Validate the *actual artifacts* round-trip and the golden symbols (incl. a golden doc)
+    // resolve, so a bad regen fails loudly here rather than at the analyzer's first query.
+    let mut engine = EngineApi::from_bytes(&blob).context("decoding the freshly-encoded blob")?;
+    engine.set_docs(
+        gdscript_api::DocStore::from_bytes(&docs_blob)
+            .map_err(|e| anyhow!("decoding the freshly-encoded doc store: {e}"))?,
+    );
     validate_golden(&engine)?;
 
     Ok(Generated {
         blob,
+        docs_blob,
+        doc_count,
         version,
         class_count,
         builtin_count,
@@ -417,8 +435,26 @@ fn validate_golden(api: &EngineApi) -> Result<()> {
     let node = api
         .class_by_name("Node")
         .context("golden: class `Node` is missing")?;
-    api.lookup_member(node, "add_child")
+    let add_child = api
+        .lookup_member(node, "add_child")
         .context("golden: `Node.add_child` did not resolve")?;
+
+    // Golden doc: the doc store is populated and a well-known method's prose resolved + converted.
+    let MemberRef::Method(m) = add_child else {
+        bail!("golden: `Node.add_child` is not a method");
+    };
+    let doc = m
+        .doc
+        .and_then(|id| api.doc(id))
+        .context("golden: `Node.add_child` has no hover doc")?;
+    // A residual `[/…]` closing tag means BBCode leaked through the converter (Markdown links
+    // `[text](url)` never contain one).
+    if doc.contains("[/") {
+        bail!("golden: `Node.add_child` doc leaks unconverted BBCode: {doc:?}");
+    }
+    if api.class(node).doc.and_then(|id| api.doc(id)).is_none() {
+        bail!("golden: class `Node` has no hover doc");
+    }
     api.class_by_name("Object")
         .context("golden: class `Object` is missing")?;
     api.singleton("Input")

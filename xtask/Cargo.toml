@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 # xtask` only builds xtask's own subgraph, so unification never pulls `bundled-api` back in.
 gdscript-api = { path = "../crates/gdscript-api", default-features = false }
 rkyv = { workspace = true }
+# Codegen-time only: parse the vendored Godot doc XML into the hover-doc store. A pure-Rust DOM
+# parser; never reaches the analyzer runtime or wasm.
+roxmltree = "0.20"
 
 [lints]
 workspace = true
