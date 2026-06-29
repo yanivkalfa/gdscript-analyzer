@@ -137,7 +137,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24 # current LTS; the npm `engines` floor stays at >=20 for consumers
       # Node path: build the napi addon and run the hello demo.
