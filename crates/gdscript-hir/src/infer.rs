@@ -1549,6 +1549,12 @@ impl Cx<'_> {
         let Some(path) = path else {
             return fallback; // computed `get_node(var)` — stays `Node`
         };
+        // An absolute `/root/<Autoload>` access resolves to the autoload's type — singleton OR
+        // loaded-but-not-global (both live at `/root/Name`). Independent of any owning scene. A deeper
+        // tail (`/root/Name/Child`) would need to walk the autoload's own scene; left as the seam.
+        if !unique && let Some(ty) = self.resolve_root_autoload_path(path) {
+            return ty;
+        }
         let Some(ctx) = self.owning_scene() else {
             return fallback; // no scene attaches this script (dynamic UI / single-file)
         };
@@ -1592,6 +1598,20 @@ impl Cx<'_> {
             // ambiguous miss / escape (`..`/absolute) → `Node`, never a false warning
             _ => fallback,
         }
+    }
+
+    /// Resolve an absolute `/root/<Autoload>` node path to the autoload's type (singleton or
+    /// loaded-but-not-global — both are children of the scene-tree root). `None` for any other path,
+    /// including a deeper tail (`/root/Name/Child`, which would need the autoload's own scene) — those
+    /// degrade to the `Node` seam with no false positive.
+    fn resolve_root_autoload_path(&self, path: &str) -> Option<Ty> {
+        let name = path.strip_prefix("/root/")?;
+        // Only the autoload node itself (no trailing segment) for now.
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        let ty = resolve::resolve_autoload_any(self.db, name);
+        (!ty.is_uninformative()).then_some(ty)
     }
 
     /// The owning-scene context for the current file (scene + attach node + multi-scene ambiguity).

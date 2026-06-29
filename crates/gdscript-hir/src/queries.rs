@@ -144,14 +144,27 @@ pub fn res_path_registry(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolStr
 /// (it iterates only the config text), so it backdates across every `.gd` keystroke.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AutoloadRegistry {
+    /// `*`-flagged autoloads — the bare names that resolve as globals in code.
     singletons: FxHashMap<SmolStr, SmolStr>,
+    /// Non-`*` autoloads — loaded at `/root/Name` but NOT global identifiers. Tracked so a
+    /// `get_node("/root/Name")` access can still resolve them (a singleton lives there too).
+    loaded: FxHashMap<SmolStr, SmolStr>,
 }
 
 impl AutoloadRegistry {
-    /// The resource path of the singleton autoload named `name`, if any.
+    /// The resource path of the **singleton** (`*`-flagged) autoload named `name`, if any — the only
+    /// autoloads exposed as bare-name globals. A non-singleton name returns `None` here (it is not a
+    /// global); use [`resolve_any_path`](AutoloadRegistry::resolve_any_path) for `/root/Name`.
     #[must_use]
     pub fn resolve_path(&self, name: &str) -> Option<&SmolStr> {
         self.singletons.get(name)
+    }
+
+    /// The resource path of **any** autoload named `name` — singleton or loaded-but-not-global. Both
+    /// live at `/root/Name`, so this is what a `get_node("/root/Name")` access resolves through.
+    #[must_use]
+    pub fn resolve_any_path(&self, name: &str) -> Option<&SmolStr> {
+        self.singletons.get(name).or_else(|| self.loaded.get(name))
     }
 
     /// The number of registered singleton autoloads.
@@ -172,12 +185,15 @@ impl AutoloadRegistry {
 #[salsa::tracked]
 pub fn autoload_registry(db: &dyn Db, config: ProjectConfig) -> Arc<AutoloadRegistry> {
     let mut singletons = FxHashMap::default();
+    let mut loaded = FxHashMap::default();
     for e in crate::project::parse_autoloads(config.project_godot_text(db)) {
         if e.is_singleton {
             singletons.entry(e.name).or_insert(e.path);
+        } else {
+            loaded.entry(e.name).or_insert(e.path);
         }
     }
-    Arc::new(AutoloadRegistry { singletons })
+    Arc::new(AutoloadRegistry { singletons, loaded })
 }
 
 /// The Godot engine `(major, minor)` declared by `project.godot`'s `[application]`

@@ -436,9 +436,11 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       pointing at a `.tscn` now resolves to its root node's attached-script `ScriptRef` (Phase-4 scene
       parsing unblocked it — `resolve_scene_autoload`), so `Music.play()` checks the real script. A
       script-less root or a `.cs` autoload stays the seam (the latter out of scope).
-- [ ] **Non-`*` autoloads are not resolvable by name (nor via `get_node("/root/Name")`).** We seed
-      globals only for `*`-singletons (matches the engine: no `*` ⇒ not a global constant). The
-      `/root/Name` node-path access is Phase-4 scene/node work. No false positives, just imprecision.
+- [x] **Non-`*` autoload via `get_node("/root/Name")` → DONE (burndown Stage 1).** The
+      `AutoloadRegistry` now also tracks loaded-but-not-global autoloads (`resolve_any_path`), and an
+      absolute `/root/<Name>` node path resolves to the autoload's type (singleton or not — both live
+      at `/root/Name`) via `resolve::resolve_autoload_any`. Bare-name resolution is unchanged (a non-`*`
+      autoload is still NOT a global). A deeper tail (`/root/Name/Child`) stays the `Node` seam.
 - [x] **`project.godot` `config/features` parsing → DONE (Phase-5 hardening §6).** The engine version
       line is parsed into the `engine_version()` salsa query + `project_engine_version()` plumbing
       (informational until Phase-6 multi-version API bundling). `[autoload]` is no longer the only line read.

@@ -484,6 +484,32 @@ mod tests {
     }
 
     #[test]
+    fn non_singleton_autoload_resolves_via_root_path() {
+        // A non-`*` autoload is loaded-but-not-global: unreachable by bare name, but reachable via
+        // the absolute `get_node("/root/Name")` path. `.volume()` must resolve through its script.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(FileId(0), "func volume() -> int:\n\treturn 50\n");
+        change.set_file_path(FileId(0), "res://audio.gd");
+        change.change_file(
+            FileId(1),
+            "func go():\n\tvar v := get_node(\"/root/Audio\").volume()\n\treturn v\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        // No leading `*` → loaded-but-not-global. Bare `Audio` would NOT resolve; `/root/Audio` does.
+        change.set_project_config("[autoload]\nAudio=\"res://audio.gd\"\n");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        assert!(analysis.diagnostics(FileId(1)).unwrap().is_empty());
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("int")),
+            "expected an `: int` inlay on the /root/-autoload-resolved binding, got {hints:?}",
+        );
+    }
+
+    #[test]
     fn scene_node_path_typing_through_the_public_api() {
         // The Phase-4 killer feature end-to-end: a `.tscn` injected via `apply_change` + a script it
         // attaches → `$Btn` types as `Button`, surfaced as an `: Button` inlay (zero annotations).
