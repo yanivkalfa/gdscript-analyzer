@@ -773,11 +773,37 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
         statements are reflowed (already-wrapped statements preserved → idempotent). Differential after
         reflow: byte-exact **51%** (godot) / **33%** (ReactiveUI), EOL-normalised; corpus safety (544
         files, safe_mode OFF): 0 non-parsing, 0 token changes, 0 idempotence breaks.
-      Remaining for full `gdformat` parity (all captured in **`crates/gdscript-fmt/DEVIATIONS.md`**
-      with oracle-verified before/after shapes): the **token-mutating** behaviours that need the safety
-      net relaxed to AST-equivalence (magic trailing comma, operator-chain paren injection, string-quote
-      normalisation, wrapped-chain `. method` padding), and **`format_range`** (range formatting for
-      LSP). These are additive on the established `format()` API + safety net.
+      - [x] **CST-driven wrapping port + token-mutating layout + comment-threading — DONE
+        (`feat/formatter-scene-rename`).** A faithful port of gdformat 4.5's `expression.py`
+        (`src/wrap.rs`) plus the token-mutating set (magic trailing comma, operator-chain paren
+        injection, string-quote normalisation, dot-chain leading-dot, lambdas, multi-line strings) and
+        **comment-threading through any reshape** (block / operator-chain / call-arg, incl. a standalone
+        comment that hangs off a lambda *body* at a deeper indent, a block-start blank strip, a
+        block-boundary comment placed at its block depth, a trailing comment that never forces a wrap,
+        and a column-0 comment amid a function body). Each is guarded by the meaning-equivalence net +
+        a dedicated **comment-multiset net** (any unplaceable comment → verbatim fallback). **gdformat
+        differential (EOL-normalised): byte-exact godot 454/456 (99.6%), ReactiveUI-Gadot 88/88 (100%);
+        `format(gold)==gold` 455/456 / 88/88; 110 unit tests. Corpus safety (544 files, safe_mode OFF):
+        0 non-parsing, 0 token changes, 0 idempotence breaks.** Every behaviour + remaining gap is
+        catalogued in **`crates/gdscript-fmt/DEVIATIONS.md`**. **`format_range`** (LSP range formatting)
+        is also DONE (`fmt::format_range` → `ide` → LSP `textDocument/rangeFormatting`).
+      - [ ] **The last 2 byte-exact godot misses — deep wrap-choice nuances (low value, regression-risky;
+        single-file, valid, ≤-width, meaning-preserving — tracked, not blocking).**
+        - **(a) `town_scene.gd` — redundant sub-expression parens in an operator chain.** gdformat
+          **keeps** the source parens in `(A) or (B)` (where each operand is an `and`-chain) and threads
+          the chain's standalone comments around them; our `strip_parens` removes the (precedence-
+          redundant) parens and re-wraps, so the comment placement + paren shape diverge. A fix must make
+          paren-stripping **operand-aware** — keep a redundant paren that wraps a tighter-precedence
+          operand of a looser chain — which is a behaviour change with corpus-wide regression risk, so
+          deferred until measured against the full corpus.
+        - **(b) `os_test.gd` — subscript on a large array literal.**
+          `["…", …, "…"][DisplayServer.screen_get_orientation()]`: gdformat explodes the array
+          one-element-per-line and keeps the `[index]` on the close line; we keep the array compact and
+          drop the subscript onto its own line below. A `format_index` layout nuance for an indexed
+          *literal* (an indexed *call* chain is already handled via `format_dot_chain`).
+      - [ ] **gdformat's BOM limitation — by design, unmatchable.** gdformat errors on a leading BOM and
+        leaves the file unchanged, so its "gold" for a BOM file is the raw source; we reformat it (BOM
+        preserved) and legitimately differ. Excluded from the parity counts above.
 - [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
 - [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
