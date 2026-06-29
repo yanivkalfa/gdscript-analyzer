@@ -2127,21 +2127,14 @@ fn compact_paren_wrap(
 /// is a function *declaration* header (its `func` is not a lambda), so it is excluded.
 fn stmt_is_rewrappable_multiline(stmt: &str) -> bool {
     let toks = gdscript_syntax::tokenize(stmt);
-    // A multi-line string token cannot be reflowed yet — leave the statement verbatim.
-    if toks
-        .iter()
-        .any(|t| t.kind == SyntaxKind::String && stmt[t.range].contains('\n'))
-    {
-        return false;
-    }
     let lead = stmt.trim_start();
     let lead = lead.strip_prefix("static ").unwrap_or(lead);
     if lead.starts_with("func ") || lead.starts_with("func(") {
         return false; // a function *declaration* header, not a lambda expression
     }
-    // The two legitimate reasons a statement cannot collapse onto one physical line and is still
-    // worth re-laying-out: it carries a lambda, or it carries a comment (the CST wrapper now threads
-    // both through; the comment-multiset net falls back to verbatim if a comment can't be placed).
+    // The three legitimate reasons a statement cannot collapse onto one physical line and is still
+    // worth re-laying-out: it carries a lambda, a comment, or a multi-line string (the CST wrapper
+    // now threads all three; the meaning / comment-multiset nets fall back to verbatim otherwise).
     let has_lambda = toks.iter().any(|t| t.kind == SyntaxKind::FuncKw);
     let has_comment = toks.iter().any(|t| {
         matches!(
@@ -2152,7 +2145,10 @@ fn stmt_is_rewrappable_multiline(stmt: &str) -> bool {
                 | SyntaxKind::EndRegionComment
         )
     });
-    has_lambda || has_comment
+    let has_multiline_string = toks
+        .iter()
+        .any(|t| t.kind == SyntaxKind::String && stmt[t.range].contains('\n'));
+    has_lambda || has_comment || has_multiline_string
 }
 
 fn flatten_statement(stmt: &str) -> Option<String> {
@@ -3548,6 +3544,19 @@ mod tests {
         assert!(out.contains("}  # note\n"), "{out:?}");
         assert!(parses_clean(&out), "{out:?}");
         assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn multiline_string_operator_chain_paren_wraps_verbatim() {
+        // gdformat paren-wraps `x = """…""" % [args]`: the string's interior lines stay verbatim
+        // (literal content, not re-indented), the `% [` goes on its own line, the array explodes.
+        let src =
+            "func p():\n\t$X.text = \"\"\"%d FPS\n\nObjects:\n%d\n\"\"\" % [\nfps,\nobjs,\n]\n";
+        assert_eq!(
+            fmt(src),
+            "func p():\n\t$X.text = (\n\t\t\"\"\"%d FPS\n\nObjects:\n%d\n\"\"\"\n\t\t% [\n\t\t\tfps,\n\t\t\tobjs,\n\t\t]\n\t)\n"
+        );
+        assert_eq!(fmt(&fmt(src)), fmt(src), "idempotent");
     }
 
     #[test]

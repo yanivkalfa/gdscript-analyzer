@@ -146,7 +146,7 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
             format!("{body}\n")
         }
     } else {
-        let indented = reindent_to(body, 1);
+        let indented = reindent_to_skipping_strings(body, 1);
         if block_header {
             format!("func __():\n{indented}\n\t\tpass\n")
         } else {
@@ -262,6 +262,35 @@ pub(crate) fn dedent(s: &str) -> String {
         .unwrap_or(0);
     s.lines()
         .map(|l| if l.len() >= min { &l[min..] } else { l })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Like [`reindent_to`], but never re-indents a line that lies *inside* a multi-line string token
+/// (its content is literal — adding indentation would change the string's bytes). The opening line of
+/// the string still gets indented, since the prefix there precedes the `"""`.
+fn reindent_to_skipping_strings(s: &str, levels: usize) -> String {
+    let raw = gdscript_syntax::tokenize(s);
+    let mut inside: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for t in &raw {
+        if t.kind == S::String {
+            let (sl, el) = (
+                line_of(s, usize::from(t.range.start())),
+                line_of(s, usize::from(t.range.end()).saturating_sub(1)),
+            );
+            inside.extend((sl + 1)..=el); // interior + closing line — never the opening line
+        }
+    }
+    let pad = "\t".repeat(levels);
+    s.lines()
+        .enumerate()
+        .map(|(i, l)| {
+            if l.trim().is_empty() || inside.contains(&i) {
+                l.to_owned()
+            } else {
+                format!("{pad}{l}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -813,11 +842,50 @@ fn format_concrete(
     prefix: &str,
     suffix: &str,
 ) -> Option<Vec<String>> {
+    if is_multiline_string(node) {
+        return multiline_string_lines(w, node, indent, prefix, suffix);
+    }
     if is_foldable(node) {
         format_foldable(w, node, indent, prefix, suffix)
     } else {
         Some(vec![single_line(w, node, indent, prefix, suffix)?])
     }
+}
+
+/// The verbatim text of a `Literal`'s string token, if it is a multi-line (`"""…"""`) string.
+fn multiline_string_text(node: &GdNode) -> Option<String> {
+    if node.kind() != S::Literal {
+        return None;
+    }
+    sig(node).into_iter().find_map(|el| match el {
+        El::Tok(S::String, t) if t.contains('\n') => Some(t),
+        _ => None,
+    })
+}
+
+fn is_multiline_string(node: &GdNode) -> bool {
+    multiline_string_text(node).is_some()
+}
+
+/// Render a multi-line string as gdformat's `_format_string_to_multiple_lines`: the first physical
+/// line carries the indent and prefix, the interior lines are verbatim (the literal content), and the
+/// closing line carries the suffix — keeping the string's bytes exactly.
+fn multiline_string_lines(
+    w: &W,
+    node: &GdNode,
+    indent: usize,
+    prefix: &str,
+    suffix: &str,
+) -> Option<Vec<String>> {
+    let text = multiline_string_text(node)?;
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    let mut out = vec![format!("{}{}{}", w.indent(indent), prefix, lines[0])];
+    out.extend(lines[1..lines.len() - 1].iter().map(|l| (*l).to_owned()));
+    out.push(format!("{}{}", lines[lines.len() - 1], suffix));
+    Some(out)
 }
 
 fn single_line(w: &W, node: &GdNode, indent: usize, prefix: &str, suffix: &str) -> Option<String> {
@@ -862,6 +930,9 @@ fn is_foldable(node: &GdNode) -> bool {
 /// whose body is multi-statement or a single *compound* statement (`_is_multistatement_lambda` /
 /// `_is_unistatement_lambda_with_compound_statement`).
 fn forcing_multiline(node: &GdNode) -> bool {
+    if is_multiline_string(node) {
+        return true; // gdformat's `_is_multiline_string` — a `"""…"""` forces every enclosing construct
+    }
     if node.kind() == S::LambdaExpr && lambda_forces_multiline(node) {
         return true;
     }
