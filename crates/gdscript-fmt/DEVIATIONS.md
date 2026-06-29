@@ -19,17 +19,26 @@ As of the CST-driven wrapping port (a faithful port of gdformat 4.5's `expressio
 `src/wrap.rs`) plus the full normalization set (inline-suite expansion, blank-line + comment rules,
 node-path / triple-quote / BOM, dict-entry & magic-comma chains), EOL-normalised:
 
-- **exact match**: **~97%** over `godot-demo-projects` (456 files; up from ~14% at the start of
-  Phase 4), **~94%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
+- **exact match**: **~98.5%** over `godot-demo-projects` (456 files; up from ~14% at the start of
+  Phase 4), **~98%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
 - **fixpoint** `format(gold)==gold`: **~99%** (both corpora)
 
-The remaining exact-match gap is now dominated by three things, none a wrapping-choice bug:
-**(1) comments** — gdformat reformats a statement *and* re-emits the comment inside it
-(`call(func(): … # note\n)`, a collapsed array/dict with a trailing `# …`); we leave any
-comment-bearing statement verbatim, so it does not reach gold's reshaped form. **(2) multi-line
-strings** — gdformat paren-wraps a `"""…""" % [...]` assignment; we bail on multi-line string tokens.
-**(3) gdformat's own limits** — a leading **BOM** makes gdformat error out and leave the file
-unchanged, so its "gold" is just the source (we reformat it and legitimately differ).
+**Comments are threaded through a reshaped statement** (a faithful port of gdformat's comment model):
+a standalone comment keeps its own line at the block / element indent, a trailing inline comment is
+appended to its statement's line with the two-space offset, a comment trailing the open bracket of a
+list stays on the open line, and a comment trailing the whole statement lands on the rendered last
+line. A *standalone* comment strictly inside a construct forces it multi-line (gdformat's
+`_has_standalone_comments`). It is made safe-by-construction by a **comment-multiset net** in
+`render()` (separate from the meaning net, which treats comments as trivia): if any comment cannot be
+placed, the whole statement falls back to verbatim — so this can only improve, never lose a comment.
+**Multi-line strings** are rendered verbatim inside an exploded operator chain / paren-wrap
+(`x = (\n"""…"""\n% [...]\n)`), with the throwaway-parse re-indent skipping string-interior lines.
+
+The remaining exact-match gap is now a handful of files each, in unrelated categories: a few
+**blank-line** placement edge cases (a spurious blank between a compound header and its body), a
+standalone comment that gdformat attaches to a *lambda body* (deeper indent) rather than the
+surrounding arg list, and gdformat's own **BOM** limitation (it errors on a leading BOM and leaves
+the file unchanged, so its "gold" is just the source — we reformat it and legitimately differ).
 
 The CST wrapper additionally renders **lambdas** (inline `func(p): body`, multi-line bodies with
 recursively-formatted nested blocks, and the contains-a-lambda dot-chain bottom-up rule), drops a
