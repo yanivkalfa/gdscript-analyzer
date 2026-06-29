@@ -162,5 +162,48 @@ fn bench_find_references(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench, bench_keystroke, bench_find_references);
+/// Project-scale **cold** analysis (Phase-6 W4 / burndown Stage 7.30): the time to diagnose every
+/// file of a freshly-loaded multi-file project from a cold `AnalysisHost` (no salsa cache warmed) —
+/// the realistic CLI `check`/LSP-startup cost the warm single-file benches don't capture. Each file is
+/// ~300 loc of typed GDScript; the engine model deserialize is amortized across the project (it is a
+/// one-time, project-independent cost, so it is warmed out first). This is also the measurement that
+/// informs the salsa-LRU decision (Stage 7.33): a cold full-project pass is what an LRU would trade
+/// recompute against.
+fn bench_cold_project(c: &mut Criterion) {
+    const N: u32 = 50; // ~50 × ~300 loc ≈ a 15k-loc project
+    let src = sample_script();
+
+    // Warm the engine model once (project-independent; excluded from the cold project cost).
+    {
+        let (a, f) = analysis_for(&src);
+        let _ = a.diagnostics(f).unwrap();
+    }
+
+    c.bench_function("cold_project_diagnostics_50x300loc", |b| {
+        b.iter(|| {
+            // A fresh host each iteration = a genuinely cold project (cold salsa cache).
+            let mut host = AnalysisHost::new();
+            let mut change = Change::new();
+            for i in 0..N {
+                change.change_file(FileId(i), src.as_str());
+                change.set_file_path(FileId(i), format!("res://f{i}.gd"));
+            }
+            host.apply_change(change);
+            let analysis = host.analysis();
+            let mut total = 0usize;
+            for i in 0..N {
+                total += black_box(analysis.diagnostics(black_box(FileId(i))).unwrap()).len();
+            }
+            black_box(total)
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench,
+    bench_keystroke,
+    bench_find_references,
+    bench_cold_project
+);
 criterion_main!(benches);

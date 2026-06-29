@@ -980,7 +980,25 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
           **gdformat gold-corpus differential** was built for the burndown (gdformat over godot-demo-projects
           → gold; our CLI `format` per file; EOL-normalised byte-compare with an improved/regressed delta)
           — it confirmed the 6.29 fix clean and is the gate any future attempt at (a) must pass.
-- [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
+- [~] **W4 — perf infra tail — burndown Stage 7 (locally-buildable parts DONE; CI-service parts deferred).**
+      Landed: a warm-keystroke incremental bench (~2 ms / ~300 loc — confirms the W1 gate-downstream + W2
+      flow-inside-`analyze_file` keep incrementality flat). **Stage 7.30 — project-scale COLD bench DONE:**
+      `cold_project_diagnostics_50x300loc` (`crates/gdscript-ide/benches/analysis.rs`) loads a fresh
+      ~15k-loc project (50 × ~300 loc) into a cold `AnalysisHost` and diagnoses every file — the realistic
+      CLI-`check`/LSP-startup cost the warm single-file benches miss. **Measured ≈ 120 ms (~2.4 ms/file
+      cold)**, linear in file count (the cross-file firewall bounds per-file work). Synthetic generation
+      (no vendored `fixtures/perf/*` — keeps the repo lean; tiers are a scale knob on `N`). **Stage 7.33 —
+      salsa-LRU NOT warranted (measure-first):** the warm keystroke is **flat at ~2.2 ms** (only the edited
+      file recomputes; cold files stay cached), so an LRU that *evicts* cold-file derived data would
+      **regress** any cross-file warm edit (recomputing evicted deps) to reclaim memory that the bounded
+      per-file derived footprint + the ~120 ms/15k-loc cold cost give **no evidence** is a problem. Deliberately
+      not built; revisit only if a real large-project resident-set ceiling is demonstrated.
+      **Deferred (unverifiable on the local windows-gnu box):** **Stage 7.31** — a CI bench-regression gate
+      (CodSpeed / Bencher needs the CI service + a baseline) and the `twiggy` wasm-size byte-ceiling guard
+      (needs `wasm-pack` on CI); **Stage 7.32** — `dhat` heap profiling for a documented resident ceiling
+      (changes no decision today — no memory pressure is demonstrated — and would add a profiling dep to the
+      contract crate; ready spec: optional `dhat` dep behind a `dhat-heap` feature + a `mem_profile` example
+      that holds a large project's host under `dhat::Profiler::new_heap()`).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
 - [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
       (non-salsa) `WarningOverride` field on the `Db` (read only by the downstream `type_diagnostics`,
