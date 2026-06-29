@@ -321,9 +321,20 @@ fn classify_body_ref(
     }
 }
 
-/// Replicate [`crate::infer`]'s bare-name lookup order, returning the *declaration identity*:
-/// local → own/inherited member → engine global → `class_name` global → autoload. `offset` is the
-/// reference site, used to pick the correct binding when a name is shadowed (lexical scoping).
+/// The **canonical bare-name lookup order** (Godot `reduce_identifier`), shared with
+/// [`crate::infer::resolve_name`]'s type-producing copy:
+///
+/// 1. a **local** binding (var / param / `for`-var / `match`-capture; nearest-preceding on a shadow),
+/// 2. an **own** class member,
+/// 3. an **inherited** member (walk the user `extends` chain),
+/// 4. an **engine global** (builtin / native class / singleton / utility / enum),
+/// 5. a **`class_name` global**,
+/// 6. an **autoload** singleton.
+///
+/// This function is the identity (`GodotDef`) producer; `infer::resolve_name` is the `Ty` producer.
+/// They are intentionally separate (the latter is woven with flow-narrowing + `UNUSED`/`UNASSIGNED`
+/// side-effects and runs mid-inference), but must never **drift** on *which* declaration a use binds
+/// to — the `classify_and_infer_agree_*` tests (gdscript-ide) lock that agreement at every rung.
 fn resolve_name_to_def(
     db: &dyn Db,
     ft: FileText,
@@ -380,31 +391,42 @@ fn resolve_name_to_def(
         return Some(GodotDef::Engine { name: name.clone() });
     }
     // 5. A `class_name` global.
-    if let Some(root) = db.source_root()
-        && let Some(decl) = crate::queries::global_registry(db, root).resolve(name)
-    {
-        return Some(GodotDef::Global {
-            decl_file: decl.file_id(db),
-            name: name.clone(),
-        });
+    if let Some(def) = class_name_global_def(db, name) {
+        return Some(def);
     }
     // 6. An autoload singleton.
-    if let Some(config) = db.project_config()
-        && let Some(path) = crate::queries::autoload_registry(db, config)
-            .resolve_path(name)
-            .cloned()
-    {
-        let target = db.source_root().and_then(|root| {
-            crate::queries::res_path_registry(db, root)
-                .get(path.as_str())
-                .copied()
-        });
-        return Some(GodotDef::Autoload {
-            name: name.clone(),
-            target_file: target,
-        });
-    }
-    None
+    autoload_def(db, name)
+}
+
+/// Rung 5 of the canonical lookup order: a project-global `class_name` → its declaring file's
+/// [`GodotDef::Global`]. (The same `global_registry` `infer::resolve_name` resolves through, so the
+/// two paths agree on *which* file declares the class.)
+fn class_name_global_def(db: &dyn Db, name: &SmolStr) -> Option<GodotDef> {
+    let root = db.source_root()?;
+    let decl = crate::queries::global_registry(db, root).resolve(name)?;
+    Some(GodotDef::Global {
+        decl_file: decl.file_id(db),
+        name: name.clone(),
+    })
+}
+
+/// Rung 6 of the canonical lookup order: an autoload singleton → [`GodotDef::Autoload`], carrying the
+/// `.gd` it points to when resolvable (`None` for a `.tscn`/non-`.gd` target). (The same
+/// `autoload_registry` `infer::resolve_name` resolves through.)
+fn autoload_def(db: &dyn Db, name: &SmolStr) -> Option<GodotDef> {
+    let config = db.project_config()?;
+    let path = crate::queries::autoload_registry(db, config)
+        .resolve_path(name)
+        .cloned()?;
+    let target_file = db.source_root().and_then(|root| {
+        crate::queries::res_path_registry(db, root)
+            .get(path.as_str())
+            .copied()
+    });
+    Some(GodotDef::Autoload {
+        name: name.clone(),
+        target_file,
+    })
 }
 
 /// The file that *declares* member `name` for the script in `sref`, walking the `extends` chain

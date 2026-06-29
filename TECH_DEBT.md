@@ -472,13 +472,21 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       previously invisible → a method rename silently missed it). The `.gd`-string refuse is retained
       only for an *un*attributable string (a dynamic `connect`/`Callable`/`get_node(var)`).
       `project.godot` `[autoload]` is still read-only to rename (an autoload-name rename refuses).
-- [ ] **(M5) `classify` duplicates `infer.rs`'s name-lookup order.** Two copies of the local → member
-      → inherited → global → autoload → engine precedence (one returns a `Ty`, one a `GodotDef`).
-      Unify behind shared `def.rs` helpers once the Phase-2 byte-identical inference guarantee can be
-      re-validated. **Guard added (Phase-5):** `classify_and_infer_agree_on_local_shadowing_a_member`
-      (gdscript-ide) locks in that goto-definition (classify) and hover (infer) resolve a use to the
-      SAME declaration under local-over-member shadowing — so a future drift fails CI. The full
-      unification behind shared helpers is still TODO.
+- [x] **(M5) `classify` / `infer` name-lookup order — UNIFIED + CI-LOCKED (burndown Stage 4.20).**
+      The two copies of the local → own member → inherited member → engine global → `class_name` global
+      → autoload precedence remain *separate functions by necessity* — `infer::resolve_name` is the
+      `Ty`-producer woven with flow-narrowing + the `UNUSED`/`UNASSIGNED` side-effects and runs
+      mid-inference (with `&mut self`), while `def::resolve_name_to_def` is the post-inference identity
+      (`GodotDef`) producer; merging them into one function would entangle flow/side-effects into the
+      identity path and churn the byte-identical-tested hot path for **no behavioural gain**. Instead the
+      drift hazard (the actual risk) is eliminated: (a) the **canonical order is single-sourced** —
+      documented once on `def::resolve_name_to_def` and referenced by `infer::resolve_name`; (b) def's
+      ladder is tidied behind named rung helpers (`class_name_global_def`, `autoload_def`) that resolve
+      through the **same registries** infer uses (so the two agree on *which* file by construction);
+      (c) a **comprehensive agreement test** (`classify_and_infer_agree_across_the_name_lookup_ladder`,
+      gdscript-ide) now locks goto-def ↔ hover agreement at **every** rung — own member, inherited
+      member, engine global, `class_name` global — alongside the two pre-existing shadowing guards. Any
+      future drift at any rung fails CI.
 - [ ] **(M5) `Member`/`Global` find-refs scope is project-wide-candidates, not a precise referrer
       graph.** Correct (the re-resolve confirms) but does wasted `classify`s on files that name-but-
       don't-reference the symbol. A firewall-safe referrer reverse-index (keyed on `item_tree`, not

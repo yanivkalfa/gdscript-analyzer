@@ -2678,6 +2678,12 @@ impl Cx<'_> {
 
     // ---- name resolution (local → class member → inherited → global) ----
 
+    /// The `Ty`-producing half of the bare-name lookup. Its precedence is the **canonical order**
+    /// documented on [`crate::def::resolve_name_to_def`] (local → own member → inherited member →
+    /// engine global → `class_name` global → autoload) — kept in lockstep with that identity-producing
+    /// copy by the `classify_and_infer_agree_*` tests (gdscript-ide). Unlike that copy, this one is
+    /// woven with flow-narrowing and the `UNUSED`/`UNASSIGNED` side-effects (it runs mid-inference),
+    /// which is why the two are intentionally separate functions rather than one.
     fn resolve_name(&mut self, id: ExprId, name: &str) -> Ty {
         // Record a *read* of a local/param for the `UNUSED_*` analysis (before the narrowing check,
         // so a narrowed read still counts as used). The direct LHS of an assignment (`x = …`) is a

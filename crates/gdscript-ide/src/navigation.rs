@@ -1209,6 +1209,64 @@ mod tests {
     }
 
     #[test]
+    fn classify_and_infer_agree_across_the_name_lookup_ladder() {
+        // The full guard for the def.rs/infer.rs name-lookup duplication: goto-definition (classify)
+        // and hover (infer) must resolve a bare name to the SAME declaration at EVERY rung of the
+        // shared precedence ladder — own member → inherited member → engine global → class_name
+        // global — so the two copies of the order can't drift silently. (The local/param shadowing
+        // rungs are covered by the two tests above.)
+        // `hp` is annotated so its type carries cross-file (an *inferred* `:=` member seams to
+        // `Variant` across the lossy `MemberSig` — that's the cross-file seam, not a lookup drift).
+        const BASE: &str = "class_name Base\nvar hp: int = 7\n";
+        const DERIVED: &str = "extends Base\nvar speed := 3\nfunc f():\n\tvar a := speed\n\tvar b := hp\n\tvar c := Node.new()\n\tvar d := Base.new()\n\treturn [a, b, c, d]\n";
+        let db = db_with(&[(0, BASE), (1, DERIVED)]);
+        let ft = db.file_text(FileId(1)).unwrap();
+        let probe = |needle: &str, nth: usize| {
+            let p = pos(1, needle, nth, DERIVED);
+            (
+                goto_definition(&db, p),
+                crate::semantic::hover(&db, ft, p.offset).and_then(|h| h.ty_label),
+            )
+        };
+
+        // Own member `speed`: goto → its decl in f1; hover → int.
+        let speed_decl = u32::try_from(DERIVED.match_indices("speed").next().unwrap().0).unwrap();
+        let (g, h) = probe("speed", 1); // the 2nd "speed" is the use
+        assert!(
+            g.iter()
+                .any(|t| t.file == FileId(1) && t.focus_range.start == speed_decl),
+            "own-member goto should reach its decl in f1: {g:?}",
+        );
+        assert_eq!(h.as_deref(), Some("int"), "own-member hover");
+
+        // Inherited member `hp`: goto → Base's decl (f0); hover → int.
+        let hp_decl = u32::try_from(BASE.match_indices("hp").next().unwrap().0).unwrap();
+        let (g, h) = probe("hp", 0);
+        assert!(
+            g.iter()
+                .any(|t| t.file == FileId(0) && t.focus_range.start == hp_decl),
+            "inherited-member goto should reach the base decl in f0: {g:?}",
+        );
+        assert_eq!(h.as_deref(), Some("int"), "inherited-member hover");
+
+        // Engine global `Node`: classify=Engine → no user-file target; hover shows the engine class.
+        let (g, h) = probe("Node", 0);
+        assert!(
+            !g.iter().any(|t| t.file == FileId(0) || t.file == FileId(1)),
+            "engine global is not a user symbol — goto must not reach a .gd file: {g:?}",
+        );
+        assert_eq!(h.as_deref(), Some("Node"), "engine-global hover");
+
+        // class_name global `Base` used as a value: goto → Base's decl (f0); hover → Base.
+        let (g, h) = probe("Base", 1); // the `Base.new()` receiver (skip `extends Base`)
+        assert!(
+            g.iter().any(|t| t.file == FileId(0)),
+            "class_name-global goto should reach its decl file: {g:?}",
+        );
+        assert_eq!(h.as_deref(), Some("Base"), "class_name-global hover");
+    }
+
+    #[test]
     fn soft_keyword_named_member_is_navigable() {
         // A member named `match` (a Godot soft-keyword identifier) must be reachable by goto-def and
         // find-refs. It used to be dropped at the AST layer (`Name::text()` read only `Ident`), so
