@@ -19,8 +19,8 @@ As of the CST-driven wrapping port (a faithful port of gdformat 4.5's `expressio
 `src/wrap.rs`) plus the full normalization set (inline-suite expansion, blank-line + comment rules,
 node-path / triple-quote / BOM, dict-entry & magic-comma chains), EOL-normalised:
 
-- **exact match**: **~91%** over `godot-demo-projects` (456 files; up from ~14% at the start of
-  Phase 4), **~60%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
+- **exact match**: **~95%** over `godot-demo-projects` (456 files; up from ~14% at the start of
+  Phase 4), **~65%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
 - **fixpoint** `format(gold)==gold`: **~99%** (godot) / **~98%** (ReactiveUI)
 
 Corpus safety (all 545 clean files, `safe_mode` OFF): **0** non-parsing outputs, **0**
@@ -52,6 +52,11 @@ even where we wouldn't make it on raw input).
 - **Node paths** (`$%Unique`, `$A/%Unique`) stay tight, **triple-single-quoted single-line strings**
   collapse to regular (`'''x'''` → `"x"`), a leading **BOM** is preserved, and a soft-keyword member
   call (`obj.match(x)`) hugs its `(`.
+- **Redundant grouping parens** are stripped from a standalone-expression position (`return (x)` →
+  `return x`, `for i in (a):` → `for i in a:`, `g((x))` → `g(x)`), while precedence-bearing parens
+  (`(a + b) * c`) are kept; an **empty signal parameter list** is removed (`signal s()` → `signal s`);
+  **backslash line continuations** are collapsed and the statement re-wrapped (gdformat converts a
+  `\`-continued operator chain to paren-wrapped multi-line).
 - **Block-boundary comment indentation** (increment C): a comment is placed at its intended depth
   (authored indentation clamped to the surrounding structure), matching gdformat — a column-0 comment
   stays at column 0, an over-indented one snaps to the block.
