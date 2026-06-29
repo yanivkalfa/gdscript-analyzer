@@ -62,6 +62,10 @@ pub struct FmtConfig {
     /// the body has more `"` than `'`. On by default. Preserves the string's value (a token-mutating
     /// rewrite guarded by the meaning-equivalence net).
     pub normalize_strings: bool,
+    /// Split an inline suite body onto its own indented line (`if c: x` → `if c:` / `x`,
+    /// `func f(): return` → split, `a; b` → two lines), matching gdformat. An inline *lambda* body
+    /// (`func(): x`) is preserved. On by default. Token-preserving (adds only newlines/indent).
+    pub expand_inline_blocks: bool,
     /// Re-parse + significant-token-equality fallback to verbatim. Keep on unless you have a
     /// reason not to: it is the guarantee the formatter never changes meaning.
     pub safe_mode: bool,
@@ -78,6 +82,7 @@ impl Default for FmtConfig {
             insert_blank_lines: true,
             reflow: true,
             normalize_strings: true,
+            expand_inline_blocks: true,
             safe_mode: true,
         }
     }
@@ -184,6 +189,13 @@ fn format_lf(source: &str, config: &FmtConfig) -> String {
     if config.safe_mode && !input_parses {
         return source.to_owned();
     }
+    // De-inline suite bodies first, so the rest of the pipeline sees a one-statement-per-line tree.
+    let expanded = if config.expand_inline_blocks {
+        expand_inline_blocks(source, config)
+    } else {
+        None
+    };
+    let source = expanded.as_deref().unwrap_or(source);
     let mut out = reindent(source, config);
     if config.insert_blank_lines {
         // Purely additive (only inserts blank lines), so the significant-token net still holds.
@@ -209,6 +221,83 @@ fn format_lf(source: &str, config: &FmtConfig) -> String {
         }
     }
     out
+}
+
+/// gdformat moves an inline suite body to its own indented line (`if c: x` → two lines, `func f():
+/// return` → split), while keeping an inline *lambda* body (`func(): x`). We do it as a source
+/// pre-pass driven by the parse tree: find each block whose first statement shares its header's line
+/// — and whose parent is a real statement/declaration, not a `LambdaExpr` — and insert a newline +
+/// indentation before the body. Returns `None` (leave the source untouched) if it does not parse,
+/// nothing is inline, or the rewrite would drop a significant token / fail to parse.
+fn expand_inline_blocks(source: &str, config: &FmtConfig) -> Option<String> {
+    let parse = gdscript_syntax::parse(source);
+    if !parse.errors().is_empty() {
+        return None;
+    }
+    let unit = config.indent_unit();
+    let mut splits: Vec<(usize, String)> = Vec::new();
+    collect_inline_splits(&parse.syntax_node(), source, 0, &unit, &mut splits);
+    if splits.is_empty() {
+        return None;
+    }
+    splits.sort_by(|a, b| b.0.cmp(&a.0)); // apply right-to-left so offsets stay valid
+    let mut out = source.to_owned();
+    for (off, text) in &splits {
+        out.insert_str(*off, text);
+    }
+    // The rewrite only adds layout (newlines/indent), so it must keep every significant token and the
+    // structure intact — verified by a token-equality + parse-validity check.
+    if !same_significant_tokens(source, &out) || !gdscript_syntax::parse(&out).errors().is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Collect `(offset, inserted_text)` for each inline suite body, recursing with `depth` = the
+/// indentation level of `node`'s own line (incremented when descending into a block).
+fn collect_inline_splits(
+    node: &gdscript_syntax::GdNode,
+    src: &str,
+    depth: usize,
+    unit: &str,
+    splits: &mut Vec<(usize, String)>,
+) {
+    for child in node.children() {
+        if child.kind() == SyntaxKind::Block {
+            // A lambda body stays inline; a real statement/declaration body splits when inline.
+            if node.kind() != SyntaxKind::LambdaExpr {
+                if let Some(bs) = first_sig_offset(&child) {
+                    if src[..bs].trim_end_matches([' ', '\t']).ends_with(':') {
+                        splits.push((bs, format!("\n{}", unit.repeat(depth + 1))));
+                    }
+                }
+            }
+            collect_inline_splits(&child, src, depth + 1, unit, splits);
+        } else {
+            collect_inline_splits(&child, src, depth, unit, splits);
+        }
+    }
+}
+
+/// The byte offset of the first significant (non-trivia, non-synthetic) token within `node`.
+fn first_sig_offset(node: &gdscript_syntax::GdNode) -> Option<usize> {
+    use cstree::util::NodeOrToken;
+    for c in node.children_with_tokens() {
+        match c {
+            NodeOrToken::Token(t) => {
+                let k = t.kind();
+                if !k.is_trivia() && !k.is_synthetic_layout() {
+                    return Some(usize::from(t.text_range().start()));
+                }
+            }
+            NodeOrToken::Node(n) => {
+                if let Some(o) = first_sig_offset(n) {
+                    return Some(o);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Inter-token spacing: how to join two adjacent significant tokens on one logical line.
@@ -2823,6 +2912,25 @@ mod tests {
         assert_eq!(fmt(src), src);
         let src2 = "#region Section\nvar a = 1\nvar b = 2\n#endregion\n";
         assert_eq!(fmt(src2), src2);
+    }
+
+    #[test]
+    fn inline_suite_bodies_split_but_lambdas_stay_inline() {
+        // gdformat moves an inline suite body to its own indented line; an inline *lambda* body stays.
+        assert_eq!(
+            fmt("func f():\n\tif cond: do_thing()\n"),
+            "func f():\n\tif cond:\n\t\tdo_thing()\n"
+        );
+        assert_eq!(fmt("func g(): return 1\n"), "func g():\n\treturn 1\n");
+        assert_eq!(
+            fmt("func i():\n\tif a: b()\n\telse: c()\n"),
+            "func i():\n\tif a:\n\t\tb()\n\telse:\n\t\tc()\n"
+        );
+        // an inline lambda body is preserved
+        assert_eq!(
+            fmt("func h():\n\tvar a := func(): return 1\n"),
+            "func h():\n\tvar a := func(): return 1\n"
+        );
     }
 
     #[test]
