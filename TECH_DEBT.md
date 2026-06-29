@@ -4,6 +4,36 @@ The running backlog of deferred work, known limitations, and queued next steps. 
 honest — anything we knowingly defer or stub goes here with enough context to pick it up
 later.
 
+> **Marker legend.** `[ ]` = open + actionable. `[x]` = done. `[~]` = a **deliberate
+> deviation** (a documented, intentional non-parity / wontfix — *not* debt). The deviations are
+> also collected in the section directly below so the open-item count reflects only real work.
+
+---
+
+## Deliberate deviations (wontfix — documented decisions, not debt)
+
+These are intentional, researched choices — kept here so they don't inflate the actionable
+backlog. Each links to the full inline context (marked `[~]` at its original site).
+
+- **`is`-narrowing is a Pyright-style value-add, not Godot parity.** Godot's `reduce_type_test`
+  does no flow narrowing; ours is **widen-only** (never narrows to a type Godot would reject).
+  Intentional UX non-parity. *(Phase 3 → "deferred/found".)*
+- **gdformat's BOM limitation is unmatchable by design.** gdformat errors on a leading BOM and
+  leaves the file unchanged, so its "gold" for a BOM file is the raw source; we reformat (BOM
+  preserved) and legitimately differ. Excluded from parity counts. *(W3 formatter tail.)*
+- **`uid://`-only `ext_resource` resolution is deferred (user-approved).** Near-zero real value:
+  Godot 4.x writes every `ext_resource` with BOTH `path=` and `uid=`, so path-first resolution
+  (implemented) handles every real case. A firewall-safe impl would need a new `uid` salsa field
+  plus loader plumbing in both LSP + CLI. Bad cost/value ratio. *(Phase 4 M0.)*
+- **A node literally named `"."` is engine-impossible input.** `by_path["."]` can't be returned by
+  `resolve_path`; the engine never produces it. Wontfix. *(Phase 4 M0 bug-hunt.)*
+- **A literal `/` inside a node name** breaks `/`-segmented path matching, but Godot disallows it
+  at edit time. A hand-edited file could violate it; treated as opaque segments. Wontfix. *(M0.)*
+- **The fully-typed napi `.d.ts` is intentionally `any`.** napi `serde_json::Value` types as `any`;
+  real TS types would need `#[napi(object)]` POD re-declaration, trading the single-source-of-truth
+  for DX. The client (guitkx) owns its own TS interfaces. Revisit only if a published `.d.ts`
+  becomes a hard requirement. *(Phase 2 FFI ergonomics.)*
+
 ---
 
 ## Phase 4 — Scene awareness (in progress)
@@ -21,14 +51,14 @@ matrix + a vendored real-file corpus), and **524/524 godot-demo-projects scenes 
 `unique_name_in_owner` / `script_class`.
 
 **M0 known limitations / deferrals (to M1+):**
-- [ ] **Type resolution is M1.** M0 only records `type=`/`script=`/`instance=`; mapping to a `Ty`
-      (native class / `class_name` registry / attached-script refine) is `gdscript-hir` M1.
-- [ ] **Instanced sub-scene recursion → M1+ (hard tail).** An instanced node records `instance`
-      (an `ExtId`); following it into the sub-scene's root type needs the cross-file VFS/project graph.
-- [ ] **Project-wide `script→scene` reverse index + salsa caching → M1.** M0's `node_with_script`
-      answers the *per-scene* half only; the cross-project map and the `scene_model(db, FileId)`
-      tracked query live in `gdscript-db`/`gdscript-hir`.
-- [ ] **`uid://` resolution → DEFERRED (Phase-5, user-approved rationale).** M0 records `uid`;
+- [x] **Type resolution → DONE (M1).** `$Path`/`%Unique`/`get_node` resolve to the node's concrete
+      `Ty` (native class / `class_name` registry / attached-script refine). See M1 below.
+- [x] **Instanced sub-scene recursion → DONE (M3).** An instanced node types as the sub-scene's root
+      (`infer::instance_root_ty` follows the ext-resource path, depth-bounded). See M3 below.
+- [x] **Project-wide `script→scene` reverse index + salsa caching → DONE (M1).** `script_scene_index`
+      (firewalled, keyed on `SourceRoot`) + the `scene_model(db, FileText)` tracked query. See M1.
+- [~] **`uid://` resolution → DEFERRED (Phase-5, user-approved rationale).** *(Deliberate deviation —
+      see the top-of-file deviations section.)* M0 records `uid`;
       resolving a uid-*only* `ext_resource` would need a project UID map. **Near-zero real value:** in
       Godot 4.x every `ext_resource` is written with BOTH `path=` and `uid=`, so path-first resolution
       (already implemented) handles every real case — a uid-only resource essentially never occurs. A
@@ -37,10 +67,10 @@ matrix + a vendored real-file corpus), and **524/524 godot-demo-projects scenes 
       plus loader plumbing in BOTH the LSP and CLI. Deferred: bad cost/value ratio. M0 prefers `path=`.
 - [ ] **Inline `script = SubResource("…")` records no attachment.** An inline GDScript sub-resource
       has no external path; M0 sets `script = None` (M1 types the node by its declared `type=`). Rare.
-- [ ] **`name_span` includes the surrounding quotes** (the `name="…"` value span). Fine for coarse
-      go-to-def; trim if a precise highlight is needed.
-- [ ] **A literal `/` inside a node name** would break `/`-segmented path matching (Godot disallows
-      it at edit time; a hand-edited file could violate it). Treated as opaque segments.
+- [x] **`name_span` quote-trim → DONE (W8).** The node `name_span` is trimmed to the bare identifier
+      (quotes excluded) via `inner_span`, so a node's own declaration tags as a precise reference.
+- [~] **A literal `/` inside a node name** would break `/`-segmented path matching (Godot disallows
+      it at edit time). *(Deliberate deviation — see top-of-file. Treated as opaque segments.)*
 - [ ] **No in-repo full corpus.** 5 representative real fixtures are vendored under
       `crates/gdscript-scene/tests/corpus/`; the broad robustness run is ad hoc via
       `cargo run -p gdscript-scene --example scene_corpus -- <dir>` (not in CI).
@@ -61,8 +91,8 @@ Deferred (low / cosmetic / engine-impossible):
       path matching still works); display/go-to-def only. Rare. Extend `unescape` if it surfaces.
 - [ ] **Cascading dangling:** a node parented to a sibling whose own parent dangled is itself
       flagged. Secondary effect; rare. Track an "upstream-dangling" set to suppress the secondary.
-- [ ] **A node literally named `"."`** makes `by_path["."]` that `resolve_path` can't return —
-      engine-impossible input; **wontfix**.
+- [~] **A node literally named `"."`** makes `by_path["."]` that `resolve_path` can't return —
+      engine-impossible input; **wontfix**. *(Deliberate deviation — see top-of-file.)*
 
 ### M1 — scene-aware node-path typing — **DONE**
 `$Path` / `%Unique` / `@onready var x := $Path` / `get_node("literal")` resolve to the node's concrete
@@ -241,12 +271,11 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       the new version + a `package.json` dep bump, else a clean `npm install` of guitkx pulls the old
       0.2.x and the typed-contract adapter crashes. So: hold the guitkx commit until this branch
       merges → releases → publishes, then bump the dep and land the (already-validated) adapter diff.
-- [ ] **Cross-file resolution → Phase 3.** `class_name` globals, autoloads, `preload`,
-      script `extends`, and `as`/`is` against user types all funnel through
-      `resolve_external() -> Ty::Unknown` (the seam). Correct + non-cascading today; Phase 3
-      reimplements only that one function.
-- [ ] **Scene-aware node typing → Phase 4.** `$Node` / `%Unique` / `get_node()` are always
-      `Object(Node)` (never the concrete child); `.tscn` parsing narrows them in Phase 4.
+- [x] **Cross-file resolution → DONE (Phase 3).** `class_name` globals, autoloads, `preload`,
+      script `extends`, and `as`/`is` against user types now resolve through the reimplemented
+      `resolve_external` (M1–M4). See the Phase 3 section.
+- [x] **Scene-aware node typing → DONE (Phase 4).** `$Node` / `%Unique` / `get_node()` resolve to
+      the concrete child type via `.tscn` parsing (M1–M3). See the Phase 4 section.
 - [ ] **Full 48-warning set + project-settings gating + real CFG narrowing → Phase 6.**
       Phase 2 ships the MVP subset (INFERENCE_ON_VARIANT, TYPE_MISMATCH, NARROWING_CONVERSION,
       INTEGER_DIVISION, UNSAFE_PROPERTY/METHOD_ACCESS); `is`-narrowing is lexical/syntactic,
@@ -306,10 +335,10 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
         serialized result (a generic walk over `NavTarget`/`Reference`/`FileEdit`/`WouldCollide`),
         so a client (guitkx) resolves cross-file targets without maintaining its own `FileId`→URI
         mirror. Zero false-positive surface (every `gdscript-base` `file` field is a `FileId`).
-  - [ ] **Fully-typed TS surface (deferred, low value).** napi `serde_json::Value` types as `any`
-        in the generated `.d.ts`. Real TS types would need `#[napi(object)]` POD re-declaration (or
-        a generated-types step), trading the single-source-of-truth for DX. The client (guitkx) owns
-        its own TS interfaces today; revisit only if a published `.d.ts` becomes a requirement.
+  - [~] **Fully-typed TS surface (deliberate deviation, low value).** napi `serde_json::Value` types
+        as `any` in the generated `.d.ts`. Real TS types would need `#[napi(object)]` POD
+        re-declaration (or a generated-types step), trading the single-source-of-truth for DX. The
+        client (guitkx) owns its own TS interfaces today. *(See top-of-file deviations.)*
 
 ### Validation
 - [ ] **Differential corpus is small + error-agreement only.** The tree-sitter oracle
@@ -420,12 +449,13 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
 - [ ] **Non-`*` autoloads are not resolvable by name (nor via `get_node("/root/Name")`).** We seed
       globals only for `*`-singletons (matches the engine: no `*` ⇒ not a global constant). The
       `/root/Name` node-path access is Phase-4 scene/node work. No false positives, just imprecision.
-- [ ] **`is`-narrowing is a deliberate divergence from upstream Godot.** Godot's `reduce_type_test` does
+- [~] **`is`-narrowing is a deliberate divergence from upstream Godot.** Godot's `reduce_type_test` does
       **no** flow narrowing (CONFIRMED against `gdscript_analyzer.cpp`); our `is`-narrowing is a Pyright-style
       UX value-add, kept **widen-only** (never narrows to a type Godot's checker would reject). Intentional
-      non-parity.
-- [ ] **`project.godot` parsing is `[autoload]`-only.** `config/features` (the human engine version) is
-      not yet parsed/consumed; API-version selection from it is Phase-5 (`ApiInput`) work.
+      non-parity. *(Deliberate deviation — see top-of-file.)*
+- [x] **`project.godot` `config/features` parsing → DONE (Phase-5 hardening §6).** The engine version
+      line is parsed into the `engine_version()` salsa query + `project_engine_version()` plumbing
+      (informational until Phase-6 multi-version API bundling). `[autoload]` is no longer the only line read.
 - [ ] **No per-`project.godot` corpus mode yet.** M4 was validated on a single autoload subproject
       (faithful: one `project.godot`, one namespace). A `--multi-project` harness mode (discover every
       `project.godot`, one host per sub-project) is the exhaustive demo-projects gate — deferred; the
