@@ -28,6 +28,8 @@
 
 use gdscript_syntax::SyntaxKind;
 
+mod wrap;
+
 /// Formatter options. Defaults match the Godot convention (tabs) and keep the safety net on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(
@@ -1331,7 +1333,7 @@ fn line_atoms(body: &str) -> Option<Vec<Atom>> {
 
 /// Binary-operator precedence (lower binds looser → breaks first); `None` for non-binary tokens.
 /// Mirrors the parser's `infix_prec`.
-fn infix_prec(kind: SyntaxKind) -> Option<u8> {
+pub(crate) fn infix_prec(kind: SyntaxKind) -> Option<u8> {
     use SyntaxKind as S;
     Some(match kind {
         S::OrKw | S::PipePipe => 4,
@@ -1695,6 +1697,13 @@ fn flatten_statement(stmt: &str) -> Option<String> {
 /// Render a flattened statement `body` at `indent` into its canonical layout — flat if it fits, else
 /// wrapped (operator-chain → bracketed compact/exploded → compact-paren). Always indented.
 fn render_statement(body: &str, indent: usize, cfg: &FmtConfig, tw: usize, unit: &str) -> String {
+    // Primary path: gdformat's own algorithm, driven from the CST (see `wrap`). It owns the layout and
+    // is faithful to gdformat. `wrap::render` self-validates that its output is meaning-equivalent to
+    // the body (allowing exactly gdformat's legitimate rewrites — redundant grouping parens, trailing
+    // commas, string quotes); it returns `None` otherwise, and we fall back to the heuristic below.
+    if let Some(out) = wrap::render(body, indent, cfg) {
+        return out;
+    }
     let flat = || format!("{}{body}", unit.repeat(indent));
     let Some(atoms) = line_atoms(body) else {
         return flat();
@@ -1877,7 +1886,7 @@ fn same_significant_tokens(a: &str, b: &str) -> bool {
 /// Re-emit a string-literal token's text in gdformat's canonical quote style: prefer `"`, fall back
 /// to `'` only when the body has more `"` than `'` (fewer escapes), keeping the prefix (`r`/`&`/`^`)
 /// and the decoded value. Idempotent. Triple-quoted strings are left verbatim (rare; not normalized).
-fn canonical_string(text: &str) -> String {
+pub(crate) fn canonical_string(text: &str) -> String {
     let Some(qpos) = text.find(['"', '\'']) else {
         return text.to_owned(); // defensive: not actually a string literal
     };
@@ -2000,7 +2009,7 @@ fn emit_tree_events(node: &gdscript_syntax::GdNode, out: &mut Vec<TreeEvent>) {
 /// is allowed to introduce: **redundant grouping parens** are unwrapped, a **trailing comma** before a
 /// closing bracket is dropped, and **string literals are compared by canonical quote form**. A
 /// dropped/added/reordered token, a changed string *value*, or a precedence change is still caught.
-fn meaning_preserved(a: &str, b: &str) -> bool {
+pub(crate) fn meaning_preserved(a: &str, b: &str) -> bool {
     fn events(s: &str) -> Vec<TreeEvent> {
         let mut raw = Vec::new();
         emit_tree_events(&gdscript_syntax::parse(s).syntax_node(), &mut raw);
@@ -2659,6 +2668,64 @@ mod tests {
         let out = fmt(src);
         assert!(out.contains("# first"), "{out:?}");
         assert!(super::same_significant_tokens(src, &out));
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    // ---- Phase-4: CST-driven wrapping (gdformat parity — see `wrap`) ----
+
+    #[test]
+    fn wrap_func_param_list_explodes_with_return_type_on_close_line() {
+        // A func header over the limit wraps its *parameter list*; the `-> void:` stays a suffix on the
+        // closing-paren line (it is never itself wrapped), matching gdformat.
+        let src = "func process(first_argument: int, second_argument: String, third_argument: float, fourth: bool) -> void:\n\tpass\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "func process(\n\tfirst_argument: int, second_argument: String, third_argument: float, fourth: bool\n) -> void:\n\tpass\n"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn wrap_method_chain_bottom_up_wraps_final_call_args() {
+        // When the chain prefix fits, gdformat wraps only the final call's arguments (bottom-up).
+        let src = "func f():\n\tobject.method_one(argument).method_two(argument).method_three(argument).method_four(argument_xxxx)\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "func f():\n\tobject.method_one(argument).method_two(argument).method_three(argument).method_four(\n\t\targument_xxxx\n\t)\n"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn wrap_method_chain_explodes_leading_dot_when_compact_overflows() {
+        // When even the compact chain overflows, gdformat wraps it in parens and breaks at each `.`,
+        // leading-dot style (`. method`).
+        let src = "func _ready():\n\ttween.tween_property(self, ^\"modulate:a\", 0.0, fade_out_duration).set_trans(Tween.TRANS_LINEAR).set_ease(Tween.EASE_OUT)\n";
+        let out = fmt(src);
+        assert!(
+            out.contains("\t(\n\t\ttween\n\t\t. tween_property("),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n\t\t. set_ease(Tween.EASE_OUT)\n\t)\n"),
+            "{out}"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn wrap_assignment_operator_chain_wraps_in_parens_compact_first() {
+        // A too-long assignment RHS that is an operator chain is wrapped in injected parens; the chain
+        // stays on one continuation line while it fits there (gdformat's compact-first), exploding at
+        // the operator only when even that overflows.
+        let src = "func f():\n\tgravity_value = first_long_operand_value_xx * second_long_operand_value_yy * third_long_operand_value_zz\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "func f():\n\tgravity_value = (\n\t\tfirst_long_operand_value_xx * second_long_operand_value_yy * third_long_operand_value_zz\n\t)\n"
+        );
         assert_eq!(fmt(&out), out, "idempotent");
     }
 

@@ -112,27 +112,26 @@ token or a changed string *value*.
 - **Enum-brace spacing — IMPLEMENTED.** An enum body is spaced inside (`enum E { A, B }`) while a dict
   stays tight (`{"k": v}`) and an empty enum is tight (`{}`). Byte-identical to gdformat.
 
-- **Layout ownership — IMPLEMENTED.** The reflow re-lays-out *every* statement, not just single-line
-  ones: a statement the author wrapped across lines is collapsed back onto one line when it now fits,
-  and re-wrapped to the canonical flat → compact → exploded form when it does not (the wrap target is
-  the outermost bracket group — for a `func` definition, its parameter list). Statements that cannot
-  be safely collapsed (a comment, a multi-line lambda body, a multi-line string) are kept verbatim.
-  Corpus-safe (0 non-parsing / 0 token changes / 0 idempotence breaks, safe_mode off). Raised the
-  byte-exact match to ~62% (godot) / ~39% (ReactiveUI).
-  *Caveat:* gdformat's wrapping algorithm has years of construct-specific tuning; our simpler model
-  makes a **different (but valid, ≤ width, meaning-preserving) layout choice** for some complex
-  multi-line statements — so `format(gdformat-output)` is now a ~90% (godot) / ~81% (ReactiveUI)
-  fixpoint rather than ~94%. The remaining tail is items 3–5 below plus assorted wrap-choice nuances.
+- **Layout ownership — IMPLEMENTED (CST-driven port of gdformat's wrapper).** The reflow re-lays-out
+  *every* statement. A statement the author wrapped across lines is collapsed when it now fits; one
+  that does not is re-wrapped by a faithful port of gdformat 4.5's `expression.py` algorithm (see
+  `src/wrap.rs`), driven from our own parse tree: each (sub-)expression is rendered single-line if it
+  fits, else exploded — a call/array/dict/parameter-list explodes its comma-separated elements
+  (compact on one continuation line when they fit, else one-per-line); an operator chain wraps in
+  injected parens and breaks operator-leading; a method chain either wraps its final call's arguments
+  (bottom-up) or, when even the compact chain overflows, explodes at each `.` (leading-dot, `. method`).
+  A `func`/`signal` header wraps its parameter list with the `-> ReturnType:` kept as a suffix. Every
+  output is self-validated as meaning-equivalent to the input (redundant parens / trailing commas /
+  string quotes allowed) before use, falling back to the previous heuristic otherwise. Corpus-safe
+  (0 non-parsing / 0 token changes / 0 idempotence breaks, safe_mode off). Byte-exact match ~66%
+  (godot) / ~46% (ReactiveUI); `format(gdformat-output)` fixpoint ~95% (godot) / ~94% (ReactiveUI).
 
-Still not implemented:
+The remaining `format(gold) != gold` tail (each low-frequency):
 
-3. **Exploded method chains + leading-dot padding.** A method chain too long even for the compact
-   paren-wrap is broken by gdformat at each `.`, leading-dot style (`. method`). We leave such a (rare)
-   chain on one line, and we tighten an *already*-wrapped chain's `. method` to `.method` — the main
-   remaining `format(gold)!=gold` cases (chain-heavy library code). Low practical impact (hand-written
-   code rarely pre-wraps chains).
-
-### Smaller gaps
-
-- `#region` / `#endregion` comments are treated as ordinary comments by the blank-line policy; we do
-  not special-case them.
+- **`#region` / `#endregion` comment indentation.** gdformat keeps a column-0 comment at column 0; our
+  block-boundary policy re-indents it to the enclosing block.
+- **`$%UniqueName` node-path spacing.** The combined `$%` sigil is spaced to `$ %` by the intra-line
+  spacing pass (the node-path state machine does not carry through a `%` after `$`).
+- **Assorted wrap-choice nuances** on deeply-nested mixed call/operator statements, where gdformat's
+  per-construct tuning picks a different (but valid, ≤ width, meaning-preserving) split than ours.
+- **Triple-quoted strings** (`'''…'''`) are left verbatim; gdformat rewrites them to `"""…"""`.
