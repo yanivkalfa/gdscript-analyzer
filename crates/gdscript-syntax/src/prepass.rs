@@ -179,7 +179,12 @@ impl PrePass<'_> {
             if tok.kind == SyntaxKind::NewlinePhys {
                 has_terminator = true;
                 let opens_lambda = self.bracket_depth > 0 && is_lambda_header;
-                if self.bracket_depth == 0 || in_lambda || opens_lambda {
+                // Use the *current* lambda state, not the line-start `in_lambda`: a lambda body that
+                // closed mid-line (`func(): … return X,` / `… last())`) is no longer significant, so
+                // its trailing physical newline must stay suppressed inside the enclosing bracket —
+                // otherwise a stray `Newline` lands between the call's argument `,` and the next arg.
+                let in_lambda_now = !self.lambda_stack.is_empty();
+                if self.bracket_depth == 0 || in_lambda_now || opens_lambda {
                     self.push_marker(SyntaxKind::Newline, tok.range.start());
                 }
                 self.out.push(*tok);

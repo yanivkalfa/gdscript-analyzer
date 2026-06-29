@@ -3447,6 +3447,20 @@ mod tests {
     }
 
     #[test]
+    fn lambda_body_ending_in_arg_separator_comma_parses_and_is_preserved() {
+        // gdformat emits `func(): … return X,` where the `,` closes the lambda body mid-line and
+        // separates the enclosing call's arguments. The prepass must suppress the lambda body's now
+        // -stale trailing newline so the `,` and the next argument parse — and the statement (with an
+        // inner comment, so it stays verbatim) round-trips unchanged.
+        let src = "func f():\n\tHooks.use_effect(\n\t\tfunc():\n\t\t\tsfx.call(null)  # c1\n\t\t\treturn null,\n\t\t[]\n\t)\n";
+        let out = fmt(src);
+        assert!(out.contains("\t\t\treturn null,\n"), "{out:?}");
+        assert!(out.contains("# c1"), "comment preserved: {out:?}");
+        assert!(parses_clean(&out), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn semicolons_inside_lambda_body_expand_at_correct_depth() {
         // A multi-line lambda body's `;`-separated statements expand one-per-line at the body depth
         // (the lambda's block counts as a depth increment even though its own body is not split inline).
