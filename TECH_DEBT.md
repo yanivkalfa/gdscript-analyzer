@@ -205,11 +205,15 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       `bindings` CI job builds it.
 
 ### Parser / syntax
-- [ ] **Trivia attachment is the simple model.** The tree sink flushes leading trivia
-      into the *following* node; it does not implement rust-analyzer's full
-      `n_attached_trivia` leading-vs-trailing heuristic (blank-line breaks, doc-comment
-      pull). Lossless, but attachment isn't ideal for formatting fidelity — refine before
-      shipping a formatter.
+- [ ] **Trivia attachment is the simple model — DEFERRED (formatter-entangled, marginal now).** The
+      tree sink flushes leading trivia into the *following* node; it does not implement
+      rust-analyzer's `n_attached_trivia` leading-vs-trailing heuristic (same-line trailing comment,
+      blank-line breaks, doc-comment pull). It is lossless (round-trip is byte-exact regardless of
+      grouping). The motivating consumer was the formatter — but the formatter already reaches
+      **99.6 % gdformat parity** via its own comment-threading tuned to the *current* model, so
+      re-attaching trivia now would risk regressing that solid component for a marginal fidelity gain.
+      The right time is a coordinated W3 formatter-fidelity pass with full corpus re-validation, not a
+      standalone refactor — so it "harms more than helps" right now. *(Deferred with rationale.)*
 - [x] **Annotations as first-class → DONE (burndown Stage 2).** The item tree now lifts decorator
       annotations onto each item: `FuncItem`/`VarItem`/`ConstItem`/`SignalItem` carry
       `annotations: Vec<AnnotationItem>` (name + range, source order), and `ItemTree` carries the
@@ -283,9 +287,14 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       Phase 2 ships the MVP subset (INFERENCE_ON_VARIANT, TYPE_MISMATCH, NARROWING_CONVERSION,
       INTEGER_DIVISION, UNSAFE_PROPERTY/METHOD_ACCESS); `is`-narrowing is lexical/syntactic,
       not a real control-flow graph; `@warning_ignore` gating is not applied.
-- [ ] **Hover docs are signatures-only.** The `DocId`-keyed doc store is wired into the
-      model but not populated (the BBCode→Markdown doc-XML pipeline is deferred, Playbook
-      §4.6), so `HoverResult.doc` is empty and hover shows the inferred type / signature only.
+- [ ] **Hover docs are signatures-only — BLOCKED ON A DATA DECISION (needs the user).** The
+      `DocId`-keyed doc store is wired into the model but not populated. The pipeline (a BBCode→Markdown
+      converter + a codegen doc-XML reader + hover wiring) is straightforward, BUT it needs the Godot
+      `doc/classes/*.xml` corpus, which is **deliberately not vendored** (`vendor/godot/4.5-stable/
+      SOURCE.txt`: ~900 files / ~6–8 MB) — and baking the descriptions into the bundled engine blob
+      grows the **wasm bundle** the playground downloads. So enabling hover docs is a repo-size + wasm-
+      size tradeoff the team explicitly avoided in Phase 0; **reversing it should be an explicit
+      decision**, not a unilateral burndown edit. (Deferred here, surfaced to the user — not skipped.)
 
 ### Genuine workarounds to revisit (flagged honestly)
 - [x] **Lambda-call parser bug — FIXED at the root.** A multi-line lambda followed by a line
