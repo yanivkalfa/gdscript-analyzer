@@ -79,6 +79,12 @@ pub fn find_references(db: &dyn Db, pos: FilePosition) -> Vec<Reference> {
             Some(SymbolKind::Signal) => {
                 out.extend(scene_connection_refs(db, *owner_file, name, true));
             }
+            // An `@export` variable is set as a `[node]` property in scenes attaching this script
+            // (a non-exported var is never a node property, so a same-named property would be an
+            // engine property we must NOT rewrite — hence the `is_exported` gate).
+            Some(SymbolKind::Variable) if var_is_exported(db, *owner_file, name) => {
+                out.extend(scene_property_refs(db, *owner_file, name));
+            }
             _ => {}
         }
     }
@@ -182,6 +188,50 @@ fn scene_connection_refs(db: &dyn Db, file: FileId, name: &str, is_signal: bool)
             });
         }
     });
+    out
+}
+
+/// Whether `name` is an `@export` variable member of `file`.
+fn var_is_exported(db: &dyn Db, file: FileId, name: &str) -> bool {
+    db.file_text(file).is_some_and(|ft| {
+        matches!(
+            queries::item_tree(db, ft).member(name),
+            Some(Member::Var(v)) if v.is_exported
+        )
+    })
+}
+
+/// References to an `@export` variable `name` of `file` made by `[node]` property assignments
+/// (`name = …`) in scenes whose node attaches this exact script — the spans a rename rewrites and
+/// find-refs shows. Resolve-confirmed (the node's `script=` resolves to `file`).
+fn scene_property_refs(db: &dyn Db, file: FileId, name: &str) -> Vec<Reference> {
+    let Some(script_res) = db.file_text(file).and_then(|ft| ft.res_path(db)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (scene_file, model) in project_scenes(db) {
+        db.unwind_if_revision_cancelled();
+        for node in &model.nodes {
+            let attaches = node
+                .script
+                .as_ref()
+                .and_then(|id| model.ext_resources.get(id))
+                .and_then(|e| e.path.as_deref())
+                == Some(script_res.as_str());
+            if !attaches {
+                continue;
+            }
+            for prop in &node.properties {
+                if prop.key == name {
+                    out.push(Reference {
+                        file: scene_file,
+                        range: prop.key_span,
+                        kind: ReferenceKind::Write,
+                    });
+                }
+            }
+        }
+    }
     out
 }
 
@@ -1661,6 +1711,47 @@ script = ExtResource(\"1\")\n";
         assert!(
             matches!(err, RenameError::CrossesUnsupportedBoundary { .. }),
             "{err:?}"
+        );
+    }
+
+    const EXPORT_GD: &str = "extends Node2D\n@export var speed := 1.0\n";
+    const EXPORT_TSCN: &str = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://e.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Node2D\"]\n\
+script = ExtResource(\"1\")\n\
+speed = 5.0\n";
+
+    #[test]
+    fn rename_an_export_var_rewrites_the_scene_property_key() {
+        let db = db_paths(&[
+            (0, "res://e.gd", EXPORT_GD),
+            (1, "res://e.tscn", EXPORT_TSCN),
+        ]);
+        let change = rename(&db, pos(0, "speed", 0, EXPORT_GD), "velocity").expect("rename ok");
+        // the `.gd` decl + the `.tscn` `speed =` property key.
+        let tscn = change
+            .edits
+            .iter()
+            .find(|e| e.file == FileId(1))
+            .expect("tscn edit");
+        assert_eq!(tscn.edits.len(), 1);
+        let r = tscn.edits[0].range;
+        assert_eq!(&EXPORT_TSCN[r.start as usize..r.end as usize], "speed");
+        assert_eq!(tscn.edits[0].new_text, "velocity");
+    }
+
+    #[test]
+    fn rename_a_non_export_var_does_not_touch_a_scene_property() {
+        // No `@export` → `speed` is never a node property; a same-named `.tscn` property is an engine
+        // property that must NOT be rewritten.
+        let gd = "extends Node2D\nvar speed := 1.0\n";
+        let db = db_paths(&[(0, "res://n.gd", gd), (1, "res://n.tscn", EXPORT_TSCN)]);
+        // (EXPORT_TSCN points at e.gd, but here file 0 is n.gd; the property won't attribute anyway.)
+        let change = rename(&db, pos(0, "speed", 0, gd), "velocity").expect("rename ok");
+        assert!(
+            change.edits.iter().all(|e| e.file != FileId(1)),
+            "{:?}",
+            change.edits
         );
     }
 }

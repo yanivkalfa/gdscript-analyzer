@@ -118,6 +118,10 @@ pub struct FuncItem {
 
 /// A `var` member.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent declaration facts of a `var` (static / exported / has-init / inferred); not a state machine to encode as an enum"
+)]
 pub struct VarItem {
     /// The variable name.
     pub name: SmolStr,
@@ -125,6 +129,9 @@ pub struct VarItem {
     pub type_ref: Option<SmolStr>,
     /// Whether this is a `static var`.
     pub is_static: bool,
+    /// Whether it carries an `@export`/`@export_*` annotation — such a var is surfaced in the editor
+    /// inspector and stored as a `.tscn` node property (the basis for scene-aware rename, W8 A3).
+    pub is_exported: bool,
     /// Whether it has an initializer expression.
     pub has_init: bool,
     /// Whether the type was inferred with `:=`.
@@ -258,12 +265,32 @@ fn lower_var(d: &ast::VarDecl) -> VarItem {
         name: decl_name(d.name()).unwrap_or_default(),
         type_ref: d.type_ref().and_then(|t| t.text()).map(SmolStr::new),
         is_static: d.is_static(),
+        is_exported: decl_is_exported(node),
         has_init: cst::first_child_expr(node).is_some(),
         is_inferred: cst::has_token(node, SyntaxKind::ColonEq),
         ptr: AstPtr::of(node),
         range: cst::text_range_of(node),
         name_range: name_range(d.name(), node),
     }
+}
+
+/// Whether a declaration carries an `@export`/`@export_*` annotation — a preceding sibling
+/// `Annotation` node. Annotations are siblings of the declaration they decorate.
+fn decl_is_exported(node: &GdNode) -> bool {
+    let mut sib = node.prev_sibling();
+    while let Some(s) = sib {
+        if s.kind() != SyntaxKind::Annotation {
+            break; // a non-annotation node ends the annotation prefix run
+        }
+        if ast::Annotation::cast(s.clone())
+            .and_then(|a| a.name())
+            .is_some_and(|n| n == "export" || n.starts_with("export_"))
+        {
+            return true;
+        }
+        sib = s.prev_sibling();
+    }
+    false
 }
 
 fn lower_const(d: &ast::ConstDecl) -> ConstItem {
