@@ -1386,17 +1386,19 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
                         let line = line_of(usize::from(t.range.start()));
                         let role = classify_line(&toks, idx);
                         // A comment's *structural* block (which one it belongs to, for the edge
-                        // rule) is not its visual indentation: a comment that *leads* a deeper block
-                        // (next code is deeper) belongs to that block — even at column 0 — so it is
-                        // not mistaken for a sibling of the preceding def; otherwise it sits at its
-                        // own (visual) depth, which correctly attaches a column-0 doc-comment to a
-                        // following *dedented* def.
+                        // rule) is not its visual indentation: a comment whose *next* code is deeper
+                        // than the comment's own column belongs to that deeper block — even a column-0
+                        // comment sitting amid a function body (commented-out code) is inside the
+                        // function, not a sibling of the preceding def. Otherwise it sits at its own
+                        // (visual) depth, which correctly attaches a column-0 doc-comment to a
+                        // following *dedented* def (whose next code is at column 0, not deeper).
                         let head_depth = if role == LineRole::Comment {
+                            let visual = line_depth(line);
                             let next_depth = next_code_info(&toks, idx, depth).0;
-                            if next_depth > depth {
+                            if next_depth > visual {
                                 next_depth
                             } else {
-                                line_depth(line)
+                                visual
                             }
                         } else {
                             depth
@@ -3939,6 +3941,15 @@ mod tests {
         // A comment is the block's first content, so a blank between it and the first statement is
         // preserved (the comment is not a header — the statement is not a new block's first line).
         let src = "func f():\n\t# note\n\n\tvar x = 1\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn a_column0_comment_amid_a_function_body_forces_no_def_blanks() {
+        // Commented-out code dedented to column 0 in the middle of a function body is structurally
+        // inside the function (its next code is deeper), so it must not be treated as a class-level
+        // sibling of the function and get 2 blank lines forced before it.
+        let src = "func f():\n\tvar a = 1\n# commented out\n#\tvar b = 2\n\tvar c = 3\n";
         assert_eq!(fmt(src), src);
     }
 
