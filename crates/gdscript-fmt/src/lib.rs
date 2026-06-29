@@ -856,28 +856,17 @@ fn next_code_info(toks: &[gdscript_syntax::RawToken], idx: usize, cur: usize) ->
     (cur, 0)
 }
 
-/// The intended depth of a block-boundary comment, matching gdformat: its authored indentation
-/// clamped to the surrounding structure. We compare the comment's indentation *length* against the
-/// previous and next code lines' — if it reaches the deeper line's indentation it joins that block,
-/// otherwise it stays at the shallower one (so a column-0 comment stays at column 0 and an
-/// over-indented one snaps in). Comparing lengths (not levels) makes it indent-width agnostic.
-fn comment_depth(
-    comment_len: usize,
-    prev_depth: usize,
-    prev_len: usize,
-    next_depth: usize,
-    next_len: usize,
-) -> usize {
-    let ((deep_depth, deep_len), (shallow_depth, _)) = if prev_depth >= next_depth {
-        ((prev_depth, prev_len), (next_depth, next_len))
-    } else {
-        ((next_depth, next_len), (prev_depth, prev_len))
-    };
-    if comment_len >= deep_len {
-        deep_depth
-    } else {
-        shallow_depth
-    }
+/// The intended depth of a block-boundary comment, matching gdformat's
+/// `reconstruct_blank_lines_in_range`: a standalone comment joins the deepest block whose line-range
+/// contains it, which is its own authored indentation level *clamped down* to the deepest open block
+/// around it. `comment_levels` is the comment's authored indentation measured in indent units; the
+/// deepest open block is the deeper of the previous code line's depth (`prev_depth`) and the next
+/// code line's (`next_depth`) — the next statement can reveal a block the prepass has not yet opened
+/// with an `Indent` (a comment that is the first line of a body). So an under-indented comment keeps
+/// its own (shallower) level, while an over-indented one snaps to the deepest real block. A column-0
+/// `#` comment is special-cased by the caller (kept at column 0).
+fn comment_depth(comment_levels: usize, prev_depth: usize, next_depth: usize) -> usize {
+    comment_levels.min(prev_depth.max(next_depth))
 }
 
 /// Re-emit the pre-pass token stream with normalized **indentation**, **intra-line spacing** (when
@@ -935,9 +924,13 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
     // The leading whitespace of the current logical line (used to recover a *comment*'s authored
     // indentation, since the prepass attributes a block-boundary comment to the wrong raw `depth`).
     let mut line_indent_ws: Option<&str> = None;
-    // The leading-indentation length of the most recent *code* line — the "previous code line" a
-    // block-boundary comment is placed against.
-    let mut prev_code_indent_len: usize = 0;
+    // The depth of the most recent *code* line, and whether the most recent content line was a
+    // comment. Used to detect the start of a block: a code statement deeper than the previous code
+    // line, with no comment in between, is a suite's first statement — gdformat strips a blank between
+    // a compound header and its body. A comment is the block's "first content" (its trailing blanks
+    // are kept), so an intervening comment suppresses the strip.
+    let mut prev_content_depth: usize = 0;
+    let mut prev_was_comment = false;
 
     for (idx, t) in toks.iter().enumerate() {
         let text = &source[t.range];
@@ -1018,8 +1011,8 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                 if line_start {
                     // A block-boundary *comment* is attributed by the prepass to the wrong raw
                     // `depth` (the `Indent`/`Dedent` lands on the next *code* line, not the comment).
-                    // Recover its intended depth the way gdformat does: its authored indentation,
-                    // clamped to the surrounding structure — `min(authored, max(prev, next))`.
+                    // Recover its intended depth the way gdformat does: its authored indentation level
+                    // clamped down to the deepest open block (`min(authored, max(prev, next))`).
                     let is_comment = matches!(
                         t.kind,
                         SyntaxKind::LineComment
@@ -1035,29 +1028,39 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                             // it to the enclosing block.
                             0
                         } else {
-                            let (next_depth, next_len) = next_code_info(&toks, idx, depth);
-                            comment_depth(
-                                comment_len,
-                                depth,
-                                prev_code_indent_len,
-                                next_depth,
-                                next_len,
-                            )
+                            let (next_depth, _) = next_code_info(&toks, idx, depth);
+                            let unit_len = unit.len().max(1);
+                            comment_depth(comment_len / unit_len, depth, next_depth)
                         }
                     } else {
-                        prev_code_indent_len = comment_len;
                         depth
                     };
                     // Flush the buffered blank lines. gdformat squeezes *every* run of blank lines to a
                     // single blank, then re-inserts the 2nd (top-level) / 1st (nested) blank only around
                     // definitions (done later by `insert_def_blanks`). So the cap here is 1 everywhere,
-                    // and 0 before the first content (leading blanks gone).
+                    // 0 before the first content (leading blanks gone), and 0 at the **start of a block**
+                    // (a suite's first statement directly under its header — gdformat's
+                    // `_remove_empty_strings_from_begin` strips a blank between a header and its body).
+                    // The strip fires only for a *code* statement deeper than the previous code line
+                    // with **no comment in between**: a comment is the block's first content, so its
+                    // trailing blanks are kept (and a column-0 comment, whose raw `depth` lags, never
+                    // looks like a header). This mirrors gdformat's `previous_statement_name is None`.
                     if collapse_on {
-                        let cap = usize::from(seen_content);
+                        let at_block_start =
+                            !prev_was_comment && !is_comment && depth > prev_content_depth;
+                        let cap = if at_block_start {
+                            0
+                        } else {
+                            usize::from(seen_content)
+                        };
                         for _ in 0..pending_blanks.min(cap) {
                             out.push('\n');
                         }
                         pending_blanks = 0;
+                    }
+                    prev_was_comment = is_comment;
+                    if !is_comment {
+                        prev_content_depth = depth;
                     }
                     for _ in 0..emit_depth {
                         out.push_str(&unit);
@@ -3922,5 +3925,32 @@ mod tests {
         assert!(!mp("var a = 'x'\n", "var a = \"y\"\n"));
         assert!(!mp("func f():\n\tg(a, b)\n", "func f():\n\tg(a)\n"));
         assert!(!mp("var x = (a + b) * c\n", "var x = a + b * c\n"));
+    }
+
+    #[test]
+    fn blank_at_the_start_of_a_block_is_stripped() {
+        // gdformat removes a blank line between a compound header and its body's first statement.
+        let src = "func f():\n\tfor i in range(3):\n\n\t\tprint(i)\n";
+        assert_eq!(fmt(src), "func f():\n\tfor i in range(3):\n\t\tprint(i)\n");
+    }
+
+    #[test]
+    fn blank_after_a_leading_block_comment_is_kept() {
+        // A comment is the block's first content, so a blank between it and the first statement is
+        // preserved (the comment is not a header — the statement is not a new block's first line).
+        let src = "func f():\n\t# note\n\n\tvar x = 1\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn a_block_trailing_comment_keeps_its_shallower_indent() {
+        // A comment after a nested block, indented to the enclosing function body, stays at the body's
+        // depth (gdformat places it in the block whose range contains it), not snapped to column 0.
+        let src = "func f():\n\tif c:\n\t\tx()\n\t# trailing\n\n\nfunc g():\n\tpass\n";
+        let out = fmt(src);
+        assert!(
+            out.contains("\n\t# trailing\n"),
+            "comment kept at one tab:\n{out}"
+        );
     }
 }
