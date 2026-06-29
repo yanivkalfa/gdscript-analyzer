@@ -109,6 +109,9 @@ fn main() {
         .expect("usage: corpus <dir> [--show] [--project]");
     let show = args.iter().any(|a| a == "--show");
     let project = args.iter().any(|a| a == "--project");
+    // `--ci`: exit non-zero on any panic or any GDSCRIPT_SYNTAX parse error (type diagnostics —
+    // UNSAFE_*, etc. — are the intended value-prop warnings and never fail the gate).
+    let ci = args.iter().any(|a| a == "--ci");
 
     let mut files = Vec::new();
     collect_gd(Path::new(&dir), &mut files);
@@ -120,6 +123,7 @@ fn main() {
     }
 
     let (mut total, mut clean, mut with_diags, mut total_diags) = (0usize, 0usize, 0usize, 0usize);
+    let mut parse_errors = 0usize;
     let mut panics = Vec::new();
 
     for path in &files {
@@ -140,6 +144,7 @@ fn main() {
             Ok(diags) => {
                 with_diags += 1;
                 total_diags += diags.len();
+                parse_errors += diags.iter().filter(|d| d.code == "GDSCRIPT_SYNTAX").count();
                 if show {
                     let idx = LineIndex::new(&src);
                     println!("\n{}  ({} diag)", path.display(), diags.len());
@@ -162,10 +167,18 @@ fn main() {
     }
 
     println!(
-        "\n=== corpus: {dir} ===\n  files:       {total}\n  clean:       {clean}\n  with diags:  {with_diags} ({total_diags} diagnostics)\n  panics:      {}",
+        "\n=== corpus: {dir} ===\n  files:       {total}\n  clean:       {clean}\n  with diags:  {with_diags} ({total_diags} diagnostics)\n  parse errors:{parse_errors}\n  panics:      {}",
         panics.len()
     );
     for p in &panics {
         println!("  PANIC: {}", p.display());
+    }
+    // The CI gate: any panic or any GDSCRIPT_SYNTAX parse error over real code is a regression.
+    if ci && (parse_errors > 0 || !panics.is_empty()) {
+        eprintln!(
+            "CORPUS GATE FAILED: {parse_errors} parse errors, {} panics",
+            panics.len()
+        );
+        std::process::exit(1);
     }
 }

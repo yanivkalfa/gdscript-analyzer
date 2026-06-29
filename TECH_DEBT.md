@@ -62,9 +62,12 @@ matrix + a vendored real-file corpus), and **524/524 godot-demo-projects scenes 
       has no external path; M0 sets `script = None` (M1 types the node by its declared `type=`). Rare.
 - [x] **`name_span` quote-trim → DONE (W8).** The node `name_span` is trimmed to the bare identifier
       (quotes excluded) via `inner_span`, so a node's own declaration tags as a precise reference.
-- [ ] **No in-repo full corpus.** 5 representative real fixtures are vendored under
-      `crates/gdscript-scene/tests/corpus/`; the broad robustness run is ad hoc via
-      `cargo run -p gdscript-scene --example scene_corpus -- <dir>` (not in CI).
+- [x] **Corpus CI gate → DONE (burndown Stage 3).** A `corpus.yml` workflow clones
+      godot-demo-projects (shallow — it carries large binary assets, so it is cloned-in-CI rather than
+      vendored) and runs both example harnesses in a new `--ci` mode that **exits non-zero on any
+      GDSCRIPT_SYNTAX parse error or panic** (`.gd` via the `gdscript-ide` corpus runner, `.tscn` via
+      `gdscript-scene/scene_corpus`). Type diagnostics (`UNSAFE_*`) don't fail the gate. Verified
+      locally: **456 `.gd` + 524 `.tscn`, 0 parse errors, 0 panics.**
 
 ### M0 adversarial bug hunt (5-finder → 3-vote verify) — fixed + deferred
 The post-M0 hunt (9 confirmed, 6 rejected; never-panic + UTF-8 safety signed off) fixed:
