@@ -1359,6 +1359,12 @@ fn format_chain_bottom_up(
         S::CallExpr => {
             let nodes = child_nodes(node);
             let callee = nodes.first()?;
+            // gdformat's `_format_dot_chain_to_multiple_lines_bottom_up` falls back to leading-dot when
+            // the lambda lives in an *earlier* chain segment (the callee) rather than the final call's
+            // own arguments — bottom-up keeps the prefix flat, which a lambda there cannot.
+            if node_contains_lambda(callee) {
+                return None;
+            }
             let arglist = find_child(node, S::ArgList)?;
             let callee_str = expr_to_str(w, callee)?;
             let elems = list_elements(&arglist);
@@ -1377,6 +1383,9 @@ fn format_chain_bottom_up(
             let nodes = child_nodes(node);
             let obj = nodes.first()?;
             let idx = nodes.get(1)?;
+            if node_contains_lambda(obj) {
+                return None;
+            }
             let obj_str = expr_to_str(w, obj)?;
             format_expression(
                 w,

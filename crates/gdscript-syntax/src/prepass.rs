@@ -158,8 +158,7 @@ impl PrePass<'_> {
         // Close any lambda bodies this line has dedented back out of.
         self.close_lambdas(col, at);
 
-        let in_lambda = !self.lambda_stack.is_empty();
-        let suppressed = !in_lambda && self.bracket_depth > 0;
+        let suppressed = self.indentation_suppressed();
         // Whether this physical line, when it ends with `:` inside brackets, is a *lambda header*
         // (`… func(params) [-> Type]:`) rather than a dict entry whose value sits on the next line
         // (`"key":\n value`). Both end with `:` inside brackets, but only the lambda opens a body
@@ -179,12 +178,12 @@ impl PrePass<'_> {
             if tok.kind == SyntaxKind::NewlinePhys {
                 has_terminator = true;
                 let opens_lambda = self.bracket_depth > 0 && is_lambda_header;
-                // Use the *current* lambda state, not the line-start `in_lambda`: a lambda body that
-                // closed mid-line (`func(): … return X,` / `… last())`) is no longer significant, so
-                // its trailing physical newline must stay suppressed inside the enclosing bracket —
-                // otherwise a stray `Newline` lands between the call's argument `,` and the next arg.
-                let in_lambda_now = !self.lambda_stack.is_empty();
-                if self.bracket_depth == 0 || in_lambda_now || opens_lambda {
+                // Emit a logical `Newline` at a significant statement boundary — re-evaluating
+                // suppression with the *current* bracket/lambda state (not the line-start value): a
+                // lambda body that closed mid-line (`func(): … return X,`) is no longer significant,
+                // and a line that sits inside a bracket nested *within* the lambda body
+                // (`return new(\n …\n)`) stays suppressed too.
+                if !self.indentation_suppressed() || opens_lambda {
                     self.push_marker(SyntaxKind::Newline, tok.range.start());
                 }
                 self.out.push(*tok);
@@ -220,7 +219,7 @@ impl PrePass<'_> {
             }
         }
         // A final line with content but no trailing newline still terminates a statement.
-        if !has_terminator && (self.bracket_depth == 0 || in_lambda) {
+        if !has_terminator && !self.indentation_suppressed() {
             self.push_marker(SyntaxKind::Newline, src_end(self.src));
         }
 
@@ -233,6 +232,16 @@ impl PrePass<'_> {
                 base: col,
                 open_bracket_depth: self.bracket_depth,
             });
+        }
+    }
+
+    /// Whether indentation / logical newlines are currently *not* significant. Outside all lambdas
+    /// that is any open bracket; inside a lambda body it is only a bracket nested *deeper* than the
+    /// lambda's own level (the body itself, at the lambda's bracket depth, stays significant).
+    fn indentation_suppressed(&self) -> bool {
+        match self.lambda_stack.last() {
+            Some(ctx) => self.bracket_depth > ctx.open_bracket_depth,
+            None => self.bracket_depth > 0,
         }
     }
 

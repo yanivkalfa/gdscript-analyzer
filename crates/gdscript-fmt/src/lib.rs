@@ -3447,6 +3447,43 @@ mod tests {
     }
 
     #[test]
+    fn nested_multiline_bracket_inside_lambda_body_parses_and_wraps() {
+        // A lambda body that contains a call which itself wraps (`return new(\n …\n)`) must keep the
+        // nested bracket's lines indentation-suppressed (they sit a level *deeper* than the lambda
+        // body), then re-lay-out to gdformat's exact shape.
+        let src = "func f():\n\tvar v = use_memo(func():\n\t\tif a == null:\n\t\t\treturn make.parse(\"/\")\n\t\treturn make.build(strip_basename(location.path, basename), location.query, location.state)\n\t, [a, base])\n";
+        let out = fmt(src);
+        assert!(parses_clean(&out), "{out:?}");
+        assert!(
+            out.contains("\tvar v = use_memo(\n\t\tfunc():"),
+            "lambda explodes: {out:?}"
+        );
+        assert!(
+            out.contains("\t\t\treturn make.build(\n"),
+            "nested call wraps: {out:?}"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn dot_chain_with_lambda_in_earlier_segment_uses_leading_dot() {
+        // gdformat bottom-ups a chain whose lambda is in the *final* call's args, but falls back to
+        // leading-dot when the lambda sits in an earlier segment (`a.m(func…).n(…)`).
+        let src = "func f():\n\tvar t := obj.tween_method(func(x: float) -> void: node.position = origin + curve.sample(x), 0.0, 100.0).set_delay(5.0)\n";
+        let out = fmt(src);
+        assert!(
+            out.contains("\tvar t := (\n"),
+            "leading-dot paren wrap: {out:?}"
+        );
+        assert!(
+            out.contains("\n\t\t. set_delay("),
+            "explodes at each dot: {out:?}"
+        );
+        assert!(parses_clean(&out), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn lambda_body_ending_in_arg_separator_comma_parses_and_is_preserved() {
         // gdformat emits `func(): … return X,` where the `,` closes the lambda body mid-line and
         // separates the enclosing call's arguments. The prepass must suppress the lambda body's now
