@@ -16,6 +16,7 @@
 
 use gdscript_base::{FileId, FilePosition, TextRange};
 use gdscript_db::{Db, FileText, parse};
+use gdscript_scene::NodeIdx;
 use gdscript_syntax::{GdNode, GdToken, SyntaxKind, ast};
 use smol_str::SmolStr;
 
@@ -120,6 +121,10 @@ pub fn classify(db: &dyn Db, pos: FilePosition) -> Option<GodotDef> {
     // The cursor inside a `$Path`/`%Unique` expression identifies the scene node at the segment under
     // it (a mid-path segment resolves the path *up to* there) — so a node can be renamed from a script.
     if let Some(def) = classify_node_path_at(db, ft, pos.file, &tok, pos.offset) {
+        return Some(def);
+    }
+    // The same, for the call form `get_node("Panel/Btn")` (a `CallExpr`, not a `GetNodeExpr`).
+    if let Some(def) = classify_get_node_call_at(db, ft, &tok, pos.offset) {
         return Some(def);
     }
     let parent = tok.parent();
@@ -544,6 +549,40 @@ fn classify_node_path_at(
     })
 }
 
+/// Classify the cursor on the literal string of a `get_node("Panel/Btn")` / `get_node_or_null(…)`
+/// call (lowered to `Expr::GetNode`, but a `CallExpr` at the CST level so `classify_node_path_at`
+/// does not catch it). Resolves the path up to the cursor segment from the script's attach node.
+fn classify_get_node_call_at(
+    db: &dyn Db,
+    ft: FileText,
+    tok: &GdToken,
+    offset: u32,
+) -> Option<GodotDef> {
+    if tok.kind() != SyntaxKind::String {
+        return None;
+    }
+    let fi = crate::queries::analyze_file(db, ft);
+    let unit = fi.unit_at(offset)?;
+    let eid = unit.body.source_map.expr_at_offset(offset)?;
+    let crate::body::Expr::GetNode { path: Some(_), .. } = unit.body.expr(eid) else {
+        return None; // not a node-path call (or a computed `get_node(var)`)
+    };
+    let range = cst::token_range(tok);
+    let content = tok.text().trim_matches(['"', '\'']);
+    let truncated = segment_up_to(content, range.start + 1, offset)?;
+    let ctx = crate::queries::scene_context(db, ft)?;
+    if ctx.ambiguous {
+        return None;
+    }
+    // The literal may carry a `%Name` head; `resolve_path_from` strips the `%` per segment.
+    Some(GodotDef::SceneNode {
+        scene: ctx.scene,
+        path: ctx
+            .model
+            .node_full_path(ctx.model.resolve_path_from(ctx.attach, &truncated)?)?,
+    })
+}
+
 /// The innermost `GetNodeExpr`/`UniqueNodeExpr` ancestor of `tok`, if any.
 fn node_path_ancestor(tok: &GdToken) -> Option<GdNode> {
     let mut cur = Some(tok.parent().clone());
@@ -571,15 +610,7 @@ fn node_path_up_to_cursor(np: &GdNode, offset: u32) -> Option<String> {
     {
         let range = cst::token_range(str_tok);
         let content = str_tok.text().trim_matches(['"', '\'']);
-        let content_start = range.start + 1; // past the opening quote
-        let rel = offset.checked_sub(content_start)? as usize;
-        if rel > content.len() {
-            return None;
-        }
-        let end = content[rel.min(content.len())..]
-            .find('/')
-            .map_or(content.len(), |i| rel + i);
-        return Some(content[..end].to_owned());
+        return segment_up_to(content, range.start + 1, offset); // +1 past the opening quote
     }
     // Token form: the segment `Ident`s (range, text) in order; keep through the one at the cursor.
     let idents: Vec<(TextRange, String)> = np
@@ -604,17 +635,61 @@ fn node_path_up_to_cursor(np: &GdNode, offset: u32) -> Option<String> {
 
 /// Classify a position in a `.tscn`: the node whose `name="…"` value contains the cursor →
 /// [`GodotDef::SceneNode`]. `None` if the cursor is not on a node name.
+/// The path `content` (located at byte `content_start`) truncated to (and including) the segment
+/// containing `offset`. Used for every `/`-segmented path value (a `$"…"` string, a `parent=`, a
+/// `[connection] from`/`to`). `None` if the cursor is outside the content.
+fn segment_up_to(content: &str, content_start: u32, offset: u32) -> Option<String> {
+    let rel = offset.checked_sub(content_start)? as usize;
+    if rel > content.len() {
+        return None;
+    }
+    let end = content[rel.min(content.len())..]
+        .find('/')
+        .map_or(content.len(), |i| rel + i);
+    Some(content[..end].to_owned())
+}
+
+/// Whether `offset` is inside `[span.start, span.end)`.
+fn in_span(offset: u32, span: TextRange) -> bool {
+    offset >= span.start && offset < span.end
+}
+
+/// Classify a position in a `.tscn`: the scene node the cursor identifies — its own `name="…"`, a
+/// `parent="…"` path segment, or a `[connection] from`/`to` path segment (all resolved to a
+/// [`GodotDef::SceneNode`] by full path). These are the dependent references a node rename rewrites.
 fn classify_scene_name(db: &dyn Db, ft: FileText, file: FileId, offset: u32) -> Option<GodotDef> {
     let model = crate::queries::scene_model(db, ft);
-    let idx = model
-        .nodes
-        .iter()
-        .position(|n| offset >= n.name_span.start && offset < n.name_span.end)?;
-    let node_idx = gdscript_scene::NodeIdx(u32::try_from(idx).ok()?);
-    Some(GodotDef::SceneNode {
-        scene: file,
-        path: model.node_full_path(node_idx)?,
-    })
+    let def = |idx: NodeIdx| {
+        Some(GodotDef::SceneNode {
+            scene: file,
+            path: model.node_full_path(idx)?,
+        })
+    };
+    // (1) The node's own `name="…"`.
+    for (i, n) in model.nodes.iter().enumerate() {
+        if in_span(offset, n.name_span) {
+            return def(NodeIdx(u32::try_from(i).ok()?));
+        }
+    }
+    // (2) A `parent="…"` path segment (root-relative; resolved from the root).
+    for n in &model.nodes {
+        if let (Some(span), Some(path)) = (n.parent_span, n.parent_path.as_deref())
+            && in_span(offset, span)
+        {
+            let trunc = segment_up_to(path, span.start, offset)?;
+            return def(model.resolve_path(&trunc)?);
+        }
+    }
+    // (3) A `[connection] from`/`to` path segment (root-relative).
+    for c in &model.connections {
+        for (span, path) in [(c.from_span, &c.from), (c.to_span, &c.to)] {
+            if in_span(offset, span) {
+                let trunc = segment_up_to(path, span.start, offset)?;
+                return def(model.resolve_path(&trunc)?);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

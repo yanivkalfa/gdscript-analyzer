@@ -503,6 +503,7 @@ impl<'a> Parser<'a> {
         let name_span = a.name.map_or(header_span, |sp| self.inner_span(sp));
         let decl_type = a.typ.and_then(|s| self.extract_string(s));
         let parent_path = a.parent.and_then(|s| self.extract_string(s));
+        let parent_span = a.parent.map(|sp| self.inner_span(sp));
         let instance = a.instance.and_then(|(s, e)| self.extract_ext_id(s, e));
         let instance_placeholder = a.instance_placeholder.is_some();
         let (script, unique_name_in_owner, properties) = self.consume_body(true);
@@ -510,6 +511,7 @@ impl<'a> Parser<'a> {
             name,
             decl_type,
             parent_path,
+            parent_span,
             parent_idx: None,
             script,
             instance,

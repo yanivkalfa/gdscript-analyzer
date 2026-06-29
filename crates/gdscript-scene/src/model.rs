@@ -83,6 +83,8 @@ pub struct SceneNode {
     pub decl_type: Option<SmolStr>,
     /// The raw `parent="…"` path (`"."` = child of root; relative, root-excluded). `None` ⇒ root.
     pub parent_path: Option<SmolStr>,
+    /// Byte span of the `parent=` value (quotes excluded), for scene-aware rename of a path segment.
+    pub parent_span: Option<TextRange>,
     /// The resolved parent (pass 2). `None` ⇒ root, or an unresolved/dangling parent.
     pub parent_idx: Option<NodeIdx>,
     /// Body `script = ExtResource("id")`.

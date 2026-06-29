@@ -1454,4 +1454,42 @@ script = ExtResource(\"1\")\n\
             "tscn decl: {refs:?}"
         );
     }
+
+    const CASCADE_GD: &str =
+        "extends Control\nfunc _ready():\n\tvar p = $Panel\n\tvar b = get_node(\"Panel/Btn\")\n";
+    const CASCADE_TSCN: &str = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://c.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Panel\" type=\"Control\" parent=\".\"]\n\
+[node name=\"Btn\" type=\"Control\" parent=\"Panel\"]\n\
+[connection signal=\"pressed\" from=\"Panel\" to=\".\" method=\"_on\"]\n";
+
+    #[test]
+    fn find_refs_on_a_node_covers_the_full_cascade() {
+        let db = db_paths(&[
+            (0, "res://c.gd", CASCADE_GD),
+            (1, "res://c.tscn", CASCADE_TSCN),
+        ]);
+        // Renaming `Panel` must touch: its `name=`, the child's `parent="Panel"`, the connection
+        // `from="Panel"` (all .tscn), plus `$Panel` and the `get_node("Panel/Btn")` segment (.gd).
+        let refs = find_references(&db, pos(1, "Panel", 0, CASCADE_TSCN)); // from the scene name=
+        let in_gd = refs.iter().filter(|r| r.file == FileId(0)).count();
+        let in_tscn = refs.iter().filter(|r| r.file == FileId(1)).count();
+        assert_eq!(in_gd, 2, "$Panel + get_node segment: {refs:?}");
+        assert_eq!(in_tscn, 3, "name= + parent= + connection from=: {refs:?}");
+        // every reference covers exactly the text `Panel`.
+        for r in &refs {
+            let src = if r.file == FileId(0) {
+                CASCADE_GD
+            } else {
+                CASCADE_TSCN
+            };
+            assert_eq!(
+                &src[r.range.start as usize..r.range.end as usize],
+                "Panel",
+                "{r:?}"
+            );
+        }
+    }
 }
