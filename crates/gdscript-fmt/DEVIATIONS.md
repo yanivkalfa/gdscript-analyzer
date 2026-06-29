@@ -15,26 +15,43 @@ records where we match, where we deliberately differ, and what is not yet implem
 - **fixpoint** — `format(gdformat(original))` equals `gdformat(original)`: do we *preserve*
   gdformat's own output? This isolates our remaining gaps from the wrapping we don't yet do.
 
-As of Phase 4C (blank-line insertion + boundary-comment indentation + EOL preservation +
-length-driven reflow), EOL-normalised:
+As of the CST-driven wrapping port (a faithful port of gdformat 4.5's `expression.py`; see
+`src/wrap.rs`) plus the full normalization set (inline-suite expansion, blank-line + comment rules,
+node-path / triple-quote / BOM, dict-entry & magic-comma chains), EOL-normalised:
 
-- exact match: **~51%** over `godot-demo-projects` (455 files; up from ~14% before 4C), **~33%** over
-  the denser `ReactiveUI-Gadot` library code (up from ~2%)
-- fixpoint `format(gold)==gold`: **426 / 455** token-compatible godot files (was 70)
+- **exact match**: **~91%** over `godot-demo-projects` (456 files; up from ~14% at the start of
+  Phase 4), **~60%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
+- **fixpoint** `format(gold)==gold`: **~99%** (godot) / **~98%** (ReactiveUI)
 
-Corpus safety (all 544 clean files, `safe_mode` OFF): **0** non-parsing outputs, **0**
+Corpus safety (all 545 clean files, `safe_mode` OFF): **0** non-parsing outputs, **0**
 token-sequence changes, **0** idempotence breaks. The safety net is never the thing that makes us
 correct on this corpus — the passes are correct on their own.
+
+The remaining exact-match gap is almost entirely **deep wrap-choice nuances**: on a heavily-nested
+expression (3–5 levels of mixed call / operator / collection), gdformat's wrapper sometimes injects a
+redundant grouping paren or picks a different (but valid, ≤ width, meaning-preserving) split point
+than our simpler recursion. These show up as a single differing sub-wrap deep inside an otherwise
+byte-identical statement, and `format(gold)==gold` stays ~98–99% (we *preserve* gdformat's choice
+even where we wouldn't make it on raw input).
 
 ## What we match
 
 - Block **indentation** (to the configured unit; tabs by default).
 - **Intra-line spacing** (increment A): one space around binary operators / assignments / `->`
   / `:=`, after `,` and dict/type-annotation `:`, hugged brackets, tight member access, tight unary.
-- **Blank-line collapse** (increment B): ≤2 at top level, ≤1 nested; leading blanks stripped.
-- **Blank-line insertion** (increment C): 2 blank lines around top-level `func`/`class`/`static func`,
-  1 around nested ones; comment/annotation prefixes move with their def; no blank before the first
-  member of a block.
+- **Blank-line collapse**: every run of blank lines is squeezed to **one** (gdformat's
+  `_squeeze_lines`); the second / first blank is then re-added only around definitions.
+- **Blank-line insertion**: 2 blank lines around top-level `func`/`class`/`static func`, 1 around
+  nested ones; comment/annotation prefixes move with their def; no blank before the first member of a
+  block; an **annotation-prefixed** def is forced apart only from a *preceding* def; a *trailing*
+  comment (a closing `#endregion`) keeps its source blanks.
+- **Inline-suite expansion**: a compound statement's inline body (`if c: x`, `func f(): return`,
+  `else: c()`), an inline `match` arm body, a property getter/setter body / shorthand, and
+  `;`-separated statements are each moved to their own indented line — while an inline **lambda** body
+  (`func(): x`) is preserved (parse-tree-driven; see `expand_inline_blocks`).
+- **Node paths** (`$%Unique`, `$A/%Unique`) stay tight, **triple-single-quoted single-line strings**
+  collapse to regular (`'''x'''` → `"x"`), a leading **BOM** is preserved, and a soft-keyword member
+  call (`obj.match(x)`) hugs its `(`.
 - **Block-boundary comment indentation** (increment C): a comment is placed at its intended depth
   (authored indentation clamped to the surrounding structure), matching gdformat — a column-0 comment
   stays at column 0, an over-indented one snaps to the block.
