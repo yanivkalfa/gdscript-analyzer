@@ -185,6 +185,59 @@ fn scene_connection_refs(db: &dyn Db, file: FileId, name: &str, is_signal: bool)
     out
 }
 
+/// Whether any node in `scene` carries a script whose attachment is **ambiguous** (the script is
+/// attached to more than one scene). For such a script `classify` cannot say *which* scene a `$Path`
+/// targets, so it resolves none — meaning a node rename would silently miss those references. The
+/// rename must refuse.
+fn scene_has_ambiguous_script(db: &dyn Db, scene: FileId) -> bool {
+    let (Some(ft), Some(root)) = (db.file_text(scene), db.source_root()) else {
+        return false;
+    };
+    let model = queries::scene_model(db, ft);
+    let index = queries::script_scene_index(db, root);
+    model.nodes.iter().any(|n| {
+        n.script
+            .as_ref()
+            .and_then(|id| model.ext_resources.get(id))
+            .and_then(|e| e.path.as_deref())
+            .and_then(|p| index.get(p))
+            .is_some_and(|attach| attach.ambiguous)
+    })
+}
+
+/// Whether a `.gd` quotes `name` as a string literal at a position **not** already a found reference
+/// — a possible dynamic `get_node(var)` / `Callable` target a node rename cannot rewrite, so it must
+/// refuse. The handled `get_node("Name")` literal *is* a found reference, so it does not trigger this.
+fn gd_has_uncovered_name_string(db: &dyn Db, name: &str, refs: &[Reference]) -> bool {
+    let Some(root) = db.source_root() else {
+        return false;
+    };
+    let needles = [format!("\"{name}\""), format!("'{name}'")];
+    root.files(db).iter().any(|&ft| {
+        if ft
+            .res_path(db)
+            .as_deref()
+            .is_some_and(queries::is_scene_path)
+        {
+            return false; // scenes are handled by classification, not the string scan
+        }
+        let file = ft.file_id(db);
+        let text = ft.text(db);
+        // The inner-name byte offsets already covered by a found reference in this file.
+        let covered: Vec<u32> = refs
+            .iter()
+            .filter(|r| r.file == file)
+            .map(|r| r.range.start)
+            .collect();
+        needles.iter().any(|needle| {
+            text.match_indices(needle.as_str()).any(|(quote, _)| {
+                // the inner name starts one byte past the opening quote
+                u32::try_from(quote + 1).is_ok_and(|inner| !covered.contains(&inner))
+            })
+        })
+    })
+}
+
 /// Whether any same-named `[connection]` cannot be proven *not* to reference this member
 /// (`Attr::Unknown`) — a rename must then refuse (correct-or-refuse: never a silent incomplete edit).
 fn scene_connection_is_ambiguous(db: &dyn Db, file: FileId, name: &str, is_signal: bool) -> bool {
@@ -285,6 +338,18 @@ pub fn rename(db: &dyn Db, pos: FilePosition, new_name: &str) -> Result<SourceCh
             reason: "no references found".to_owned(),
         });
     }
+    // A scene node's name appearing as a `.gd` string we did NOT resolve to a reference may be a
+    // dynamic `get_node(var)` / `Callable` target we can't rewrite — refuse rather than partial-edit.
+    if let GodotDef::SceneNode { path, .. } = &def {
+        let node_name = path.rsplit('/').next().unwrap_or(path);
+        if gd_has_uncovered_name_string(db, node_name, &refs) {
+            return Err(RenameError::CrossesUnsupportedBoundary {
+                what: format!(
+                    "`{node_name}` appears as a string the analyzer can't attribute (possibly a dynamic get_node / Callable) — rename refuses"
+                ),
+            });
+        }
+    }
     // Group edits per file, deterministically.
     let mut by_file: Vec<(FileId, Vec<TextEdit>)> = Vec::new();
     for r in refs {
@@ -320,14 +385,20 @@ fn refuse_if_crosses_boundary(db: &dyn Db, def: &GodotDef) -> Result<(), RenameE
         GodotDef::Autoload { .. } => Err(RenameError::CrossesUnsupportedBoundary {
             what: "autoload name is declared in project.godot (not rewritten by rename)".to_owned(),
         }),
-        // A scene-node rename rewrites its `name=` plus every `$Path`/`parent=`/`[connection]`
-        // segment referencing it. That write path (and its correct-or-refuse guards) is wired in the
-        // next milestone; until then read-side classify / goto / find-refs are available but a rename
-        // refuses rather than risk a partial edit.
-        GodotDef::SceneNode { .. } => Err(RenameError::CrossesUnsupportedBoundary {
-            what: "renaming a scene node is not yet supported (read-side navigation only)"
-                .to_owned(),
-        }),
+        // A scene-node rename rewrites its `name=` plus every `$Path`/`parent=`/`[connection]`/
+        // `get_node` segment referencing it. The remaining unsoundness risk here is an **ambiguous**
+        // script (attached to multiple scenes): its node paths can't be resolved to *this* scene, so
+        // they would be silently missed — refuse. (The dynamic-`get_node(var)` risk is gated after
+        // find-references, in `rename`.)
+        GodotDef::SceneNode { scene, .. } => {
+            if scene_has_ambiguous_script(db, *scene) {
+                Err(RenameError::CrossesUnsupportedBoundary {
+                    what: "a script in this scene is attached to multiple scenes, so its node-path references can't be resolved unambiguously — rename refuses".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        }
         // A member refuses when it has a reference surface we cannot rewrite: a type-only inner
         // class / named enum, or a method/var/const/signal that may be named by a project string.
         GodotDef::Member { owner_file, name } => match member_symbol_kind(db, *owner_file, name) {
@@ -455,9 +526,23 @@ fn collision_check(db: &dyn Db, def: &GodotDef, new_name: &str) -> Result<(), Re
                 }
             }
         }
-        // Autoload/Engine have no rename collision surface here. A scene node's sibling-collision
-        // check is wired with its write path (the next milestone), where scene + parent are known.
-        GodotDef::Autoload { .. } | GodotDef::Engine { .. } | GodotDef::SceneNode { .. } => {}
+        GodotDef::Autoload { .. } | GodotDef::Engine { .. } => {}
+        // A sibling node with the new name collides (Godot forbids duplicate sibling names, and a
+        // `$Parent/New` path would otherwise become ambiguous).
+        GodotDef::SceneNode { scene, path } => {
+            if let Some(ft) = db.file_text(*scene) {
+                let model = queries::scene_model(db, ft);
+                if let Some(idx) = model.node_by_full_path(path) {
+                    let parent = model.node(idx).and_then(|n| n.parent_idx);
+                    if let Some((_, sib)) = model
+                        .children_of(parent)
+                        .find(|&(i, n)| i != idx && n.name == new_name)
+                    {
+                        return Err(collide(*scene, sib.name_span));
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1491,5 +1576,91 @@ script = ExtResource(\"1\")\n\
                 "{r:?}"
             );
         }
+    }
+
+    #[test]
+    fn rename_a_scene_node_rewrites_every_reference() {
+        let db = db_paths(&[
+            (0, "res://c.gd", CASCADE_GD),
+            (1, "res://c.tscn", CASCADE_TSCN),
+        ]);
+        // from the scene `name="Panel"`:
+        let change = rename(&db, pos(1, "Panel", 0, CASCADE_TSCN), "Sidebar").expect("rename ok");
+        let total: usize = change.edits.iter().map(|e| e.edits.len()).sum();
+        assert_eq!(
+            total, 5,
+            "name= + parent= + connection + $Panel + get_node: {:?}",
+            change.edits
+        );
+        for fe in &change.edits {
+            for e in &fe.edits {
+                assert_eq!(e.new_text, "Sidebar");
+            }
+        }
+    }
+
+    #[test]
+    fn rename_a_scene_node_from_a_script_path_works_too() {
+        let db = db_paths(&[
+            (0, "res://c.gd", CASCADE_GD),
+            (1, "res://c.tscn", CASCADE_TSCN),
+        ]);
+        // starting on the `$Panel` use in the script yields the same 5-edit change.
+        let change = rename(&db, pos(0, "Panel", 0, CASCADE_GD), "Sidebar").expect("rename ok");
+        let total: usize = change.edits.iter().map(|e| e.edits.len()).sum();
+        assert_eq!(total, 5, "{:?}", change.edits);
+    }
+
+    #[test]
+    fn rename_a_scene_node_to_a_sibling_name_collides() {
+        let tscn = "[gd_scene format=3]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+[node name=\"A\" type=\"Control\" parent=\".\"]\n\
+[node name=\"B\" type=\"Control\" parent=\".\"]\n";
+        let db = db_paths(&[(0, "res://s.tscn", tscn)]);
+        let err = rename(&db, pos(0, "A", 0, tscn), "B").unwrap_err();
+        assert!(matches!(err, RenameError::WouldCollide { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn rename_a_scene_node_refuses_on_an_unattributable_string() {
+        // A bare `"Panel"` string (not a node-path) could be a dynamic get_node(var) target — refuse.
+        let gd = "extends Control\nfunc _ready():\n\tvar p = $Panel\n\tvar s = \"Panel\"\n";
+        let tscn = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://d.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Panel\" type=\"Control\" parent=\".\"]\n";
+        let db = db_paths(&[(0, "res://d.gd", gd), (1, "res://d.tscn", tscn)]);
+        let err = rename(&db, pos(1, "Panel", 0, tscn), "Sidebar").unwrap_err();
+        assert!(
+            matches!(err, RenameError::CrossesUnsupportedBoundary { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rename_a_scene_node_refuses_on_an_ambiguous_multi_scene_script() {
+        let gd = "extends Control\nfunc _ready():\n\tpass\n";
+        let x = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://a.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Target\" type=\"Control\" parent=\".\"]\n";
+        let y = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://a.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n";
+        // a.gd attaches to BOTH x.tscn and y.tscn → ambiguous.
+        let db = db_paths(&[
+            (0, "res://a.gd", gd),
+            (1, "res://x.tscn", x),
+            (2, "res://y.tscn", y),
+        ]);
+        let err = rename(&db, pos(1, "Target", 0, x), "Renamed").unwrap_err();
+        assert!(
+            matches!(err, RenameError::CrossesUnsupportedBoundary { .. }),
+            "{err:?}"
+        );
     }
 }
