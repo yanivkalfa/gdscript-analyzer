@@ -692,8 +692,39 @@ fn explode(w: &W, node: &GdNode, indent: usize, prefix: &str, suffix: &str) -> O
                 &format!("){suffix}"),
             )
         }
+        S::DictEntry => format_dict_entry(w, node, indent, prefix, suffix),
         _ => None,
     }
+}
+
+/// gdformat's `_format_kv_pair_to_multiple_lines`: the key keeps its `:`/` =` on its own line(s);
+/// the value is formatted below it at the same indent (so a multi-line value's open bracket drops to
+/// the next line — `player =` / `{ … }`).
+/// Decompose a dict entry into `(key, value, is_colon)`. A lua-style `key = value` is parsed with the
+/// `=` absorbed into a single assignment `BinExpr` child (since `=` is an infix operator), so that is
+/// unwrapped here; a colon entry `key: value` has the key and value as separate children.
+fn dict_entry_kv(node: &GdNode) -> Option<(GdNode, GdNode, bool)> {
+    let nodes = child_nodes(node);
+    if nodes.len() == 1 && nodes[0].kind() == S::BinExpr && bin_op(&nodes[0]) == Some(S::Eq) {
+        let bn = child_nodes(&nodes[0]);
+        return Some((bn.first()?.clone(), bn.get(1)?.clone(), false));
+    }
+    let colon = sig(node).iter().any(|e| matches!(e, El::Tok(S::Colon, _)));
+    Some((nodes.first()?.clone(), nodes.get(1)?.clone(), colon))
+}
+
+fn format_dict_entry(
+    w: &W,
+    node: &GdNode,
+    indent: usize,
+    prefix: &str,
+    suffix: &str,
+) -> Option<Vec<String>> {
+    let (key, val, colon) = dict_entry_kv(node)?;
+    let key_suffix = if colon { ":" } else { " =" };
+    let mut out = format_expression(w, &key, indent, prefix, key_suffix)?;
+    out.extend(format_expression(w, &val, indent, "", suffix)?);
+    Some(out)
 }
 
 fn bin_op(node: &GdNode) -> Option<S> {
@@ -1176,8 +1207,11 @@ fn format_dot_chain(
     prefix: &str,
     suffix: &str,
 ) -> Option<Vec<String>> {
-    // Bottom-up: only when the chain ends in a call or subscript (something with args to wrap).
-    let bottom_up = if matches!(node.kind(), S::CallExpr | S::IndexExpr) {
+    // A chain forced multi-line by a magic comma inside it goes straight to leading-dot (gdformat's
+    // `is_expression_forcing_multiple_lines` short-circuit) — bottom-up is only for length-driven wraps.
+    // Otherwise try bottom-up: only when the chain ends in a call or subscript (args to wrap).
+    let bottom_up = if !forcing_multiline(node) && matches!(node.kind(), S::CallExpr | S::IndexExpr)
+    {
         format_chain_bottom_up(w, node, indent, prefix, suffix)
             .filter(|b| b.iter().all(|l| width(l) <= w.max))
     } else {
@@ -1486,14 +1520,13 @@ fn expr_to_str(w: &W, node: &GdNode) -> Option<String> {
             Some(format!("{{{}}}", elems.join(", ")))
         }
         S::DictEntry => {
-            let nodes = child_nodes(node);
-            let key = expr_to_str(w, nodes.first()?)?;
-            let val = expr_to_str(w, nodes.get(1)?)?;
-            let lua = sig(node).iter().any(|e| matches!(e, El::Tok(S::Eq, _)));
-            Some(if lua {
-                format!("{key} = {val}")
-            } else {
+            let (key, val, colon) = dict_entry_kv(node)?;
+            let key = expr_to_str(w, &key)?;
+            let val = expr_to_str(w, &val)?;
+            Some(if colon {
                 format!("{key}: {val}")
+            } else {
+                format!("{key} = {val}")
             })
         }
         S::Param => {

@@ -2764,6 +2764,31 @@ mod tests {
     }
 
     #[test]
+    fn wrap_dict_entry_drops_multiline_value_below_the_key() {
+        // gdformat's kv-pair rule: a multi-line dict-entry value drops to its own line(s) below the
+        // `key =`, and a magic trailing comma forces the whole nest exploded.
+        let src = "func f():\n\tvar d := {player = {position = a, health = b,}, enemies = [],}\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "func f():\n\tvar d := {\n\t\tplayer =\n\t\t{\n\t\t\tposition = a,\n\t\t\thealth = b,\n\t\t},\n\t\tenemies = [],\n\t}\n"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn wrap_magic_comma_chain_explodes_leading_dot() {
+        // A method chain forced multi-line by a magic comma inside it goes straight to leading-dot.
+        let src = "func f():\n\treturn obj.method({\"a\": 1, \"b\": 2,})\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "func f():\n\treturn (\n\t\tobj\n\t\t. method(\n\t\t\t{\n\t\t\t\t\"a\": 1,\n\t\t\t\t\"b\": 2,\n\t\t\t}\n\t\t)\n\t)\n"
+        );
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn column_zero_trailing_region_comment_stays_put_without_forced_blanks() {
         // gdformat keeps a column-0 `#endregion` at column 0 and forces no blank lines before a
         // *trailing* comment (one that ends its block).
