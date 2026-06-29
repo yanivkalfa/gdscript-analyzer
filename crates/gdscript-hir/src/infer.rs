@@ -2239,8 +2239,10 @@ impl Cx<'_> {
             Ty::Builtin(_) | Ty::Array(_) | Ty::Dict(..) | Ty::Callable | Ty::Signal(_) => {
                 self.builtin_member_ty(&recv_ty, name, name_range, as_method)
             }
-            // Enum value access (`MyEnum.VALUE`) is an `int`.
-            Ty::Enum(_) => self.int_ty(),
+            // Accessing a member of an enum namespace (`State.IDLE`) yields the enum type itself —
+            // an enum value (freely int-assignable via `ty::is_assignable`). Was `int`, which lost
+            // the enum type and false-`INFERENCE_ON_VARIANT`'d a same-file `var x := State.IDLE`.
+            Ty::Enum(er) => Ty::Enum(er.clone()),
             // A cross-file script reference: resolve the member against its (own) member table.
             Ty::ScriptRef(sref) => self.script_member_ty(*sref, name, as_method),
             _ => Ty::Variant,
@@ -2732,7 +2734,17 @@ impl Cx<'_> {
                 }
                 Some(Member::Signal(_)) => Ty::Signal(None),
                 Some(Member::Class(_)) => Ty::Unknown,
-                Some(Member::Enum(_)) | None => Ty::Variant,
+                // A same-file named `enum State` used as a value/namespace → the enum type, so
+                // `State.IDLE` (member access below) types as `State`, not a false-`INFERENCE_ON_
+                // VARIANT` seam. An anonymous enum has no namespace name (its variants are direct
+                // class constants), so it stays the seam.
+                Some(Member::Enum(e)) => e.name.as_ref().map_or(Ty::Variant, |n| {
+                    Ty::Enum(EnumRef {
+                        qualified: n.clone(),
+                        bitfield: false,
+                    })
+                }),
+                None => Ty::Variant,
             },
         }
     }
@@ -3003,6 +3015,20 @@ mod tests {
     fn vector2i_to_vector2_is_allowed() {
         let h = infer_first_func("func f():\n\tvar v: Vector2 = Vector2i(1, 2)\n");
         assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn local_enum_member_access_types_as_the_enum_not_variant() {
+        // `var x := State.IDLE` (a same-file enum) infers the enum type, not a Variant seam — so no
+        // false INFERENCE_ON_VARIANT.
+        let h = infer_first_func(
+            "enum State { IDLE, RUN }\nfunc f():\n\tvar x := State.IDLE\n\treturn x\n",
+        );
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            codes(&h)
+        );
     }
 
     #[test]

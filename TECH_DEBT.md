@@ -345,7 +345,11 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
         dict key is now parsed **above assignment precedence**, so it's a dict entry.
       Result: **55 → 1** — and that 1 (a deep `XRPose.transform` misinference) plus the 3 `os_test.gd`
       `-> void`-returns-a-value cases are **genuine** (Godot flags them too). No-false-`TYPE_MISMATCH`
-      baseline effectively locked; the per-project corpus gate guards it.
+      baseline effectively locked; the per-project corpus gate guards it. The same corpus pass also
+      exposed **`INFERENCE_ON_VARIANT` false positives on same-file enums** (`var x := State.IDLE`
+      typed `Variant`): a named local `enum` now resolves to its enum type (`own_member_ty` +
+      `infer_field`), dropping `INFERENCE_ON_VARIANT` **33 → 11** (the rest are genuine untyped-operand
+      vector math). The former Vector2↔Vector2i `TYPE_MISMATCH` are now correctly `NARROWING_CONVERSION`.
 
 ### FFI ergonomics
 - [x] **Bindings return native JS values, not JSON strings — DONE (Phase 3, `feat/w1-warnings`).**
