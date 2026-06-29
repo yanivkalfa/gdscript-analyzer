@@ -235,15 +235,16 @@ fn expand_inline_blocks(source: &str, config: &FmtConfig) -> Option<String> {
         return None;
     }
     let unit = config.indent_unit();
-    let mut splits: Vec<(usize, String)> = Vec::new();
+    // Each split is `(start, replace_len, text)`: `replace_len` bytes at `start` become `text`.
+    let mut splits: Vec<(usize, usize, String)> = Vec::new();
     collect_inline_splits(&parse.syntax_node(), source, 0, &unit, &mut splits);
     if splits.is_empty() {
         return None;
     }
-    splits.sort_by_key(|(off, _)| std::cmp::Reverse(*off)); // apply right-to-left so offsets stay valid
+    splits.sort_by_key(|(off, ..)| std::cmp::Reverse(*off)); // apply right-to-left so offsets stay valid
     let mut out = source.to_owned();
-    for (off, text) in &splits {
-        out.insert_str(*off, text);
+    for (off, len, text) in &splits {
+        out.replace_range(*off..*off + *len, text);
     }
     // The rewrite only adds layout (newlines/indent), so it must keep every significant token and the
     // structure intact — verified by a token-equality + parse-validity check.
@@ -260,10 +261,32 @@ fn collect_inline_splits(
     src: &str,
     depth: usize,
     unit: &str,
-    splits: &mut Vec<(usize, String)>,
+    splits: &mut Vec<(usize, usize, String)>,
 ) {
     use SyntaxKind as S;
-    for child in node.children() {
+    use cstree::util::NodeOrToken;
+    for elem in node.children_with_tokens() {
+        let child = match elem {
+            NodeOrToken::Node(n) => n,
+            NodeOrToken::Token(t) => {
+                // A statement-level `;` separates two statements — replace it (and any following
+                // spaces) with a newline + this block's indent so each lands on its own line; a
+                // *trailing* `;` (nothing after it on the line) is dropped.
+                if t.kind() == S::Semicolon {
+                    let r = t.text_range();
+                    let (s, e) = (usize::from(r.start()), usize::from(r.end()));
+                    let trail = src[e..].len() - src[e..].trim_start_matches([' ', '\t']).len();
+                    let rest = &src[e + trail..];
+                    let text = if rest.starts_with('\n') || rest.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{}", unit.repeat(depth))
+                    };
+                    splits.push((s, e + trail - s, text));
+                }
+                continue;
+            }
+        };
         // A suite-introducing child: a statement/declaration `Block` (but never a `LambdaExpr`'s,
         // which stays inline) or a property body (`var x: T: set = f`). Its body splits onto its own
         // indented line when it shares the header's line.
@@ -280,7 +303,7 @@ fn collect_inline_splits(
             let inline_body =
                 body_offset.filter(|&bs| src[..bs].trim_end_matches([' ', '\t']).ends_with(':'));
             if let Some(bs) = inline_body {
-                splits.push((bs, format!("\n{}", unit.repeat(depth + 1))));
+                splits.push((bs, 0, format!("\n{}", unit.repeat(depth + 1))));
             }
         }
         // A child is one indent level deeper when it is a suite, or a `match` arm (arms sit a level
@@ -2029,7 +2052,9 @@ fn same_significant_tokens(a: &str, b: &str) -> bool {
     fn sig(s: &str) -> Vec<(SyntaxKind, &str)> {
         gdscript_syntax::tokenize(s)
             .into_iter()
-            .filter(|t| !t.kind.is_trivia())
+            // A `;` is a statement separator equivalent to a newline — ignore it, so splitting
+            // `a; b` onto two lines is recognised as token-preserving.
+            .filter(|t| !t.kind.is_trivia() && t.kind != SyntaxKind::Semicolon)
             .map(|t| (t.kind, &s[t.range]))
             .collect()
     }
@@ -2146,7 +2171,9 @@ fn emit_tree_events(node: &gdscript_syntax::GdNode, out: &mut Vec<TreeEvent>) {
             NodeOrToken::Node(n) => emit_tree_events(n, out),
             NodeOrToken::Token(t) => {
                 let kind = t.kind();
-                if kind.is_trivia() {
+                // A `;` is a statement separator (equivalent to a newline) — dropping it lets the
+                // formatter split `a; b` onto two lines without the net seeing a meaning change.
+                if kind.is_trivia() || kind == SyntaxKind::Semicolon {
                     continue;
                 }
                 let text = if matches!(
@@ -2941,6 +2968,20 @@ mod tests {
         assert_eq!(
             fmt("func h():\n\tvar a := func(): return 1\n"),
             "func h():\n\tvar a := func(): return 1\n"
+        );
+    }
+
+    #[test]
+    fn semicolon_separated_statements_split() {
+        // gdformat splits `;`-separated statements onto their own lines and drops a trailing `;`.
+        assert_eq!(
+            fmt("func f():\n\ta = 1; b = 2\n"),
+            "func f():\n\ta = 1\n\tb = 2\n"
+        );
+        assert_eq!(fmt("func g():\n\tpass;\n"), "func g():\n\tpass\n");
+        assert_eq!(
+            fmt("func h():\n\tif c: a(); b()\n"),
+            "func h():\n\tif c:\n\t\ta()\n\t\tb()\n"
         );
     }
 
