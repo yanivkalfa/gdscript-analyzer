@@ -240,7 +240,7 @@ fn expand_inline_blocks(source: &str, config: &FmtConfig) -> Option<String> {
     if splits.is_empty() {
         return None;
     }
-    splits.sort_by(|a, b| b.0.cmp(&a.0)); // apply right-to-left so offsets stay valid
+    splits.sort_by_key(|(off, _)| std::cmp::Reverse(*off)); // apply right-to-left so offsets stay valid
     let mut out = source.to_owned();
     for (off, text) in &splits {
         out.insert_str(*off, text);
@@ -264,17 +264,18 @@ fn collect_inline_splits(
 ) {
     for child in node.children() {
         if child.kind() == SyntaxKind::Block {
-            // A lambda body stays inline; a real statement/declaration body splits when inline.
-            if node.kind() != SyntaxKind::LambdaExpr {
-                if let Some(bs) = first_sig_offset(&child) {
-                    if src[..bs].trim_end_matches([' ', '\t']).ends_with(':') {
-                        splits.push((bs, format!("\n{}", unit.repeat(depth + 1))));
-                    }
-                }
+            // A lambda body stays inline; a real statement/declaration body splits when inline (its
+            // first token's preceding non-space char on the same line is the header's `:`).
+            let inline_body = (node.kind() != SyntaxKind::LambdaExpr)
+                .then(|| first_sig_offset(child))
+                .flatten()
+                .filter(|&bs| src[..bs].trim_end_matches([' ', '\t']).ends_with(':'));
+            if let Some(bs) = inline_body {
+                splits.push((bs, format!("\n{}", unit.repeat(depth + 1))));
             }
-            collect_inline_splits(&child, src, depth + 1, unit, splits);
+            collect_inline_splits(child, src, depth + 1, unit, splits);
         } else {
-            collect_inline_splits(&child, src, depth, unit, splits);
+            collect_inline_splits(child, src, depth, unit, splits);
         }
     }
 }
