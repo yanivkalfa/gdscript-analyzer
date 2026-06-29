@@ -584,16 +584,12 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                         prev_code_indent_len = comment_len;
                         depth
                     };
-                    // Flush the buffered blank lines, capped to this line's context: 2 at top level,
-                    // 1 inside a block, and 0 before the first content (leading blanks gone).
+                    // Flush the buffered blank lines. gdformat squeezes *every* run of blank lines to a
+                    // single blank, then re-inserts the 2nd (top-level) / 1st (nested) blank only around
+                    // definitions (done later by `insert_def_blanks`). So the cap here is 1 everywhere,
+                    // and 0 before the first content (leading blanks gone).
                     if collapse_on {
-                        let cap = if !seen_content {
-                            0
-                        } else if emit_depth == 0 {
-                            2
-                        } else {
-                            1
-                        };
+                        let cap = usize::from(seen_content);
                         for _ in 0..pending_blanks.min(cap) {
                             out.push('\n');
                         }
@@ -2827,6 +2823,25 @@ mod tests {
         assert_eq!(fmt(src), src);
         let src2 = "#region Section\nvar a = 1\nvar b = 2\n#endregion\n";
         assert_eq!(fmt(src2), src2);
+    }
+
+    #[test]
+    fn blank_runs_collapse_to_one_then_defs_restore_two() {
+        // gdformat squeezes every blank run to one, then re-adds the 2nd blank only around defs.
+        // Between two non-defs, that means a single blank regardless of how many were authored.
+        assert_eq!(
+            fmt("var a = 1\n\n\nvar b = 2\n"),
+            "var a = 1\n\nvar b = 2\n"
+        );
+        assert_eq!(
+            fmt("extends Node\n\n\nvar b = 2\n"),
+            "extends Node\n\nvar b = 2\n"
+        );
+        // Two top-level funcs still get two blanks (def-forced), no matter the authored count.
+        assert_eq!(
+            fmt("func a():\n\tpass\n\n\n\nfunc b():\n\tpass\n"),
+            "func a():\n\tpass\n\n\nfunc b():\n\tpass\n"
+        );
     }
 
     #[test]
