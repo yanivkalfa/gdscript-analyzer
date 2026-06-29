@@ -99,6 +99,19 @@ pub struct SceneNode {
     pub header_span: TextRange,
     /// Byte span of the `name="…"` value (finer go-to-definition / highlight).
     pub name_span: TextRange,
+    /// The node's body property keys (`key = value`; values skipped). Drives renaming an `@export`
+    /// variable set as a scene property (W8 A3); read-side typing ignores them.
+    pub properties: Vec<NodeProp>,
+}
+
+/// One body property line of a `[node …]` — `key = value` (value skipped). The key may be a bare
+/// identifier (an `@export` var or an engine property) or a `group/sub` override path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeProp {
+    /// The property key.
+    pub key: SmolStr,
+    /// Byte span of the key.
+    pub key_span: TextRange,
 }
 
 /// One `[connection …]` section — a signal wired to a method in the editor. The four spans are the

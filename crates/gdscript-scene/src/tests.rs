@@ -453,3 +453,26 @@ fn captures_connections_with_inner_identifier_spans() {
     assert_eq!(at(c.to_span), ".");
     assert_eq!(at(c.method_span), "_on_start_pressed");
 }
+
+#[test]
+fn captures_node_property_keys_with_spans() {
+    let src = "[gd_scene format=3]\n\
+[node name=\"Enemy\" type=\"Node2D\"]\n\
+speed = 5.0\n\
+position = Vector2(1, 2)\n\
+theme_override_colors/font_color = Color(1, 1, 1, 1)\n";
+    let m = parse_scene(src);
+    assert!(m.problems.is_empty(), "{:?}", m.problems);
+    let n = m.node(m.root.unwrap()).unwrap();
+    let keys: Vec<&str> = n.properties.iter().map(|p| p.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["speed", "position", "theme_override_colors/font_color"]
+    );
+    // the key span is the bare key (for `speed`, exactly `speed`).
+    let speed = n.properties.iter().find(|p| p.key == "speed").unwrap();
+    assert_eq!(
+        &src[speed.key_span.start as usize..speed.key_span.end as usize],
+        "speed"
+    );
+}

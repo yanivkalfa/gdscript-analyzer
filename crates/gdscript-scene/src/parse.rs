@@ -15,8 +15,8 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 use crate::model::{
-    ExtId, ExtResource, NodeIdx, SceneConnection, SceneKind, SceneModel, SceneNode, SceneProblem,
-    SubResource,
+    ExtId, ExtResource, NodeIdx, NodeProp, SceneConnection, SceneKind, SceneModel, SceneNode,
+    SceneProblem, SubResource,
 };
 
 /// Parse `.tscn`/`.tres` text into a [`SceneModel`]. Pure, never panics, never returns `Err`.
@@ -295,19 +295,22 @@ impl<'a> Parser<'a> {
     /// Read the body property lines of the current section until the next header / EOF. When
     /// `is_node`, capture `script =` and `unique_name_in_owner =`; otherwise skip every value
     /// losslessly. Returns `(script, unique_name_in_owner)`.
-    fn consume_body(&mut self, is_node: bool) -> (Option<ExtId>, bool) {
+    fn consume_body(&mut self, is_node: bool) -> (Option<ExtId>, bool, Vec<NodeProp>) {
         let mut script = None;
         let mut unique = false;
+        let mut props = Vec::new();
         loop {
             self.skip_trivia();
             match self.peek() {
                 None | Some(b'[') => break, // EOF or next section
                 Some(_) => {}
             }
+            let key_start = self.pos;
             let Some(key) = self.read_ident() else {
                 self.skip_to_eol(); // not a key line — skip it
                 continue;
             };
+            let key_span = TextRange::new(to_u32(key_start), to_u32(self.pos));
             self.skip_inline_ws();
             if self.peek() != Some(b'=') {
                 self.skip_to_eol();
@@ -323,10 +326,11 @@ impl<'a> Parser<'a> {
                     }
                     _ => {}
                 }
+                props.push(NodeProp { key, key_span });
             }
             self.skip_to_eol();
         }
-        (script, unique)
+        (script, unique, props)
     }
 
     // ---- value extraction (interpret a recorded span) ----
@@ -501,7 +505,7 @@ impl<'a> Parser<'a> {
         let parent_path = a.parent.and_then(|s| self.extract_string(s));
         let instance = a.instance.and_then(|(s, e)| self.extract_ext_id(s, e));
         let instance_placeholder = a.instance_placeholder.is_some();
-        let (script, unique_name_in_owner) = self.consume_body(true);
+        let (script, unique_name_in_owner, properties) = self.consume_body(true);
         self.model.nodes.push(SceneNode {
             name,
             decl_type,
@@ -514,6 +518,7 @@ impl<'a> Parser<'a> {
             unique_name_in_owner,
             header_span,
             name_span,
+            properties,
         });
     }
 
