@@ -82,6 +82,9 @@ struct W<'a> {
     cfg: &'a FmtConfig,
     unit: String,
     max: usize,
+    /// The exact text that was parsed to build the tree being formatted — lets comment tokens be
+    /// located by byte offset and source line so they can be re-emitted in the reshaped output.
+    src: String,
 }
 
 impl W<'_> {
@@ -121,15 +124,6 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
     if !cfg.reflow {
         return None;
     }
-    let w = W {
-        cfg,
-        unit: if cfg.use_tabs {
-            "\t".to_owned()
-        } else {
-            " ".repeat(cfg.indent_size.max(1))
-        },
-        max: cfg.line_width,
-    };
     // A class-level declaration (`var`/`const`/`func`/`signal`/`enum`/`@…`) parses at file scope; a
     // function-body statement (`return …`, `x = …`, a call, `if`/`for`/`while`/`match`) is invalid
     // there, so it is wrapped in a throwaway `func`. A genuine block header (ending in `:`) needs a
@@ -143,20 +137,32 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
         );
     // `body` is at indent 0 (single physical line, or a multi-line statement already dedented by the
     // caller). For a function-body statement we re-indent *every* line one level into the throwaway
-    // `func` (so a multi-line lambda body keeps its relative nesting and parses).
-    let parse = if class_level {
-        gdscript_syntax::parse(&if block_header {
+    // `func` (so a multi-line lambda body keeps its relative nesting and parses). The parsed text is
+    // kept in `w.src` so comment tokens can be located by byte offset / source line.
+    let parsed_src = if class_level {
+        if block_header {
             format!("{body}\n\tpass\n")
         } else {
             format!("{body}\n")
-        })
+        }
     } else {
         let indented = reindent_to(body, 1);
-        gdscript_syntax::parse(&if block_header {
+        if block_header {
             format!("func __():\n{indented}\n\t\tpass\n")
         } else {
             format!("func __():\n{indented}\n")
-        })
+        }
+    };
+    let parse = gdscript_syntax::parse(&parsed_src);
+    let w = W {
+        cfg,
+        unit: if cfg.use_tabs {
+            "\t".to_owned()
+        } else {
+            " ".repeat(cfg.indent_size.max(1))
+        },
+        max: cfg.line_width,
+        src: parsed_src,
     };
     let root = parse.syntax_node();
     let container = if class_level {
@@ -189,6 +195,12 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
     if lines.len() == 1 {
         return None;
     }
+    // A comment trailing the whole statement (`const X := {…}  # note`) sits on the rendered last line.
+    if let Some(c) = statement_trailing_comment(&container, &stmt, &w.src) {
+        let last = lines.last_mut()?;
+        last.push_str("  ");
+        last.push_str(&c);
+    }
     let out = lines.join("\n");
     // Self-validate: the output must be meaning-equivalent to the body. We re-parse both in the *same*
     // context (a bare function-body statement is invalid at file scope), neutralising indentation so
@@ -207,7 +219,37 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
     if !crate::meaning_preserved(&mine, &orig) {
         return None;
     }
+    // The reshape must carry *every* comment through unchanged — the meaning net treats comments as
+    // trivia, so this is the dedicated guard: if any comment was dropped or duplicated, fall back to
+    // the verbatim statement (which keeps all comments exactly where they were).
+    if comment_multiset(&out) != comment_multiset(body) {
+        return None;
+    }
     Some(out)
+}
+
+/// The sorted multiset of comment texts in `s` (trailing whitespace trimmed).
+fn comment_multiset(s: &str) -> Vec<String> {
+    let mut v: Vec<String> = gdscript_syntax::tokenize(s)
+        .into_iter()
+        .filter(|t| is_comment_kind(t.kind))
+        .map(|t| s[t.range].trim_end().to_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// A comment that trails `stmt` on the same source line, just past its code (a sibling token in
+/// `container`, after the statement's last significant token).
+fn statement_trailing_comment(container: &GdNode, stmt: &GdNode, src: &str) -> Option<String> {
+    let (_, ce) = code_span(stmt)?;
+    let end_line = line_of(src, ce.saturating_sub(1));
+    let mut comments = Vec::new();
+    comment_tokens(container, src, &mut comments);
+    comments
+        .into_iter()
+        .find(|&(off, line, _)| off >= ce && line == end_line)
+        .map(|(_, _, text)| text)
 }
 
 /// Strip the common leading-whitespace prefix from every non-blank line (preserves relative indent).
@@ -376,11 +418,132 @@ fn format_full_statement(w: &W, stmt: &GdNode, indent: usize) -> Option<Vec<Stri
     }
 }
 
-/// Format every statement of a block (a lambda / compound body) fully, in order.
+// ---- comments ------------------------------------------------------------------
+
+/// Whether `k` is a comment token (line / doc / `#region` marker) that must survive a reshape.
+fn is_comment_kind(k: S) -> bool {
+    matches!(
+        k,
+        S::LineComment | S::DocComment | S::RegionComment | S::EndRegionComment
+    )
+}
+
+/// 0-based source line of byte offset `off`.
+fn line_of(src: &str, off: usize) -> usize {
+    src[..off.min(src.len())].matches('\n').count()
+}
+
+/// Every comment token in `node`'s subtree, in source order: `(offset, line, text)` (text trimmed).
+fn comment_tokens(node: &GdNode, src: &str, out: &mut Vec<(usize, usize, String)>) {
+    for c in node.children_with_tokens() {
+        match c {
+            NodeOrToken::Node(n) => comment_tokens(n, src, out),
+            NodeOrToken::Token(t) if is_comment_kind(t.kind()) => {
+                let off = usize::from(t.text_range().start());
+                out.push((off, line_of(src, off), t.text().trim_end().to_owned()));
+            }
+            NodeOrToken::Token(_) => {}
+        }
+    }
+}
+
+/// The first..last significant (non-trivia, non-synthetic) byte offsets of `node` — its code span,
+/// excluding leading / trailing comment or whitespace trivia.
+fn code_span(node: &GdNode) -> Option<(usize, usize)> {
+    fn rec(node: &GdNode, first: &mut Option<usize>, last: &mut usize) {
+        for c in node.children_with_tokens() {
+            match c {
+                NodeOrToken::Node(n) => rec(n, first, last),
+                NodeOrToken::Token(t) => {
+                    if t.kind().is_trivia() || t.kind().is_synthetic_layout() {
+                        continue;
+                    }
+                    let r = t.text_range();
+                    if first.is_none() {
+                        *first = Some(usize::from(r.start()));
+                    }
+                    *last = usize::from(r.end());
+                }
+            }
+        }
+    }
+    let mut first = None;
+    let mut last = 0usize;
+    rec(node, &mut first, &mut last);
+    first.map(|f| (f, last))
+}
+
+/// The comments inside a block, partitioned for re-emission around its statements.
+struct BlockComments {
+    /// `before[i]` — standalone comment lines that precede statement `i` (each at the block indent).
+    before: Vec<Vec<String>>,
+    /// `trailing[i]` — an inline comment that trails statement `i` on the same source line.
+    trailing: Vec<Option<String>>,
+    /// Standalone comment lines after the last statement.
+    tail: Vec<String>,
+}
+
+/// Partition a block's comments into per-statement leading / trailing / tail buckets. A comment that
+/// falls *inside* a statement's own code span is left to that statement's recursive formatting (a
+/// compound body) or to the meaning net (an in-expression comment → verbatim fallback).
+fn collect_block_comments(block: &GdNode, src: &str, stmts: &[GdNode]) -> BlockComments {
+    let n = stmts.len();
+    let spans: Vec<Option<(usize, usize)>> = stmts.iter().map(code_span).collect();
+    let mut bc = BlockComments {
+        before: vec![Vec::new(); n],
+        trailing: vec![None; n],
+        tail: Vec::new(),
+    };
+    let mut comments = Vec::new();
+    comment_tokens(block, src, &mut comments);
+    for (off, line, text) in comments {
+        if spans
+            .iter()
+            .flatten()
+            .any(|&(cs, ce)| cs <= off && off < ce)
+        {
+            continue; // inside a statement — handled elsewhere
+        }
+        // The last statement whose code ends before this comment, if on the same source line → trail.
+        let prev = spans
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, s)| s.filter(|&(_, ce)| ce <= off).map(|(_, ce)| (i, ce)));
+        if let Some((i, _)) = prev.filter(|&(_, ce)| line_of(src, ce.saturating_sub(1)) == line) {
+            bc.trailing[i] = Some(text);
+            continue;
+        }
+        // Otherwise standalone: it precedes the next statement, or trails the whole block.
+        match spans.iter().position(|s| s.is_some_and(|(cs, _)| cs > off)) {
+            Some(nx) => bc.before[nx].push(text),
+            None => bc.tail.push(text),
+        }
+    }
+    bc
+}
+
+/// Format every statement of a block (a lambda / compound body) fully, in order, re-emitting the
+/// block's comments: a standalone comment on its own indented line, an inline comment appended to its
+/// statement's last line with gdformat's two-space offset.
 fn format_block_body(w: &W, block: &GdNode, indent: usize) -> Option<Vec<String>> {
+    let stmts: Vec<GdNode> = block.children().cloned().collect();
+    let bc = collect_block_comments(block, &w.src, &stmts);
     let mut out = Vec::new();
-    for stmt in block.children() {
-        out.extend(format_full_statement(w, stmt, indent)?);
+    for (i, stmt) in stmts.iter().enumerate() {
+        for c in &bc.before[i] {
+            out.push(format!("{}{c}", w.indent(indent)));
+        }
+        let mut lines = format_full_statement(w, stmt, indent)?;
+        if let Some(c) = &bc.trailing[i] {
+            let last = lines.last_mut()?;
+            last.push_str("  ");
+            last.push_str(c);
+        }
+        out.append(&mut lines);
+    }
+    for c in &bc.tail {
+        out.push(format!("{}{c}", w.indent(indent)));
     }
     Some(out)
 }

@@ -2127,7 +2127,23 @@ fn compact_paren_wrap(
 /// is a function *declaration* header (its `func` is not a lambda), so it is excluded.
 fn stmt_is_rewrappable_multiline(stmt: &str) -> bool {
     let toks = gdscript_syntax::tokenize(stmt);
-    if toks.iter().any(|t| {
+    // A multi-line string token cannot be reflowed yet — leave the statement verbatim.
+    if toks
+        .iter()
+        .any(|t| t.kind == SyntaxKind::String && stmt[t.range].contains('\n'))
+    {
+        return false;
+    }
+    let lead = stmt.trim_start();
+    let lead = lead.strip_prefix("static ").unwrap_or(lead);
+    if lead.starts_with("func ") || lead.starts_with("func(") {
+        return false; // a function *declaration* header, not a lambda expression
+    }
+    // The two legitimate reasons a statement cannot collapse onto one physical line and is still
+    // worth re-laying-out: it carries a lambda, or it carries a comment (the CST wrapper now threads
+    // both through; the comment-multiset net falls back to verbatim if a comment can't be placed).
+    let has_lambda = toks.iter().any(|t| t.kind == SyntaxKind::FuncKw);
+    let has_comment = toks.iter().any(|t| {
         matches!(
             t.kind,
             SyntaxKind::LineComment
@@ -2135,15 +2151,8 @@ fn stmt_is_rewrappable_multiline(stmt: &str) -> bool {
                 | SyntaxKind::RegionComment
                 | SyntaxKind::EndRegionComment
         )
-    }) {
-        return false;
-    }
-    let lead = stmt.trim_start();
-    let lead = lead.strip_prefix("static ").unwrap_or(lead);
-    if lead.starts_with("func ") || lead.starts_with("func(") {
-        return false;
-    }
-    toks.iter().any(|t| t.kind == SyntaxKind::FuncKw)
+    });
+    has_lambda || has_comment
 }
 
 fn flatten_statement(stmt: &str) -> Option<String> {
@@ -3512,6 +3521,31 @@ mod tests {
         let out = fmt(src);
         assert!(out.contains("\t\t\treturn null,\n"), "{out:?}");
         assert!(out.contains("# c1"), "comment preserved: {out:?}");
+        assert!(parses_clean(&out), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn comments_in_a_reshaped_lambda_body_are_threaded_through() {
+        // A statement reshaped by the CST wrapper carries its block comments: a trailing inline
+        // comment stays on its statement's line (two-space offset), a standalone comment keeps its own
+        // line — both at the reshaped indent. (The comment-multiset net falls back to verbatim if any
+        // comment can't be placed, so this can only improve correctness.)
+        assert_eq!(
+            fmt(
+                "func r():\n\tx.connect(func():\n\t\ta()  # trailing\n\t\t# standalone\n\t\tb()\n\t)\n"
+            ),
+            "func r():\n\tx.connect(\n\t\tfunc():\n\t\t\ta()  # trailing\n\t\t\t# standalone\n\t\t\tb()\n\t)\n"
+        );
+    }
+
+    #[test]
+    fn trailing_comment_on_a_reshaped_statement_survives() {
+        // A comment trailing the whole statement (`const X := {…}  # note`) lands on the rendered last
+        // line of the reshaped statement.
+        let src = "const RESERVED := {\"a\": one_long_key_value_that_forces_a_wrap, \"b\": another_long_one_here}  # note\n";
+        let out = fmt(src);
+        assert!(out.contains("}  # note\n"), "{out:?}");
         assert!(parses_clean(&out), "{out:?}");
         assert_eq!(fmt(&out), out, "idempotent");
     }
