@@ -705,10 +705,17 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       when the condition is a constant literal whose booleanization is known (a bool literal, or
       `null` = false), mirroring Godot's `resolve_assert`. Named-constant / arithmetic folding is
       deliberately not attempted (sound under-warn — no false positive on a runtime condition).
-- [ ] **`CONFUSABLE_IDENTIFIER` / `_LOCAL_DECLARATION` / `_LOCAL_USAGE` / `_CAPTURE_REASSIGNMENT` /
-      `_TEMPORARY_MODIFICATION`** — Unicode mixed-script/homoglyph detection; needs a confusables
-      table (`unicode-security` crate or the Unicode confusables data). `_TEMPORARY_MODIFICATION` is
-      master-only (already `since=Master`).
+- [x] **`CONFUSABLE_IDENTIFIER` → DONE (burndown Stage 2).** UTS #39 restriction-level detection via
+      the `unicode-security` crate: a non-ASCII identifier that mixes scripts in a spoofable way (≥
+      `MinimallyRestrictive`, e.g. a Latin name carrying a Cyrillic/Greek homoglyph) warns; pure-ASCII
+      and legitimate single-script / CJK+Latin names never do. Checked on members, locals/params, and
+      `class_name`. **Prerequisite also fixed:** the lexer was ASCII-only (`[A-Za-z_]…`) — a
+      parse-correctness gap on valid Godot code — now accepts UAX #31 / XID identifiers (`\p{XID_Start}
+      \p{XID_Continue}*`), a strict superset on ASCII (tokenization byte-identical there).
+- [ ] **The 4 flow/scope confusables** (`CONFUSABLE_LOCAL_DECLARATION` / `_LOCAL_USAGE` /
+      `_CAPTURE_REASSIGNMENT` / `_TEMPORARY_MODIFICATION` — the last master-only) — these are **not**
+      the Unicode-table check above; they need use-before-declaration shadowing analysis + lambda-
+      capture tracking (a distinct flow-analysis effort, low value / niche).
 - [x] **Deprecated-misuse trio — `PROPERTY_USED_AS_FUNCTION` / `CONSTANT_USED_AS_FUNCTION` DONE
       (Phase 1, `feat/w1-warnings`).** Calling a statically-resolved engine property/const as a
       function, guarded against Callable/Signal/uninformative members. **`FUNCTION_USED_AS_PROPERTY`

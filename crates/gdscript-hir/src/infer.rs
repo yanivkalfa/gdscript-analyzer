@@ -307,6 +307,22 @@ pub fn infer(
         }
     }
 
+    // CONFUSABLE_IDENTIFIER — a parameter / local binding whose name mixes scripts in a spoofable
+    // way (the same UTS #39 check used for member names; ASCII names fast-path out).
+    let confusable_bindings: Vec<TextRange> = cx
+        .bindings
+        .iter()
+        .filter(|b| is_confusable_identifier(&b.name))
+        .map(|b| b.name_range)
+        .collect();
+    for range in confusable_bindings {
+        cx.warn(
+            range,
+            WarningCode::ConfusableIdentifier,
+            "This identifier uses confusable characters (mixed scripts).".to_owned(),
+        );
+    }
+
     // UNREACHABLE_CODE — statements after a return/break/continue / exhaustive branch (Workstream 2).
     let unreachable = cx.flow.unreachable_ranges(body);
     for range in unreachable {
@@ -442,6 +458,18 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
                 ),
                 source: DiagnosticSource::Type,
                 fixes: Vec::new(),
+            });
+        }
+        // CONFUSABLE_IDENTIFIER on the `class_name` itself (gated, unlike the hides-global check).
+        if is_confusable_identifier(&name)
+            && let Some(range) = class_name_decl_range(root)
+        {
+            raw_warnings.push(RawWarning {
+                range,
+                code: WarningCode::ConfusableIdentifier,
+                message: format!(
+                    "The identifier \"{name}\" uses confusable characters (mixed scripts)."
+                ),
             });
         }
     }
@@ -587,6 +615,18 @@ fn member_level_warnings(
                 range,
                 code: WarningCode::ShadowedGlobalIdentifier,
                 message: format!("The {what} \"{name}\" has the same name as a {kind}."),
+            });
+        }
+        // CONFUSABLE_IDENTIFIER — any member name that mixes scripts in a spoofable way.
+        if let Some((name, range)) = member_decl_name(m)
+            && is_confusable_identifier(name)
+        {
+            out.push(RawWarning {
+                range,
+                code: WarningCode::ConfusableIdentifier,
+                message: format!(
+                    "The identifier \"{name}\" uses confusable characters (mixed scripts)."
+                ),
             });
         }
         match m {
@@ -779,6 +819,34 @@ fn member_value_decl(m: &Member) -> Option<(&SmolStr, TextRange, &'static str)> 
         Member::Signal(s) => Some((&s.name, s.name_range, "signal")),
         _ => None,
     }
+}
+
+/// The declared `(name, name range)` of any named member (`func`/`var`/`const`/`signal`/named
+/// `enum`/inner `class`), for the `CONFUSABLE_IDENTIFIER` scan. An anonymous `enum { … }` has no
+/// name → `None`.
+fn member_decl_name(m: &Member) -> Option<(&SmolStr, TextRange)> {
+    match m {
+        Member::Func(f) => Some((&f.name, f.name_range)),
+        Member::Var(v) => Some((&v.name, v.name_range)),
+        Member::Const(c) => Some((&c.name, c.name_range)),
+        Member::Signal(s) => Some((&s.name, s.name_range)),
+        Member::Class(c) => Some((&c.name, c.name_range)),
+        Member::Enum(e) => e.name.as_ref().map(|n| (n, e.name_range)),
+    }
+}
+
+/// Whether `name` is a `CONFUSABLE_IDENTIFIER` — a non-ASCII identifier that mixes scripts in a
+/// spoofable way (UTS #39 restriction level ≥ `MinimallyRestrictive`, e.g. a Latin identifier with a
+/// Cyrillic/Greek homoglyph like `pаypal`). Pure-ASCII (the overwhelming majority) and legitimate
+/// single-script / CJK-plus-Latin identifiers are never flagged. Mirrors the intent of Godot's
+/// `TextServer` confusable check with zero false positives on ordinary code.
+fn is_confusable_identifier(name: &str) -> bool {
+    use unicode_security::RestrictionLevel as RL;
+    use unicode_security::RestrictionLevelDetection;
+    if name.is_ascii() {
+        return false; // the fast path for ~all real identifiers
+    }
+    name.detect_restriction_level() >= RL::MinimallyRestrictive
 }
 
 /// The NAME range of the file's `class_name` declaration, trimmed to the bare identifier (the
@@ -2912,6 +2980,34 @@ mod tests {
         assert_eq!(untyped, 2, "only `p` and `a` are untyped: {raw:?}");
         let inferred = raw.iter().filter(|c| **c == "INFERRED_DECLARATION").count();
         assert_eq!(inferred, 1, "only `b` uses `:=`: {raw:?}");
+    }
+
+    #[test]
+    fn confusable_identifier_warns_on_a_mixed_script_local() {
+        // `p\u{0430}ypal` — Latin letters with a Cyrillic `а` (U+0430): a homoglyph of ASCII `paypal`.
+        let h = infer_first_func("func f():\n\tvar p\u{0430}ypal = 1\n\treturn p\u{0430}ypal\n");
+        assert!(
+            codes(&h).contains(&"CONFUSABLE_IDENTIFIER"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn an_ordinary_ascii_identifier_is_not_confusable() {
+        let h = infer_first_func("func f():\n\tvar paypal = 1\n\treturn paypal\n");
+        assert!(
+            !codes(&h).contains(&"CONFUSABLE_IDENTIFIER"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn a_member_with_a_confusable_name_warns() {
+        // Cyrillic `а` inside `balance`.
+        let cs = file_codes("var b\u{0430}lance = 0\n");
+        assert!(cs.iter().any(|c| c == "CONFUSABLE_IDENTIFIER"), "{cs:?}");
     }
 
     #[test]
