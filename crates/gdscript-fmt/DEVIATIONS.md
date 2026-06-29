@@ -19,9 +19,18 @@ As of the CST-driven wrapping port (a faithful port of gdformat 4.5's `expressio
 `src/wrap.rs`) plus the full normalization set (inline-suite expansion, blank-line + comment rules,
 node-path / triple-quote / BOM, dict-entry & magic-comma chains), EOL-normalised:
 
-- **exact match**: **~95%** over `godot-demo-projects` (456 files; up from ~14% at the start of
-  Phase 4), **~65%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
+- **exact match**: **~97%** over `godot-demo-projects` (456 files; up from ~14% at the start of
+  Phase 4), **~93%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
 - **fixpoint** `format(gold)==gold`: **~99%** (godot) / **~98%** (ReactiveUI)
+
+The CST wrapper additionally renders **lambdas** (inline `func(p): body`, multi-line bodies with
+recursively-formatted nested blocks, and the contains-a-lambda dot-chain bottom-up rule), drops a
+colon dict-entry's value below its key when the entry overflows, splits a long annotated declaration's
+annotation onto its own line, and re-lays-out multi-line lambda-bearing statements. Two parse-tree
+pre-passes were added: an inner class's `extends` is moved to its own body line
+(`class C extends B:` → `class C:` / `extends B`), and `;`/inline-suite expansion now descends
+correctly through inner-class and lambda bodies. A parser fix lets a dict value sit on the next line
+(`"k":\n v`).
 
 Corpus safety (all 545 clean files, `safe_mode` OFF): **0** non-parsing outputs, **0**
 token-sequence changes, **0** idempotence breaks. The safety net is never the thing that makes us
