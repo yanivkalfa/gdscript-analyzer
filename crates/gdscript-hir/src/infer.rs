@@ -2924,6 +2924,37 @@ mod tests {
     }
 
     #[test]
+    fn vector_scalar_compound_assign_is_not_a_mismatch() {
+        // `v *= 0.5` desugars to `v = v * 0.5` : Vector2 — not the scalar float (the old collapse).
+        let h = infer_first_func(
+            "func f() -> Vector2:\n\tvar v := Vector2()\n\tv *= 0.5\n\treturn v\n",
+        );
+        assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn array_literal_to_packed_array_is_allowed() {
+        let h = infer_first_func("func f():\n\tvar p: PackedStringArray = [\"a\", \"b\"]\n");
+        assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn vector2i_to_vector2_is_allowed() {
+        let h = infer_first_func("func f():\n\tvar v: Vector2 = Vector2i(1, 2)\n");
+        assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn lua_style_dict_key_is_not_an_assignment() {
+        // `{ pos = "x" }` is a dict entry (key `pos`), not the statement `pos = "x"` — so it must not
+        // check the value against the member `pos`'s type.
+        let h = infer_first_func(
+            "var pos: Vector2\nfunc f():\n\tvar d = { pos = \"x\" }\n\treturn d\n",
+        );
+        assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
+    }
+
+    #[test]
     fn narrowing_conversion_float_to_int() {
         let h = infer_first_func("func f():\n\tvar n: int = 1.5\n");
         assert!(codes(&h).contains(&NARROWING_CONVERSION));

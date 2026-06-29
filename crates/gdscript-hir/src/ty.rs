@@ -176,6 +176,46 @@ pub enum Assign {
     No,
 }
 
+/// Whether `name` is a `Packed*Array` builtin (`PackedStringArray`, `PackedVector2Array`, …).
+fn is_packed_array(name: &str) -> bool {
+    name.starts_with("Packed") && name.ends_with("Array")
+}
+
+/// Godot's implicit conversions between two **builtin** types (the engine's `Variant::can_convert`
+/// for the value-prop slots GDScript accepts silently). Covers the numeric / vector widening +
+/// narrowing, `bool`↔`int`, the `String`/`StringName`/`NodePath` family, and `Array`↔`Packed*Array`.
+#[allow(
+    clippy::unnested_or_patterns,
+    reason = "a flat (from, to) conversion table reads more clearly than maximally-nested patterns"
+)]
+fn builtin_conversion(from: &str, to: &str) -> Assign {
+    match (from, to) {
+        // Narrowing (NARROWING_CONVERSION, not a hard mismatch): float→int, float-vec→int-vec.
+        ("float", "int")
+        | ("Vector2", "Vector2i")
+        | ("Vector3", "Vector3i")
+        | ("Vector4", "Vector4i")
+        | ("Rect2", "Rect2i") => Assign::Narrowing,
+        // Widening / interchangeable value types Godot converts silently.
+        ("int", "float")
+        | ("bool", "int")
+        | ("bool", "float")
+        | ("int", "bool")
+        | ("Vector2i", "Vector2")
+        | ("Vector3i", "Vector3")
+        | ("Vector4i", "Vector4")
+        | ("Rect2i", "Rect2")
+        | ("String", "StringName")
+        | ("String", "NodePath")
+        | ("StringName", "String")
+        | ("NodePath", "String") => Assign::Ok,
+        // A bare `Array` ↔ a `Packed*Array` is a runtime element-checked conversion Godot allows.
+        ("Array", t) if is_packed_array(t) => Assign::Ok,
+        (f, "Array") if is_packed_array(f) => Assign::Ok,
+        _ => Assign::No,
+    }
+}
+
 /// Whether a value of type `from` may be assigned to a slot of type `to` (the engine's
 /// `check_type_compatibility`, ported — Playbook §3.5). **Order matters.**
 #[must_use]
@@ -194,24 +234,21 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
     }
 
     match to {
-        Ty::Builtin(to_id) => match from {
-            Ty::Builtin(from_id) if from_id == to_id => Assign::Ok,
-            Ty::Builtin(from_id) => {
-                let from_name = api.builtin(*from_id).name.as_str();
-                let to_name = api.builtin(*to_id).name.as_str();
-                match (from_name, to_name) {
-                    ("float", "int") => Assign::Narrowing, // NARROWING_CONVERSION
-                    // `int`→`float` widening (silent) + Godot's string-ish auto-conversions.
-                    ("int", "float")
-                    | ("String", "StringName" | "NodePath")
-                    | ("StringName" | "NodePath", "String") => Assign::Ok,
-                    _ => Assign::No,
+        Ty::Builtin(to_id) => {
+            let to_name = api.builtin(*to_id).name.as_str();
+            match from {
+                Ty::Builtin(from_id) if from_id == to_id => Assign::Ok,
+                Ty::Builtin(from_id) => {
+                    builtin_conversion(api.builtin(*from_id).name.as_str(), to_name)
                 }
+                // An enum value is assignable to `int`.
+                Ty::Enum(_) if to_name == "int" => Assign::Ok,
+                // A bare/typed `Array` (a `[…]` literal) assigns to any `Packed*Array`: Godot
+                // runtime-converts + validates the elements at runtime — never a static mismatch.
+                Ty::Array(_) if is_packed_array(to_name) => Assign::Ok,
+                _ => Assign::No,
             }
-            // An enum value is assignable to `int`.
-            Ty::Enum(_) if api.builtin(*to_id).name == "int" => Assign::Ok,
-            _ => Assign::No,
-        },
+        }
         Ty::Enum(to_enum) => match from {
             Ty::Enum(from_enum) if from_enum == to_enum => Assign::Ok,
             // A *different* enum's value is an `int` at runtime: Godot wants a cast

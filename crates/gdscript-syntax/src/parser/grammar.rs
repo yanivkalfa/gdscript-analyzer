@@ -914,7 +914,10 @@ impl Parser<'_> {
         self.expect(LBrace);
         while !self.at(RBrace) && !self.eof() {
             let e = self.open();
-            self.expr();
+            // Parse the key ABOVE assignment precedence so the Lua-style `key = value` separator is
+            // NOT folded into the key as an assignment expression: `{ pos = x }` is a dict entry
+            // (key `pos`, value `x`), not the statement `pos = x` (which would false-`TYPE_MISMATCH`).
+            self.expr_bp(bp(PREC_ASSIGN, Assoc::Right).0 + 1);
             if self.eat(Colon) || self.eat(Eq) {
                 self.expr();
             }

@@ -633,9 +633,35 @@ impl Lowerer {
             K::BinExpr => {
                 let exprs = cst::child_exprs(node);
                 let op = bin_op(node).unwrap_or(BinOp::Add);
-                let lhs = self.lower_or_missing(exprs.first(), range);
-                let rhs = self.lower_or_missing(exprs.get(1), range);
-                Expr::Bin { op, lhs, rhs }
+                // A compound assignment `x op= y` desugars to `x = (x op y)`. Typing then checks the
+                // REAL result against the slot (`velocity *= 0.5` is `velocity = velocity * 0.5` :
+                // Vector2 — not the scalar `0.5`, which would false-`TYPE_MISMATCH`), and the LHS is
+                // a READ of `x` (so `x += 1` is not falsely `UNUSED`). Lowering the LHS twice is safe
+                // for analysis (the Body IR is never executed, so re-evaluation has no side effect).
+                if op == BinOp::Assign
+                    && let Some(under) = compound_assign_op(node)
+                {
+                    let lhs = self.lower_or_missing(exprs.first(), range);
+                    let lhs_read = self.lower_or_missing(exprs.first(), range);
+                    let rhs = self.lower_or_missing(exprs.get(1), range);
+                    let value = self.alloc_expr(
+                        Expr::Bin {
+                            op: under,
+                            lhs: lhs_read,
+                            rhs,
+                        },
+                        range,
+                    );
+                    Expr::Bin {
+                        op: BinOp::Assign,
+                        lhs,
+                        rhs: value,
+                    }
+                } else {
+                    let lhs = self.lower_or_missing(exprs.first(), range);
+                    let rhs = self.lower_or_missing(exprs.get(1), range);
+                    Expr::Bin { op, lhs, rhs }
+                }
             }
             K::UnaryExpr => {
                 let op = un_op(node).unwrap_or(UnOp::Pos);
@@ -953,6 +979,30 @@ fn bin_op(node: &GdNode) -> Option<BinOp> {
     node.children_with_tokens()
         .filter_map(cstree::util::NodeOrToken::into_token)
         .find_map(|t| BinOp::from_token(t.kind()))
+}
+
+/// The *underlying* operator of a **compound** assignment `BinExpr` (`*=` → `Mul`, `+=` → `Add`, …),
+/// or `None` for a plain `=` / a non-assignment. Used to desugar `x op= y` into `x = (x op y)`.
+fn compound_assign_op(node: &GdNode) -> Option<BinOp> {
+    use SyntaxKind as K;
+    node.children_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .find_map(|t| {
+            Some(match t.kind() {
+                K::PlusEq => BinOp::Add,
+                K::MinusEq => BinOp::Sub,
+                K::StarEq => BinOp::Mul,
+                K::SlashEq => BinOp::Div,
+                K::PercentEq => BinOp::Mod,
+                K::StarStarEq => BinOp::Pow,
+                K::AmpEq => BinOp::BitAnd,
+                K::PipeEq => BinOp::BitOr,
+                K::CaretEq => BinOp::BitXor,
+                K::ShlEq => BinOp::Shl,
+                K::ShrEq => BinOp::Shr,
+                _ => return None,
+            })
+        })
 }
 
 /// The prefix operator token of a `UnaryExpr`.

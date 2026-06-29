@@ -327,11 +327,21 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       `await_a_coroutine_call_recovers_its_return_type`, `await_a_signal_stays_the_seam`.
 
 ### Validation
-- [ ] **Type-diagnostic corpus is one project.** Validated on ReactiveUI-Godot (89 `.gd`):
-      **0 panics, 0 false `TYPE_MISMATCH`**; total diagnostics 446→57 after hardening. The 2
-      residual `INFERENCE_ON_VARIANT` are *true* positives (an explicit `-> Variant` return; an
-      untyped operand) and the 53 `UNSAFE_*` are the intended value-prop warnings the engine
-      ignores by default (§5). Broaden to the Godot demo-projects corpus before v1.
+- [x] **Type-diagnostic corpus broadened to demo-projects → DONE (burndown Stage 3).** The faithful
+      `--per-project` run over godot-demo-projects (138 projects) exposed **55 `TYPE_MISMATCH`** that
+      ReactiveUI (UI code, no vector math) never had. They were **3 distinct false-positive classes**,
+      all fixed:
+      - **Vector-scalar compound assign** (~25): `x *= y` collapsed to `x = y`, so `velocity *= 0.5`
+        checked the scalar against `Vector2`. Fixed at the root — the body lowering now **desugars
+        `x op= y` to `x = (x op y)`** (so typing checks the real result, and the LHS counts as a READ
+        for `UNUSED_*`).
+      - **Missing implicit conversions** (~22): `Array`↔`Packed*Array`, `Vector2i`↔`Vector2` (+ 3/4),
+        `Rect2i`↔`Rect2`, `bool`↔`int` are silent in Godot — added to `ty::is_assignable`.
+      - **Lua-style dict keys** (~4): `{ pos = "x" }` was parsed as the assignment `pos = "x"`; the
+        dict key is now parsed **above assignment precedence**, so it's a dict entry.
+      Result: **55 → 1** — and that 1 (a deep `XRPose.transform` misinference) plus the 3 `os_test.gd`
+      `-> void`-returns-a-value cases are **genuine** (Godot flags them too). No-false-`TYPE_MISMATCH`
+      baseline effectively locked; the per-project corpus gate guards it.
 
 ### FFI ergonomics
 - [x] **Bindings return native JS values, not JSON strings — DONE (Phase 3, `feat/w1-warnings`).**
