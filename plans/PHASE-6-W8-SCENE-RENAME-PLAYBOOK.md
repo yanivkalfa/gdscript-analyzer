@@ -1,5 +1,10 @@
 # Phase 6 · W8 — Scene-Aware Rename Playbook
 
+> **STATUS: DONE** (branch `feat/formatter-scene-rename`). All nine milestones landed + gated +
+> pushed. Validated by ~13k renames across 9 godot-demo-projects subprojects — **0 panics, 0
+> corrupting edits** (each successful rename applied + re-parsed). 71 `gdscript-ide` nav tests.
+
+
 > The write-side counterpart to Phase 4's read-side scene awareness (typing / goto / completion /
 > diagnostics). Renaming a **script symbol** updates its **scene references** (`[connection]`s, exported
 > properties), and renaming a **scene node** updates its **`$Path`/`%Unique`/`get_node` references** in

@@ -140,8 +140,17 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       scene; `%Box/` resolves `Box` scene-wide and offers its children. Tests:
       `unique_node_path_completion_offers_children`, `bare_percent_offers_all_unique_nodes`,
       `percent_modulo_is_not_hijacked_as_a_unique_path`.
-- [ ] **Scene-aware rename → Phase 6.** Renaming a node in a `.tscn` and updating `$Path`s (or vice
-      versa) is deferred per the plan; M2 ships the read-side features (type/goto/complete/diagnose).
+- [x] **Scene-aware rename → DONE (W8, `feat/formatter-scene-rename`).** Renaming a node in a `.tscn`
+      (or from a `$Path` in a script) now rewrites the node `name=`, every child `parent=` segment,
+      every `[connection] from`/`to` segment, and every `$Path`/`%Unique`/`get_node("…")` segment in
+      scripts; renaming a connected method/signal rewrites its `[connection]`; renaming an `@export`
+      var rewrites its `[node]` property key. `GodotDef::SceneNode` (identity = scene + full node path)
+      classifies a node from both ends; the new scene-parser data is `SceneModel.connections` +
+      `SceneNode.{parent_span, properties}`. Correct-or-refuse (WouldCollide on a sibling name; refuse
+      on an ambiguous multi-scene script, a `.gd`-string the analyzer can't attribute, an
+      un-attributable connection). Validated: ~13k renames across the godot-demo-projects subprojects
+      (9 projects) — **0 panics, 0 corrupting edits** (apply + re-parse). See
+      `plans/PHASE-6-W8-SCENE-RENAME-PLAYBOOK.md`.
 
 ---
 
@@ -381,12 +390,13 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       firewall projection.
 - [x] **`extends "res://path.gd"` + `preload` need a `res://` → `FileId` map — DONE in M3** (above).
       `load(var)`/`load("lit")` stay opaque by design (D5).
-- [ ] **(M5) Scene/config rewriting deferred → rename refuses.** `.tscn`/`.tres` are not ingested
-      (scene crate is a Phase-4 stub) and `project.godot` is read-only to rename. Method/signal/
-      exported-var renames **refuse** on a detected same-named project string literal; autoload-name
-      renames refuse. **Known probabilistic gap:** a scene `[connection method="…"]` we cannot see
-      makes a method rename *appear* safe — we mitigate by refusing on any same-named `.gd` string,
-      but a pure-scene reference is invisible. Scene-aware rename = Phase 4/6.
+- [x] **(M5) Scene rewriting → DONE (W8).** `.tscn` scenes are ingested (Phase-4 scene crate) and a
+      rename now rewrites scene references: method/signal `[connection]`s and `@export`-var `[node]`
+      properties are **attributed + rewritten** (resolve-confirmed: the connection/property node must
+      attach this exact script), closing the old probabilistic gap (a scene-only `[connection]` was
+      previously invisible → a method rename silently missed it). The `.gd`-string refuse is retained
+      only for an *un*attributable string (a dynamic `connect`/`Callable`/`get_node(var)`).
+      `project.godot` `[autoload]` is still read-only to rename (an autoload-name rename refuses).
 - [ ] **(M5) `classify` duplicates `infer.rs`'s name-lookup order.** Two copies of the local → member
       → inherited → global → autoload → engine precedence (one returns a `Ty`, one a `GodotDef`).
       Unify behind shared `def.rs` helpers once the Phase-2 byte-identical inference guarantee can be
