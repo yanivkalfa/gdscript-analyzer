@@ -678,6 +678,54 @@ mod tests {
     }
 
     #[test]
+    fn missing_tool_warns_when_extending_a_tool_base_without_tool() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "@tool\nclass_name ToolBase\n", Durability::LOW);
+        db.set_file_text(
+            FileId(1),
+            "extends ToolBase\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let derived = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            derived
+                .raw_warnings
+                .iter()
+                .any(|w| w.code.as_str() == "MISSING_TOOL"),
+            "{:?}",
+            derived
+                .raw_warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>()
+        );
+        // The base itself IS `@tool` → no warning.
+        let base = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(
+            !base
+                .raw_warnings
+                .iter()
+                .any(|w| w.code.as_str() == "MISSING_TOOL")
+        );
+    }
+
+    #[test]
+    fn a_tool_class_extending_a_tool_base_is_silent() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "@tool\nclass_name ToolBase\n", Durability::LOW);
+        db.set_file_text(FileId(1), "@tool\nextends ToolBase\n", Durability::LOW);
+        db.sync_source_root();
+        let derived = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            !derived
+                .raw_warnings
+                .iter()
+                .any(|w| w.code.as_str() == "MISSING_TOOL")
+        );
+    }
+
+    #[test]
     fn duplicate_class_name_warns_at_both_declarations() {
         let mut db = RootDatabase::default();
         db.set_file_text(

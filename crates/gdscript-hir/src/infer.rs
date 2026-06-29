@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::body::{self, BinOp, Body, Expr, ExprId, Literal, ParamBinding, Stmt, UnOp};
 use crate::cst::{self, AstPtr};
 use crate::flow::{self, FlowAnalysis, NarrowedTy, Place};
-use crate::item_tree::{ItemTree, Member, item_tree};
+use crate::item_tree::{ItemTree, Member, has_annotation, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
 use crate::ty::{self, Assign, EnumRef, ScriptRefId, Ty};
 use crate::warnings::{RawWarning, WarningCode};
@@ -586,6 +586,47 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
     }
 }
 
+/// Class-level annotation checks (W1), unblocked by first-class item-tree annotations:
+/// `REDUNDANT_STATIC_UNLOAD` (`@static_unload` with no `static var`) and `MISSING_TOOL` (a non-`@tool`
+/// class extending a `@tool` user-script base).
+fn class_annotation_warnings(
+    db: &dyn Db,
+    api: &EngineApi,
+    root: &GdNode,
+    tree: &ItemTree,
+    res_path: Option<&str>,
+) -> Vec<RawWarning> {
+    let mut out = Vec::new();
+    // REDUNDANT_STATIC_UNLOAD — `@static_unload` on a class that declares no `static var`.
+    if let Some(unload) = tree.annotations.iter().find(|a| a.name == "static_unload")
+        && !tree
+            .members
+            .iter()
+            .any(|m| matches!(m, Member::Var(v) if v.is_static))
+    {
+        out.push(RawWarning {
+            range: unload.range,
+            code: WarningCode::RedundantStaticUnload,
+            message: "`@static_unload` is redundant on a class with no static variables."
+                .to_owned(),
+        });
+    }
+    // MISSING_TOOL — this class is not `@tool` but its (user-script) base is, so it will NOT run in
+    // the editor. Only the resolvable user-script base is checked (an engine base is never `@tool`).
+    if !has_annotation(&tree.annotations, "tool")
+        && user_base_is_tool(db, api, tree, res_path)
+        && let Some(range) = extends_decl_range(root)
+    {
+        out.push(RawWarning {
+            range,
+            code: WarningCode::MissingTool,
+            message: "This class extends a `@tool` script but is not itself `@tool` (it will not run in the editor)."
+                .to_owned(),
+        });
+    }
+    out
+}
+
 /// File-level (member) warnings that need the whole item-tree, not a single body (W1):
 /// `ENUM_VARIABLE_WITHOUT_DEFAULT` on an enum-typed field with no initializer, and `UNUSED_SIGNAL`
 /// on a signal never referenced anywhere in the file. Both are sound + conservative.
@@ -605,7 +646,24 @@ fn member_level_warnings(
         Ty::Object(c) => Some(c),
         _ => None,
     };
+
+    out.extend(class_annotation_warnings(db, api, root, tree, res_path));
+
     for m in &tree.members {
+        // ONREADY_WITH_EXPORT — `@onready` and `@export` on the same member (Godot raises this).
+        if let Member::Var(v) = m
+            && has_annotation(&v.annotations, "onready")
+            && v.is_exported
+        {
+            out.push(RawWarning {
+                range: v.name_range,
+                code: WarningCode::OnreadyWithExport,
+                message: format!(
+                    "The member \"{}\" has both `@onready` and `@export`; they conflict.",
+                    v.name
+                ),
+            });
+        }
         // SHADOWED_GLOBAL_IDENTIFIER — a value member (`var`/`const`/`signal`) whose name collides
         // with a project/engine global. Godot's `is_shadowing` fires for member declarations too.
         if let Some((name, range, what)) = member_value_decl(m)
@@ -770,6 +828,24 @@ fn is_autoload_singleton(db: &dyn Db, name: &str) -> bool {
             .resolve_path(name)
             .is_some()
     })
+}
+
+/// Whether the file's resolved **user-script** base carries the `@tool` annotation (for
+/// `MISSING_TOOL`). An engine base or an unresolved base is never `@tool`. Firewall-safe: reads the
+/// base's `item_tree` (signature-level — a base *body* edit leaves the annotation set unchanged).
+fn user_base_is_tool(
+    db: &dyn Db,
+    api: &EngineApi,
+    tree: &ItemTree,
+    res_path: Option<&str>,
+) -> bool {
+    let Ty::ScriptRef(sref) = resolve::resolve_base(db, api, tree, res_path) else {
+        return false;
+    };
+    let Some(ft) = db.file_text(FileId(sref.0)) else {
+        return false;
+    };
+    has_annotation(&crate::queries::item_tree(db, ft).annotations, "tool")
 }
 
 /// Whether `name` is registered as a global `class_name` by some file in the project. `false` when
@@ -3008,6 +3084,24 @@ mod tests {
         // Cyrillic `а` inside `balance`.
         let cs = file_codes("var b\u{0430}lance = 0\n");
         assert!(cs.iter().any(|c| c == "CONFUSABLE_IDENTIFIER"), "{cs:?}");
+    }
+
+    #[test]
+    fn onready_with_export_warns() {
+        let cs = file_codes("@onready @export var n = null\n");
+        assert!(cs.iter().any(|c| c == "ONREADY_WITH_EXPORT"), "{cs:?}");
+    }
+
+    #[test]
+    fn redundant_static_unload_warns_without_a_static_var() {
+        let cs = file_codes("@static_unload\nclass_name Foo\nvar x = 1\n");
+        assert!(cs.iter().any(|c| c == "REDUNDANT_STATIC_UNLOAD"), "{cs:?}");
+    }
+
+    #[test]
+    fn static_unload_with_a_static_var_is_silent() {
+        let cs = file_codes("@static_unload\nstatic var pool = []\n");
+        assert!(!cs.iter().any(|c| c == "REDUNDANT_STATIC_UNLOAD"), "{cs:?}");
     }
 
     #[test]

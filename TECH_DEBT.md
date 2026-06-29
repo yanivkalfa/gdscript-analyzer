@@ -210,9 +210,12 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       `n_attached_trivia` leading-vs-trailing heuristic (blank-line breaks, doc-comment
       pull). Lossless, but attachment isn't ideal for formatting fidelity — refine before
       shipping a formatter.
-- [ ] **Annotations are sibling nodes,** not children of the declaration they decorate.
-      `document_symbols` is unaffected; an AST `FuncDecl::annotations()` accessor would
-      need a preceding-sibling walk.
+- [x] **Annotations as first-class → DONE (burndown Stage 2).** The item tree now lifts decorator
+      annotations onto each item: `FuncItem`/`VarItem`/`ConstItem`/`SignalItem` carry
+      `annotations: Vec<AnnotationItem>` (name + range, source order), and `ItemTree` carries the
+      class-level ones (`@tool`/`@icon`/`@static_unload`/`@abstract`). `VarItem::is_exported` is now
+      derived from them. `item_tree::has_annotation` is the accessor. (The CST still holds them as
+      sibling nodes — losslessly — but consumers no longer re-walk siblings ad hoc.)
 - [ ] **Property accessor (`get`/`set`) parsing is permissive.** Inline and indented
       forms are accepted loosely; tighten when accessor semantics matter (Phase 2).
 - [x] **Soft-keyword identifiers — `match`/`when` supported.** Godot's `is_identifier()`
@@ -729,11 +732,15 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       under-warn — deferred.
 - [x] **`STATIC_CALLED_ON_INSTANCE` + `ENUM_VARIABLE_WITHOUT_DEFAULT` — DONE (Phase 1).** Static-on-
       instance fires only for a typed local instance (skips a type-aliased local). Enum-without-
-      default fires for a local OR member field. Still deferred: **`MISSING_TOOL`**,
-      **`REDUNDANT_STATIC_UNLOAD`**, **`ONREADY_WITH_EXPORT`** (all need the item-tree to capture
-      annotations — `@tool`/`@static_unload`/`@onready`/`@export` are sibling CST nodes today),
-      **`REDUNDANT_AWAIT`**, **`UNSAFE_VOID_RETURN`**, **`UNSAFE_CAST`**, **`RETURN_VALUE_DISCARDED`**,
-      **`INT_AS_ENUM_WITHOUT_MATCH`**, **`DEPRECATED_KEYWORD`** (`yield` — parser must surface it).
+      default fires for a local OR member field.
+- [x] **Annotation-dependent lifecycle checks → DONE (burndown Stage 2, on first-class annotations).**
+      **`ONREADY_WITH_EXPORT`** (`@onready` + `@export` on one member), **`REDUNDANT_STATIC_UNLOAD`**
+      (`@static_unload` with no `static var`), and **`MISSING_TOOL`** (a non-`@tool` class extending a
+      `@tool` user-script base — firewall-safe via the base's `item_tree`). Corpus: 0 false positives.
+- [ ] **Non-annotation W1 checks still deferred:** **`REDUNDANT_AWAIT`**, **`UNSAFE_VOID_RETURN`**,
+      **`UNSAFE_CAST`**, **`RETURN_VALUE_DISCARDED`**, **`INT_AS_ENUM_WITHOUT_MATCH`**,
+      **`DEPRECATED_KEYWORD`** (`yield` — the parser must surface it), **`FUNCTION_USED_AS_PROPERTY`**
+      (needs value-vs-call context). Each is an independent additive check, not annotation-blocked.
 - [x] **`UNUSED_SIGNAL` — DONE (Phase 1, same-file).** A signal never referenced anywhere in its own
       file (a whole-file `NameUses` identifier + string-literal scan). Same-file only, like Godot — a
       signal connected purely from a scene/other file is invisible (the Godot-parity limitation).
