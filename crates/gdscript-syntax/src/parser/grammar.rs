@@ -913,18 +913,31 @@ impl Parser<'_> {
         self.close(m, DictLit)
     }
 
-    /// `$Path` / `%Unique`: a sigil followed by a string or an identifier path.
+    /// `$Path` / `%Unique`: a sigil followed by a string, or a `/`-separated identifier path whose
+    /// segments may be `%`-prefixed unique-node names (`$%Unique`, `$A/%Unique/B`). A `%` is only a
+    /// path sigil when immediately followed by a name; a `%` before a non-name (`$A % 5`) is modulo
+    /// and is left for the Pratt loop.
     fn get_node(&mut self, node: SyntaxKind, sigil: SyntaxKind) -> MarkClosed {
         let m = self.open();
         self.expect(sigil);
         if self.eat(String) {
             // `$"Path/With Spaces"`
-        } else if self.eat(Ident) {
+        } else {
+            self.eat_node_path_segment();
             while self.eat(Slash) {
-                self.eat(Ident);
+                self.eat_node_path_segment();
             }
         }
         self.close(m, node)
+    }
+
+    /// One node-path segment: an optional `%` (unique-node sigil, only when it precedes a name)
+    /// followed by an identifier.
+    fn eat_node_path_segment(&mut self) {
+        if self.at(Percent) && self.nth(1) == Ident {
+            self.advance(); // `%`
+        }
+        self.eat(Ident);
     }
 
     /// A lambda (`func`-expression). Returns the closed node and whether its body was an
