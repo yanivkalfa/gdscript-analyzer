@@ -669,11 +669,13 @@ ones below were deliberately **not** rushed into the 1.0 cut because they carry 
 (uncertain Godot-parity semantics) that the §1 pass exists to eliminate — better landed individually,
 each with its own bug-hunt, than batched in under freeze pressure. Sequenced by value.
 
-- [ ] **`UNTYPED_DECLARATION` / `INFERRED_DECLARATION`** — directly from the binding `annotated` /
-      `inferred_colon_eq` flags. **Low value:** default-IGNORE opt-in *and* extremely noisy (fires on
-      essentially every untyped/inferred local) — most users never enable them; the strict group's
-      real value (the `UNSAFE_*` codes) already ships. Adding them also needs a `codes()` test helper
-      that filters the opt-in group (else they pollute every focused infer fixture).
+- [x] **`UNTYPED_DECLARATION` / `INFERRED_DECLARATION` — DONE (burndown Stage 1).** Emitted from the
+      binding flags: a `var`/parameter with no `: T` and no `:=` → `UNTYPED_DECLARATION`; a `var :=` →
+      `INFERRED_DECLARATION` (locals + params; `const`/`for`/pattern-bind excluded — value-fixed). To
+      keep them from polluting every fixture, the infer `codes()`/`file_codes()` helpers filter them,
+      and — because they fire on essentially every untyped/inferred local — they are **excluded from
+      the `--strict`/standalone auto-promotion** (`WarningCode::promoted_by_strict`): they require an
+      explicit per-code `project.godot` setting, matching Godot's "most users never enable them".
 - [x] **`SHADOWED_VARIABLE` — DONE (§1 pass).** A local `var`/`const` shadowing a param or own
       value-member (var/const/signal/anon-enum). **`SHADOWED_VARIABLE_BASE_CLASS` — DONE engine-base
       (Phase 1):** a local shadowing a value member of the resolved ENGINE base

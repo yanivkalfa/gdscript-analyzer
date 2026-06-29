@@ -1598,8 +1598,9 @@ mod tests {
         let file = db.file_text(FileId(0)).unwrap();
         let config = db.project_config().unwrap();
 
-        // Prime: analyze_file runs once and records the gateable INTEGER_DIVISION raw warning.
-        assert_eq!(observe_analyze_file(&db, file), 1);
+        // Prime: analyze_file runs once and records the gateable raw warnings — INTEGER_DIVISION
+        // plus UNTYPED_DECLARATION (the untyped `var x`).
+        assert_eq!(observe_analyze_file(&db, file), 2);
         let runs = ANALYZE_OBSERVED.load(Ordering::SeqCst);
         assert_eq!(
             warning_settings(&db, config)
@@ -1614,7 +1615,7 @@ mod tests {
         db.set_project_config(
             "[autoload]\nGame=\"*res://game.gd\"\n[debug]\ngdscript/warnings/integer_division=1\n",
         );
-        assert_eq!(observe_analyze_file(&db, file), 1);
+        assert_eq!(observe_analyze_file(&db, file), 2);
         assert_eq!(
             ANALYZE_OBSERVED.load(Ordering::SeqCst),
             runs,

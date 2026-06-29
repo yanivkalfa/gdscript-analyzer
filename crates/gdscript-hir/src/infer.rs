@@ -270,6 +270,43 @@ pub fn infer(
         }
     }
 
+    // UNTYPED_DECLARATION / INFERRED_DECLARATION — the opt-in declaration-strictness codes (default
+    // IGNORE; promoted to WARN under a strict / standalone run). Driven directly by the binding flags:
+    // a `var` declared with `:=` is INFERRED_DECLARATION; a `var` / parameter with neither a `: T`
+    // annotation nor `:=` is UNTYPED_DECLARATION. `const` (its value type is always statically known),
+    // `for` vars, and pattern binds (fixed by the iterable / scrutinee, not user-typeable) are excluded
+    // — they can't carry the static type Godot's strict check expects.
+    if is_func_body {
+        let decl_strictness: Vec<(TextRange, WarningCode, String)> = cx
+            .bindings
+            .iter()
+            .filter_map(|b| match b.kind {
+                BindingKind::Param if !b.annotated => Some((
+                    b.name_range,
+                    WarningCode::UntypedDeclaration,
+                    format!("The parameter \"{}\" has no static type.", b.name),
+                )),
+                BindingKind::Var if !b.is_const && b.inferred_colon_eq => Some((
+                    b.name_range,
+                    WarningCode::InferredDeclaration,
+                    format!(
+                        "The variable \"{}\" uses inferred typing (`:=`); consider declaring its type explicitly.",
+                        b.name
+                    ),
+                )),
+                BindingKind::Var if !b.is_const && !b.annotated => Some((
+                    b.name_range,
+                    WarningCode::UntypedDeclaration,
+                    format!("The variable \"{}\" has no static type.", b.name),
+                )),
+                _ => None,
+            })
+            .collect();
+        for (range, code, msg) in decl_strictness {
+            cx.warn(range, code, msg);
+        }
+    }
+
     // UNREACHABLE_CODE — statements after a return/break/continue / exhaustive branch (Workstream 2).
     let unreachable = cx.flow.unreachable_ranges(body);
     for range in unreachable {
@@ -2640,12 +2677,19 @@ mod tests {
     /// Every code inference produced — the ungated `diagnostics` plus the severity-free
     /// `raw_warnings` (the gateable Godot codes, post-W1-M0). Infer-level tests assert what the
     /// checker *records*; the gate-level resolution is tested in `crate::warnings`.
+    /// The opt-in declaration-strictness codes — filtered out of [`codes`] / [`file_codes`] so they
+    /// don't pollute the hundreds of focused fixtures (they fire on essentially every untyped /
+    /// inferred local). A test that targets them reads the raw warnings directly (see
+    /// `untyped_and_inferred_declarations_warn`).
+    const DECLARATION_STRICTNESS: &[&str] = &["UNTYPED_DECLARATION", "INFERRED_DECLARATION"];
+
     fn codes(h: &Harness) -> Vec<&str> {
         h.result
             .diagnostics
             .iter()
             .map(|d| d.code.as_str())
             .chain(h.result.raw_warnings.iter().map(|w| w.code.as_str()))
+            .filter(|c| !DECLARATION_STRICTNESS.contains(c))
             .collect()
     }
 
@@ -2661,6 +2705,7 @@ mod tests {
             .iter()
             .map(|d| d.code.clone())
             .chain(fi.raw_warnings.iter().map(|w| w.code.as_str().to_owned()))
+            .filter(|c| !DECLARATION_STRICTNESS.contains(&c.as_str()))
             .collect()
     }
 
@@ -2829,6 +2874,24 @@ mod tests {
             "{:?}",
             codes(&h)
         );
+    }
+
+    #[test]
+    fn untyped_and_inferred_declarations_warn() {
+        // The opt-in (default IGNORE) declaration-strictness codes, read from the raw warnings —
+        // `codes()` filters them out so they don't pollute every other fixture.
+        let h = infer_first_func("func f(p):\n\tvar a = 1\n\tvar b := 2\n\tvar c: int = 3\n");
+        let raw: Vec<&str> = h
+            .result
+            .raw_warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect();
+        // The untyped param `p` and untyped `var a` — not the typed `var c` nor the inferred `var b`.
+        let untyped = raw.iter().filter(|c| **c == "UNTYPED_DECLARATION").count();
+        assert_eq!(untyped, 2, "only `p` and `a` are untyped: {raw:?}");
+        let inferred = raw.iter().filter(|c| **c == "INFERRED_DECLARATION").count();
+        assert_eq!(inferred, 1, "only `b` uses `:=`: {raw:?}");
     }
 
     #[test]
