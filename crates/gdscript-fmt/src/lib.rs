@@ -339,6 +339,7 @@ fn strip_outer_parens(source: &str) -> Option<String> {
     }
     let mut dels: Vec<usize> = Vec::new(); // byte offsets of `(`/`)` tokens to delete (1 byte each)
     collect_redundant_parens(&parse.syntax_node(), &mut dels);
+    collect_empty_signal_parens(&parse.syntax_node(), &mut dels);
     if dels.is_empty() {
         return None;
     }
@@ -388,6 +389,27 @@ fn collect_redundant_parens(node: &gdscript_syntax::GdNode, dels: &mut Vec<usize
             }
         }
         collect_redundant_parens(child, dels);
+    }
+}
+
+/// Collect the `(`/`)` of a signal's *empty* parameter list — gdformat writes `signal s` not
+/// `signal s()`. (A `func` always keeps its `()`, so this is restricted to signals.)
+fn collect_empty_signal_parens(node: &gdscript_syntax::GdNode, dels: &mut Vec<usize>) {
+    use cstree::util::NodeOrToken;
+    for child in node.children() {
+        let empty_params = (child.kind() == SyntaxKind::SignalDecl)
+            .then(|| child.children().find(|c| c.kind() == SyntaxKind::ParamList))
+            .flatten()
+            .filter(|p| p.children().next().is_none());
+        if let Some(params) = empty_params {
+            for c in params.children_with_tokens() {
+                let NodeOrToken::Token(t) = c else { continue };
+                if matches!(t.kind(), SyntaxKind::LParen | SyntaxKind::RParen) {
+                    dels.push(usize::from(t.text_range().start()));
+                }
+            }
+        }
+        collect_empty_signal_parens(child, dels);
     }
 }
 
@@ -2247,6 +2269,11 @@ fn emit_tree_events(node: &gdscript_syntax::GdNode, out: &mut Vec<TreeEvent>) {
     out.push(TreeEvent::Open(node.kind()));
     for child in node.children_with_tokens() {
         match child {
+            // An *empty* parameter list carries no meaning — `signal s()` ≡ `signal s` (a func always
+            // has `()`, so dropping the empty list uniformly leaves func headers unaffected). Skipping
+            // it here lets the formatter remove a signal's empty `()` without the net objecting.
+            NodeOrToken::Node(n)
+                if n.kind() == SyntaxKind::ParamList && n.children().next().is_none() => {}
             NodeOrToken::Node(n) => emit_tree_events(n, out),
             NodeOrToken::Token(t) => {
                 let kind = t.kind();
@@ -3086,6 +3113,14 @@ mod tests {
         // precedence parens kept; an expr-statement assignment RHS keeps its parens (gdformat does too)
         assert_eq!(fmt("var a = (b + c) * d\n"), "var a = (b + c) * d\n");
         assert_eq!(fmt("func f():\n\tx = (y)\n"), "func f():\n\tx = (y)\n");
+    }
+
+    #[test]
+    fn empty_signal_parens_are_removed() {
+        // gdformat writes `signal s` not `signal s()`; a signal with parameters keeps its list.
+        assert_eq!(fmt("signal done()\n"), "signal done\n");
+        assert_eq!(fmt("signal hit(x, y)\n"), "signal hit(x, y)\n");
+        assert_eq!(fmt("signal a\n"), "signal a\n");
     }
 
     #[test]
