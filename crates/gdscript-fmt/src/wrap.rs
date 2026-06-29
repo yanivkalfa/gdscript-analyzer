@@ -837,7 +837,10 @@ fn format_foldable(
     prefix: &str,
     suffix: &str,
 ) -> Option<Vec<String>> {
-    if forcing_multiline(node) {
+    // A *standalone* comment inside `node` forces it (and every enclosing construct) multi-line — a
+    // single-line render would have nowhere to put it (gdformat's `_has_standalone_comments`). An
+    // inline comment that merely trails the construct does not force it.
+    if forcing_multiline(node) || node_has_standalone_comment(node, &w.src) {
         return explode(w, node, indent, prefix, suffix);
     }
     let line = single_line(w, node, indent, prefix, suffix)?;
@@ -868,6 +871,24 @@ fn forcing_multiline(node: &GdNode) -> bool {
 /// Whether `node`'s subtree contains a lambda (gdformat's `expression_contains_lambda`).
 fn node_contains_lambda(node: &GdNode) -> bool {
     node.kind() == S::LambdaExpr || node.children().any(node_contains_lambda)
+}
+
+/// Whether `node` has a *standalone* comment strictly *inside* its code span — one that begins its
+/// source line (only whitespace precedes it) and sits between the node's first and last significant
+/// tokens. gdformat forces a construct multi-line for such an interior comment, but a comment that
+/// merely leads the node (a sibling's standalone comment) or trails it does not force *this* node.
+fn node_has_standalone_comment(node: &GdNode, src: &str) -> bool {
+    let Some((cs, ce)) = code_span(node) else {
+        return false;
+    };
+    let mut comments = Vec::new();
+    comment_tokens(node, src, &mut comments);
+    comments.iter().any(|&(off, _, _)| {
+        cs < off && off < ce && {
+            let line_start = src[..off].rfind('\n').map_or(0, |i| i + 1);
+            src[line_start..off].trim().is_empty()
+        }
+    })
 }
 
 /// A lambda body forces multiple lines: more than one statement, or a single compound statement.
@@ -1399,12 +1420,13 @@ fn format_comma_list(
 ) -> Option<Vec<String>> {
     let elems = list_elements(list_node);
     let magic = has_trailing_comma(list_node);
+    let lc = collect_list_comments(list_node, &w.src, &elems);
     let mut out = vec![format!("{}{}", w.indent(indent), prefix)];
     let child = indent + 1;
-    // Compact: all elements on one continuation line, if they fit and there's no magic comma. When an
-    // element cannot render inline (a multi-line lambda body), the compact form is simply unavailable —
-    // fall through to the exploded form rather than abandoning the whole wrap.
-    let compact = (!magic && !elems.iter().any(forcing_multiline))
+    // Compact: all elements on one continuation line, if they fit, no magic comma, and no comment to
+    // place (a comment cannot sit on a compact line). When an element cannot render inline (a
+    // multi-line lambda body), the compact form is unavailable — fall through to the exploded form.
+    let compact = (!magic && !lc.any() && !elems.iter().any(forcing_multiline))
         .then(|| {
             elems
                 .iter()
@@ -1420,14 +1442,109 @@ fn format_comma_list(
         out.push(format!("{}{}", w.indent(indent), suffix));
         return Some(out);
     }
-    // Exploded: one element per line.
+    // A comment trailing the open bracket (`[  # …`) sits on the open line.
+    if let Some(c) = &lc.after_open {
+        let last = out.last_mut()?;
+        last.push_str("  ");
+        last.push_str(c);
+    }
+    // Exploded: one element per line, with its surrounding comments.
     let n = elems.len();
     for (i, e) in elems.iter().enumerate() {
+        for c in &lc.before[i] {
+            out.push(format!("{}{c}", w.indent(child)));
+        }
         let elem_suffix = if i + 1 < n || magic { "," } else { "" };
-        out.extend(format_expression(w, e, child, "", elem_suffix)?);
+        let mut lines = format_expression(w, e, child, "", elem_suffix)?;
+        if let Some(c) = &lc.trailing[i] {
+            let last = lines.last_mut()?;
+            last.push_str("  ");
+            last.push_str(c);
+        }
+        out.append(&mut lines);
+    }
+    for c in &lc.tail {
+        out.push(format!("{}{c}", w.indent(child)));
     }
     out.push(format!("{}{}", w.indent(indent), suffix));
     Some(out)
+}
+
+/// The comments inside a bracket list, partitioned for re-emission around its elements.
+struct ListComments {
+    /// A comment trailing the open bracket (`[  # …`).
+    after_open: Option<String>,
+    /// `before[i]` — standalone comment lines that precede element `i`.
+    before: Vec<Vec<String>>,
+    /// `trailing[i]` — an inline comment that trails element `i` on the same source line.
+    trailing: Vec<Option<String>>,
+    /// Standalone comment lines after the last element, before the close bracket.
+    tail: Vec<String>,
+}
+
+impl ListComments {
+    fn any(&self) -> bool {
+        self.after_open.is_some()
+            || self.before.iter().any(|v| !v.is_empty())
+            || self.trailing.iter().any(Option::is_some)
+            || !self.tail.is_empty()
+    }
+}
+
+/// Partition a bracket list's comments into open-bracket / per-element leading / trailing / tail
+/// buckets. A comment inside an element's own code span is left to that element's recursive
+/// formatting (a nested list / lambda) or to the meaning net (an in-leaf comment → verbatim).
+fn collect_list_comments(list_node: &GdNode, src: &str, elems: &[GdNode]) -> ListComments {
+    let n = elems.len();
+    let mut lc = ListComments {
+        after_open: None,
+        before: vec![Vec::new(); n],
+        trailing: vec![None; n],
+        tail: Vec::new(),
+    };
+    let Some((open_off, _)) = code_span(list_node) else {
+        return lc;
+    };
+    let open_line = line_of(src, open_off);
+    let spans: Vec<Option<(usize, usize)>> = elems.iter().map(code_span).collect();
+    let first_start = spans.iter().flatten().map(|&(cs, _)| cs).min();
+    let mut comments = Vec::new();
+    comment_tokens(list_node, src, &mut comments);
+    for (off, line, text) in comments {
+        if spans
+            .iter()
+            .flatten()
+            .any(|&(cs, ce)| cs <= off && off < ce)
+        {
+            continue; // inside an element — handled by its own recursion
+        }
+        // A comment on the open-bracket line, before the first element, trails the open bracket.
+        if line == open_line && first_start.is_none_or(|fs| off < fs) {
+            lc.after_open = Some(text);
+            continue;
+        }
+        // The last element whose code ends before this comment, if on the same source line → trail.
+        let prev = spans
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, s)| s.filter(|&(_, ce)| ce <= off).map(|(_, ce)| (i, ce)));
+        if let Some((i, _)) = prev.filter(|&(_, ce)| line_of(src, ce.saturating_sub(1)) == line) {
+            lc.trailing[i] = Some(text);
+            continue;
+        }
+        // A standalone comment after a lambda argument belongs to the lambda *body* (gdformat indents
+        // it at the body, not the arg list). Rather than mis-place it, omit it — the comment-multiset
+        // net then falls back to the verbatim statement, which has it exactly right.
+        if prev.is_some_and(|(i, _)| node_contains_lambda(&elems[i])) {
+            continue;
+        }
+        match spans.iter().position(|s| s.is_some_and(|(cs, _)| cs > off)) {
+            Some(nx) => lc.before[nx].push(text),
+            None => lc.tail.push(text),
+        }
+    }
+    lc
 }
 
 /// The element expression nodes of a bracket list (args / array / dict entries / params).

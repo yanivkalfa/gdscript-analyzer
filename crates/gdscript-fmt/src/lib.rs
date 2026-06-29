@@ -3551,6 +3551,21 @@ mod tests {
     }
 
     #[test]
+    fn comments_in_a_collection_are_threaded_through() {
+        // A bracket list carries its comments when it explodes: one trailing the open bracket, one
+        // trailing an element, and a standalone one keeping its own line — all at the element indent.
+        assert_eq!(
+            fmt("var x = [  # head\n\t1,  # one\n\t# mid\n\t2,\n]\n"),
+            "var x = [  # head\n\t1,  # one\n\t# mid\n\t2,\n]\n"
+        );
+        // a standalone comment forces the collection multi-line even when it would otherwise fit
+        let out = fmt("var d = {\n\t# note\n\t\"a\": 1,\n}\n");
+        assert!(out.contains("\t# note\n\t\"a\": 1,"), "{out:?}");
+        assert!(parses_clean(&out), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn semicolons_inside_lambda_body_expand_at_correct_depth() {
         // A multi-line lambda body's `;`-separated statements expand one-per-line at the body depth
         // (the lambda's block counts as a depth increment even though its own body is not split inline).
