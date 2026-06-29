@@ -484,6 +484,45 @@ mod tests {
     }
 
     #[test]
+    fn multi_scene_node_path_unions_to_the_common_base() {
+        // main.gd attaches to a.tscn (`$Btn`: HBoxContainer) AND b.tscn (`$Btn`: VBoxContainer). The
+        // path unions to the common base BoxContainer (both extend it) — not the first scene's type.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Btn\" type=\"HBoxContainer\" parent=\".\"]\n",
+        );
+        change.set_file_path(FileId(0), "res://a.tscn");
+        change.change_file(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Btn\" type=\"VBoxContainer\" parent=\".\"]\n",
+        );
+        change.set_file_path(FileId(2), "res://b.tscn");
+        change.change_file(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar b := $Btn\n\tb.queue_free()\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("BoxContainer")),
+            "expected the common base `: BoxContainer` of HBox/VBoxContainer, got {hints:?}",
+        );
+    }
+
+    #[test]
     fn non_singleton_autoload_resolves_via_root_path() {
         // A non-`*` autoload is loaded-but-not-global: unreachable by bare name, but reachable via
         // the absolute `get_node("/root/Name")` path. `.volume()` must resolve through its script.

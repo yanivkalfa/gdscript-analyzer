@@ -1731,6 +1731,13 @@ impl Cx<'_> {
         let Some(ctx) = self.owning_scene() else {
             return fallback; // no scene attaches this script (dynamic UI / single-file)
         };
+        // Multi-scene attachment (M2 §6.3): a `$Path` may resolve to a different node type in each
+        // attaching scene, so type it as the COMMON BASE across all of them (never the first-scene
+        // type, which could be wrong for another scene). If any scene can't resolve it identically,
+        // degrade to `Node` — never a false positive and never a false `INVALID_NODE_PATH`.
+        if ctx.ambiguous {
+            return self.union_node_ty(path, unique).unwrap_or(fallback);
+        }
         let resolution = if unique {
             ctx.model.classify_unique(path)
         } else {
@@ -1742,7 +1749,7 @@ impl Cx<'_> {
                 .node(idx)
                 .and_then(|n| self.scene_node_ty(&ctx.model, n, 0))
                 .unwrap_or(fallback),
-            R::Missing if !ctx.ambiguous => {
+            R::Missing => {
                 let what = if unique { "unique name" } else { "node path" };
                 let sigil = if unique { "%" } else { "$" };
                 self.emit(
@@ -1768,9 +1775,63 @@ impl Cx<'_> {
                     })
                     .unwrap_or(fallback)
             }
-            // ambiguous miss / escape (`..`/absolute) → `Node`, never a false warning
-            _ => fallback,
+            // An `..`/absolute escape out of the slice → `Node`, never a false warning.
+            R::Escaped => fallback,
         }
+    }
+
+    /// Union-type a `$Path`/`%Unique` across **every** scene that attaches this script (the rare
+    /// multi-scene case): resolve the path in each scene, then take the COMMON BASE of the per-scene
+    /// node types. `None` (→ caller degrades to `Node`) if any scene fails to resolve the path the
+    /// same way — keeping the no-false-positive contract on an ambiguous attachment.
+    fn union_node_ty(&self, path: &str, unique: bool) -> Option<Ty> {
+        use gdscript_scene::NodePathResolution as R;
+        let res_path = self.self_res_path()?;
+        let root = self.db.source_root()?;
+        let attaches = crate::queries::script_scene_attachments(self.db, root)
+            .get(res_path.as_str())
+            .cloned()?;
+        let mut acc: Option<Ty> = None;
+        for (scene_file, attach) in &attaches {
+            let ft = self.db.file_text(*scene_file)?;
+            let model = crate::queries::scene_model(self.db, ft);
+            let resolution = if unique {
+                model.classify_unique(path)
+            } else {
+                model.classify_path_from(*attach, path)
+            };
+            let R::Resolved(idx) = resolution else {
+                return None; // a miss / escape / into-instance in some scene → bail to `Node`
+            };
+            let ty = model
+                .node(idx)
+                .and_then(|n| self.scene_node_ty(&model, n, 0))?;
+            acc = Some(match acc {
+                None => ty,
+                Some(prev) => self.common_base(&prev, &ty),
+            });
+        }
+        acc
+    }
+
+    /// The common base of two scene-node types — the lowest engine class both descend from (walk
+    /// `a`'s ancestor chain, return the first that `b` is a subclass of). Identical types collapse to
+    /// themselves; a `ScriptRef` or any mixed pair degrades to the `Node` floor (the engine base for
+    /// every scene node), which is always a sound supertype.
+    fn common_base(&self, a: &Ty, b: &Ty) -> Ty {
+        if a == b {
+            return a.clone();
+        }
+        if let (Ty::Object(ca), Ty::Object(cb)) = (a, b) {
+            let mut cur = Some(*ca);
+            while let Some(c) = cur {
+                if self.api.is_subclass(*cb, c) {
+                    return Ty::Object(c);
+                }
+                cur = self.api.class(c).base;
+            }
+        }
+        self.node_ty()
     }
 
     /// Resolve an absolute `/root/<Autoload>` node path to the autoload's type (singleton or

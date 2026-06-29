@@ -426,6 +426,39 @@ pub fn script_scene_index(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolSt
     Arc::new(map)
 }
 
+/// **Every** scene that attaches the script at `res_path` — `(scene file, attach node)` pairs in
+/// scan order. Single-scene scripts have one entry; the rare multi-scene script has several (the
+/// basis for `$Path` **union typing**, M2 §6.3 — type a path as the common base across all scenes).
+/// Same firewall as [`script_scene_index`] (keyed on the scene texts, backdates across `.gd` edits).
+#[salsa::tracked]
+pub fn script_scene_attachments(
+    db: &dyn Db,
+    root: SourceRoot,
+) -> Arc<FxHashMap<SmolStr, Vec<(FileId, NodeIdx)>>> {
+    let mut map: FxHashMap<SmolStr, Vec<(FileId, NodeIdx)>> = FxHashMap::default();
+    for &file in root.files(db) {
+        if !file.res_path(db).as_deref().is_some_and(is_scene_path) {
+            continue;
+        }
+        let model = scene_model(db, file);
+        let scene = file.file_id(db);
+        for (i, node) in model.nodes.iter().enumerate() {
+            let Some(path) = node
+                .script
+                .as_ref()
+                .and_then(|id| model.ext_resources.get(id))
+                .and_then(|e| e.path.clone())
+            else {
+                continue;
+            };
+            map.entry(path)
+                .or_default()
+                .push((scene, NodeIdx(u32::try_from(i).unwrap_or(u32::MAX))));
+        }
+    }
+    Arc::new(map)
+}
+
 /// The owning-scene context for the script in `file` (M1): the scene's [`FileId`], the parsed
 /// scene, and the attach node, so `$Path`/`%Unique`/`get_node("…")` can resolve (and go-to-def can
 /// jump into the `.tscn`). `None` when the project has no scene attaching this script (the

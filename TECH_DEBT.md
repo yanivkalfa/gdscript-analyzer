@@ -104,9 +104,13 @@ the resolved type automatically. Validated: `xtask ci` green + 7 new typing test
 end-to-end inlay test.
 
 **M1 deferrals (→ M2+):**
-- [ ] **1-script-many-scenes = first scene wins** for *typing*. `script_scene_index` keeps the first
-      attaching scene (now also flagging the attachment `ambiguous`, which M2 uses to suppress false
-      `INVALID_NODE_PATH`); the common-base union *typing* policy (Playbook §6.3) is later.
+- [x] **1-script-many-scenes union typing → DONE (burndown Stage 4).** A `$Path`/`%Unique` in a
+      script attached to >1 scene now types as the **common base** across every attaching scene (new
+      `script_scene_attachments` query → resolve the path in each scene → `union_node_ty` folds the
+      per-scene node types via `common_base`, the engine-hierarchy LCA), not the first-scene type. If
+      any scene resolves it differently (miss / escape / into-instance) it degrades to `Node` — keeping
+      the no-false-positive contract. (E.g. `$Btn` = HBoxContainer in one scene + VBoxContainer in
+      another → `BoxContainer`.)
 - [x] **`.tscn`-autoload sharpening — DONE (post-LSP tech-debt pass).** A `*`-autoload pointing at a
       `.tscn` now resolves to the scene root's **attached-script `ScriptRef`** (`resolve_scene_autoload`
       in `resolve.rs`, reusing `scene_model` + `res_path_registry`), so `Music.play()` checks the real
