@@ -2128,6 +2128,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn override_child_under_an_instance_types_from_the_subscene() {
+        // The "hard tail" (burndown Stage 4.23): main.tscn instances enemy.tscn at `Enemy` AND adds
+        // an OVERRIDE child `[node name="Sprite" parent="Enemy"]` — a node with no own
+        // `type=`/script/instance (it only carries property overrides). It RESOLVES to that outer
+        // node (not IntoInstance), which used to floor to bare `Node`; now its type is taken from the
+        // same-pathed node inside the instanced sub-scene → `Sprite2D`.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://enemy.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Enemy\" parent=\".\" instance=ExtResource(\"2\")]\n\
+             [node name=\"Sprite\" parent=\"Enemy\"]\n\
+             modulate = Color(1, 0, 0, 1)\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar s := $Enemy/Sprite\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_file_text(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [node name=\"Enemy\" type=\"Node2D\"]\n\
+             [node name=\"Sprite\" type=\"Sprite2D\" parent=\".\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://enemy.tscn");
+        db.sync_source_root();
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Sprite2D"),
+            "an override child under an instance types from the sub-scene (Sprite2D), got: {:?}",
+            binding_labels(&db),
+        );
+    }
+
     // ---- Phase-4 hunt fixes: `%`-segment paths (no false INVALID_NODE_PATH) ----------------
 
     #[test]

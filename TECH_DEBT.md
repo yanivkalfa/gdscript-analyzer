@@ -159,9 +159,14 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       `SceneModel::resolve_into_instance` returns `(instance_node, tail)` at the boundary and
       `infer::resolve_into_instance_ty` walks the tail from the sub-scene's root, recursing through
       nested instance boundaries (depth-bounded ≤16). A genuinely-absent tail stays `Node` with no
-      false `INVALID_NODE_PATH`. An override child *under* an instance (mapping back into the
-      sub-scene tree) stays `Node` — the rare remaining tail. Test:
-      `path_into_an_instanced_subscene_types_the_inner_node`.
+      false `INVALID_NODE_PATH`. **The override-child tail → DONE (burndown Stage 4.23):** an override
+      child *under* an instance (`[node name="Sprite" parent="Enemy"]` over an instanced `enemy.tscn` —
+      a node with no own `type=`/script/instance that *resolves* in the outer scene but used to floor to
+      bare `Node`) is now typed from the same-pathed node inside the sub-scene. `infer::override_child_ty`
+      walks up to the nearest instance-boundary ancestor and re-uses `resolve_into_instance_ty` on the
+      relative path (depth-bounded; `None` → the `Node` floor when not under an instance, so no
+      regression). Tests: `path_into_an_instanced_subscene_types_the_inner_node`,
+      `override_child_under_an_instance_types_from_the_subscene`.
 - [x] **`self.get_node("…")` — DONE (post-LSP tech-debt pass).** Explicit `self.get_node("…")` now
       types like the bare form (`self` = the attach node). A *foreign* `obj.get_node("…")` stays a
       normal call → `Node` (correct — its path is relative to a node we can't resolve here).

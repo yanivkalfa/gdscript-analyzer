@@ -1883,6 +1883,37 @@ impl Cx<'_> {
             }
         }
         self.instance_root_ty(scene, node, depth)
+            .or_else(|| self.override_child_ty(scene, node, depth))
+    }
+
+    /// An **override child** *under* an instance: a node added/overridden in the outer scene beneath
+    /// an `instance=` boundary (`[node name="Sprite" parent="Enemy"]` over an instanced `enemy.tscn`),
+    /// carrying no own `type=`/`script`/`instance=` — so its real type lives in the instanced
+    /// sub-scene. Walk up to the nearest instance-boundary ancestor, then type the node by its same
+    /// path *inside* that sub-scene (so the outer override of `enemy.tscn`'s `Sprite` types as the
+    /// sub-scene's `Sprite`, not bare `Node`). `None` if the node is not under an instance (the
+    /// caller then floors to `Node`, unchanged). Depth-bounded against an instancing cycle.
+    fn override_child_ty(&self, scene: &SceneModel, node: &SceneNode, depth: u32) -> Option<Ty> {
+        if depth >= 16 {
+            return None;
+        }
+        let mut segs_rev: Vec<String> = vec![node.name.to_string()];
+        let mut parent_idx = node.parent_idx?;
+        let mut guard = 0u32;
+        loop {
+            let parent = scene.node(parent_idx)?;
+            if parent.instance.is_some() {
+                segs_rev.reverse();
+                let rel = segs_rev.join("/");
+                return self.resolve_into_instance_ty(scene, parent, &rel, depth + 1);
+            }
+            segs_rev.push(parent.name.to_string());
+            parent_idx = parent.parent_idx?;
+            guard += 1;
+            if guard > 4096 {
+                return None;
+            }
+        }
     }
 
     /// An instanced node (`instance=ExtResource(id)`) takes the type of the instanced sub-scene's
