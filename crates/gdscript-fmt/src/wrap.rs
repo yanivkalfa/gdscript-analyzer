@@ -141,25 +141,37 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
             leading_keyword(body),
             "if" | "elif" | "else" | "for" | "while" | "match" | "func" | "class"
         );
-    let stmt = if class_level {
-        let src = if block_header {
+    let parse = if class_level {
+        gdscript_syntax::parse(&if block_header {
             format!("{body}\n\tpass\n")
         } else {
             format!("{body}\n")
-        };
-        let parse = gdscript_syntax::parse(&src);
-        find_statement(&parse.syntax_node())?
+        })
     } else {
         // Wrap in a function so the statement parses; its own block header gets a nested `pass`.
-        let src = if block_header {
+        gdscript_syntax::parse(&if block_header {
             format!("func __():\n\t{body}\n\t\tpass\n")
         } else {
             format!("func __():\n\t{body}\n")
-        };
-        let parse = gdscript_syntax::parse(&src);
-        first_block_statement(&parse.syntax_node())?
+        })
     };
-    let lines = format_statement(&w, &stmt, indent)?;
+    let root = parse.syntax_node();
+    let container = if class_level {
+        root.clone()
+    } else {
+        let func = root.children().find(|c| c.kind() == S::FuncDecl)?;
+        func.children().find(|c| c.kind() == S::Block)?.clone()
+    };
+    // Collect any leading prefix annotations (`@onready var x = …`) — they prepend to the underlying
+    // statement's first line, exactly as gdformat does.
+    let (anns, stmt) = find_statement_with_anns(&container)?;
+    let mut lines = format_statement(&w, &stmt, indent)?;
+    if !anns.is_empty() {
+        let prefix = anns.iter().map(node_text).collect::<Vec<_>>().join(" ");
+        let first = &lines[0];
+        let lead = first.len() - first.trim_start().len();
+        lines[0] = format!("{}{} {}", &first[..lead], prefix, &first[lead..]);
+    }
     // The CST path owns only *multi-line* layout. A single-line result means the statement fits as-is;
     // we delegate it to the caller's flat path, which re-emits the body's already-correct spacing
     // verbatim (our `expr_to_str` is for the inline parts of a wrap, not a spacing oracle).
@@ -234,30 +246,20 @@ fn starts_with_class_keyword(body: &str) -> bool {
         )
 }
 
-/// The first handleable statement directly inside the (synthetic) function's block.
-fn first_block_statement(root: &GdNode) -> Option<GdNode> {
-    let func = root.children().find(|c| c.kind() == S::FuncDecl)?;
-    let block = func.children().find(|c| c.kind() == S::Block)?;
-    block
-        .children()
-        .find(|c| is_statement_kind(c.kind()))
-        .cloned()
-}
-
-/// Find the single statement/declaration node to format (the outermost handleable node, pre-order).
-fn find_statement(root: &GdNode) -> Option<GdNode> {
-    fn walk(node: &GdNode) -> Option<GdNode> {
-        if is_statement_kind(node.kind()) {
-            return Some(node.clone());
+/// Within `container` (the source file or a function's block), collect any leading *prefix*
+/// annotations (`@onready`, `@export(…)` — which prepend to the statement they decorate) and return
+/// them with the underlying statement. If only annotations are present (a standalone `@annotation`
+/// line), the last one is returned as the statement itself.
+fn find_statement_with_anns(container: &GdNode) -> Option<(Vec<GdNode>, GdNode)> {
+    let mut anns = Vec::new();
+    for c in container.children() {
+        if c.kind() == S::Annotation {
+            anns.push(c.clone());
+        } else if is_statement_kind(c.kind()) {
+            return Some((anns, c.clone()));
         }
-        for c in node.children() {
-            if let Some(found) = walk(c) {
-                return Some(found);
-            }
-        }
-        None
     }
-    walk(root)
+    anns.pop().map(|a| (Vec::new(), a))
 }
 
 fn is_statement_kind(k: S) -> bool {
