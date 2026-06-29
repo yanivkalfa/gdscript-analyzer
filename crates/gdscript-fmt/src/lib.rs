@@ -2750,6 +2750,18 @@ mod tests {
     }
 
     #[test]
+    fn dot_chain_with_lambda_wraps_bottom_up_not_leading_dot() {
+        // gdformat always bottom-ups a dot-chain that contains a lambda (a Godot-parser-bug
+        // workaround), even when a magic comma deep inside would otherwise force leading-dot.
+        let src = "func r():\n\treturn V.fc(Demo.render, {\"title\": \"a fairly long title here for the box widget yes\"}, [V.button({\"on_pressed\": func(): go()})])\n";
+        let out = fmt(src);
+        assert!(out.contains("\treturn V.fc("), "should bottom-up: {out:?}");
+        assert!(!out.contains(". fc"), "should not leading-dot: {out:?}");
+        assert!(parses_clean(&out), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn over_indented_lambda_in_brackets_does_not_corrupt() {
         // The exact corpus shapes (godot-demo-projects rhythm_game) that used to format to
         // non-parsing code: the lambda HEADER sits on its own bracket-continuation line at an

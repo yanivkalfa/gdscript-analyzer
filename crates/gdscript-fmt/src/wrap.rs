@@ -639,6 +639,11 @@ fn forcing_multiline(node: &GdNode) -> bool {
     has_trailing_comma(node) || node.children().any(forcing_multiline)
 }
 
+/// Whether `node`'s subtree contains a lambda (gdformat's `expression_contains_lambda`).
+fn node_contains_lambda(node: &GdNode) -> bool {
+    node.kind() == S::LambdaExpr || node.children().any(node_contains_lambda)
+}
+
 /// A lambda body forces multiple lines: more than one statement, or a single compound statement.
 fn lambda_forces_multiline(node: &GdNode) -> bool {
     let Some(block) = find_child(node, S::Block) else {
@@ -1256,11 +1261,16 @@ fn format_dot_chain(
     prefix: &str,
     suffix: &str,
 ) -> Option<Vec<String>> {
-    // A chain forced multi-line by a magic comma inside it goes straight to leading-dot (gdformat's
-    // `is_expression_forcing_multiple_lines` short-circuit) — bottom-up is only for length-driven wraps.
-    // Otherwise try bottom-up: only when the chain ends in a call or subscript (args to wrap).
-    let bottom_up = if !forcing_multiline(node) && matches!(node.kind(), S::CallExpr | S::IndexExpr)
-    {
+    // gdformat's `_format_dot_chain_to_multiple_lines` decision order:
+    //   1. a chain *containing a lambda* always wraps bottom-up (a Godot-parser-bug workaround) —
+    //      regardless of a magic comma deep inside it;
+    //   2. otherwise a chain forced multi-line by a magic comma goes straight to leading-dot;
+    //   3. otherwise try bottom-up, and keep it only if every line fits, else leading-dot.
+    // Bottom-up needs args to wrap, so it applies only when the chain ends in a call or subscript.
+    let endable = matches!(node.kind(), S::CallExpr | S::IndexExpr);
+    let bottom_up = if endable && node_contains_lambda(node) {
+        format_chain_bottom_up(w, node, indent, prefix, suffix)
+    } else if endable && !forcing_multiline(node) {
         format_chain_bottom_up(w, node, indent, prefix, suffix)
             .filter(|b| b.iter().all(|l| width(l) <= w.max))
     } else {
