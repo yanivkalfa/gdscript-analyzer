@@ -466,6 +466,35 @@ mod tests {
         node.kind() == kind || node.children().any(|c| contains_node(c, kind))
     }
 
+    #[test]
+    fn property_accessors_parse_cleanly() {
+        let indented = "var x: int:\n\tget:\n\t\treturn 1\n\tset(v):\n\t\tx = v\n";
+        round_trips(indented);
+        assert!(
+            parse(indented).errors().is_empty(),
+            "valid get/set accessors must not error: {:?}",
+            parse(indented).errors()
+        );
+        let inline = "var y: int : get = _get_y, set = _set_y\n";
+        round_trips(inline);
+        assert!(
+            parse(inline).errors().is_empty(),
+            "{:?}",
+            parse(inline).errors()
+        );
+    }
+
+    #[test]
+    fn a_non_get_set_accessor_keyword_is_a_parse_error() {
+        // Tightened: a property accessor keyword must be exactly `get` or `set` — `foo` is an error,
+        // not a silently-accepted setter.
+        let src = "var x: int:\n\tfoo:\n\t\treturn 1\n";
+        assert!(
+            !parse(src).errors().is_empty(),
+            "a non-get/set accessor must be a parse error"
+        );
+    }
+
     fn has_match_stmt(src: &str) -> bool {
         contains_node(&parse(src).syntax_node(), SyntaxKind::MatchStmt)
     }

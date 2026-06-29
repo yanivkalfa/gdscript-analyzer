@@ -216,8 +216,11 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       class-level ones (`@tool`/`@icon`/`@static_unload`/`@abstract`). `VarItem::is_exported` is now
       derived from them. `item_tree::has_annotation` is the accessor. (The CST still holds them as
       sibling nodes — losslessly — but consumers no longer re-walk siblings ad hoc.)
-- [ ] **Property accessor (`get`/`set`) parsing is permissive.** Inline and indented
-      forms are accepted loosely; tighten when accessor semantics matter (Phase 2).
+- [x] **Property accessor (`get`/`set`) parsing tightened → DONE (burndown Stage 2).** The accessor
+      keyword must now be exactly `get` or `set` — a different identifier (a typo) is a parse error
+      with recovery, not a silently-accepted setter; and only `set` consumes a `(value)` parameter (a
+      `get(x)` is rejected). Valid inline (`get = f, set = f`) and indented blocks are unchanged; corpus
+      (2d/3d/gui): 0 new `GDSCRIPT_SYNTAX`.
 - [x] **Soft-keyword identifiers — `match`/`when` supported.** Godot's `is_identifier()`
       whitelist is `match, when, PI, TAU, INF, NAN`; the parser now accepts `match`/`when`
       as names (declaration / parameter / identifier expression) and the full

@@ -416,20 +416,32 @@ impl Parser<'_> {
         self.close(m, PropertyBody);
     }
 
-    /// One `get`/`set` accessor (block or `= func` form).
+    /// One `get`/`set` accessor (an indented `:` block, or the inline `= func` form). Tightened: the
+    /// accessor keyword must be exactly `get` or `set` — a different identifier (a typo) is a parse
+    /// error, not a silently-accepted setter. A `get` takes no parameter; `set(value)` takes one.
     fn accessor(&mut self) {
-        let is_getter = self.cur_text() == "get";
+        let kind = match self.cur_text() {
+            "get" => Getter,
+            "set" => Setter,
+            // Recover by consuming the stray token so the accessor loop still makes progress.
+            _ => {
+                self.advance_with_error("expected `get` or `set` in a property accessor");
+                return;
+            }
+        };
         let m = self.open();
-        self.eat(Ident); // `get` / `set`
-        if self.at(LParen) {
-            self.param_list(); // `set(value)`
+        self.advance(); // `get` / `set`
+        // Only `set` carries a parameter (`set(value)`); a `get(x)` is rejected (the `(` is left for
+        // recovery — a `get` has no parameter list).
+        if kind == Setter && self.at(LParen) {
+            self.param_list();
         }
         if self.eat(Colon) {
             self.block();
         } else if self.eat(Eq) {
             self.expr();
         }
-        self.close(m, if is_getter { Getter } else { Setter });
+        self.close(m, kind);
     }
 
     // ---- statements & blocks --------------------------------------------------
