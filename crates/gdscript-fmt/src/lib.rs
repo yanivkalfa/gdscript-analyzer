@@ -2653,6 +2653,33 @@ mod tests {
     }
 
     #[test]
+    fn indexed_array_literal_explodes_the_array_keeps_index_on_close_line() {
+        // A subscript on a too-wide array literal (`[…][i]`): explode the ARRAY one element per line
+        // (with a trailing comma) and keep `[index]` compact on the close-bracket line — gdformat
+        // parity (the os_test.gd byte-exact miss, burndown Stage 6.29), NOT the reverse (a compact
+        // over-width array with the index dropped to its own line).
+        let src = "func f():\n\tvar x = [\"Landscape\", \"Portrait\", \"Landscape (reverse)\", \"Portrait (reverse)\", \"Defined by sensor\"][get_orientation()]\n";
+        let out = fmt(src);
+        // The array opens/explodes and the `[index]` stays compact on the close-bracket line.
+        assert!(
+            out.contains("var x = [\n"),
+            "the array must open/explode:\n{out}"
+        );
+        assert!(
+            out.contains("][get_orientation()]"),
+            "the index must stay on the close-bracket line:\n{out}"
+        );
+        // The OLD bug kept the array a compact over-width line and dropped the index onto its own
+        // line (`…"][` then a newline) — never again.
+        assert!(
+            !out.contains("][\n"),
+            "the index must not be exploded onto its own line:\n{out}"
+        );
+        assert!(super::same_significant_tokens(src, &out));
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn preserves_significant_tokens_including_strings() {
         let src = "func f():\n\tvar s = \"a + b\"\n\treturn s\n";
         let out = fmt(src);

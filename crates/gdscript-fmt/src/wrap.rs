@@ -1514,6 +1514,17 @@ fn format_index(
     if matches!(obj.kind(), S::FieldExpr | S::CallExpr | S::IndexExpr) {
         return format_dot_chain(w, node, indent, prefix, suffix);
     }
+    // A subscript on a COLLECTION LITERAL (`[…][i]`, `{…}[k]`): gdformat explodes the *collection*
+    // and keeps the `[index]` compact on its close-bracket line — not the reverse (exploding the
+    // index while the collection stays a too-wide single line). Fold the flat index into the suffix
+    // and let the collection's own wrapping place it (`format_paren_list` puts `close + suffix` on
+    // the close line, so the exploded array ends `][index]`). Falls through when the index can't be
+    // rendered flat (a multi-line index → the generic path below).
+    if matches!(obj.kind(), S::ArrayLit | S::DictLit)
+        && let Some(idx_str) = expr_to_str(w, idx)
+    {
+        return format_expression(w, obj, indent, prefix, &format!("[{idx_str}]{suffix}"));
+    }
     let obj_str = expr_to_str(w, obj)?;
     format_expression(
         w,
