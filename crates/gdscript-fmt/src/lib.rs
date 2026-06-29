@@ -262,21 +262,31 @@ fn collect_inline_splits(
     unit: &str,
     splits: &mut Vec<(usize, String)>,
 ) {
+    use SyntaxKind as S;
     for child in node.children() {
-        if child.kind() == SyntaxKind::Block {
-            // A lambda body stays inline; a real statement/declaration body splits when inline (its
-            // first token's preceding non-space char on the same line is the header's `:`).
-            let inline_body = (node.kind() != SyntaxKind::LambdaExpr)
-                .then(|| first_sig_offset(child))
-                .flatten()
-                .filter(|&bs| src[..bs].trim_end_matches([' ', '\t']).ends_with(':'));
+        // A suite-introducing child: a statement/declaration `Block` (but never a `LambdaExpr`'s,
+        // which stays inline) or a property body (`var x: T: set = f`). Its body splits onto its own
+        // indented line when it shares the header's line.
+        let suite =
+            matches!(child.kind(), S::Block | S::PropertyBody) && node.kind() != S::LambdaExpr;
+        if suite {
+            // The body offset: a `Block`'s first token, or — for a property body, whose own first
+            // token is the `:` — its first getter/setter node (the content after the `:`).
+            let body_offset = if child.kind() == S::PropertyBody {
+                child.children().next().and_then(first_sig_offset)
+            } else {
+                first_sig_offset(child)
+            };
+            let inline_body =
+                body_offset.filter(|&bs| src[..bs].trim_end_matches([' ', '\t']).ends_with(':'));
             if let Some(bs) = inline_body {
                 splits.push((bs, format!("\n{}", unit.repeat(depth + 1))));
             }
-            collect_inline_splits(child, src, depth + 1, unit, splits);
-        } else {
-            collect_inline_splits(child, src, depth, unit, splits);
         }
+        // A child is one indent level deeper when it is a suite, or a `match` arm (arms sit a level
+        // below the `match` with no intervening `Block` node).
+        let deeper = suite || (node.kind() == S::MatchStmt && child.kind() == S::MatchArm);
+        collect_inline_splits(child, src, depth + usize::from(deeper), unit, splits);
     }
 }
 
@@ -2931,6 +2941,25 @@ mod tests {
         assert_eq!(
             fmt("func h():\n\tvar a := func(): return 1\n"),
             "func h():\n\tvar a := func(): return 1\n"
+        );
+    }
+
+    #[test]
+    fn inline_match_arm_and_property_bodies_split() {
+        // A match arm sits one level below `match`, so its inline body splits to two deeper levels.
+        assert_eq!(
+            fmt("func f():\n\tmatch x:\n\t\t\"inc\": return state + 1\n"),
+            "func f():\n\tmatch x:\n\t\t\"inc\":\n\t\t\treturn state + 1\n"
+        );
+        // A property setter shorthand splits below the `var`.
+        assert_eq!(
+            fmt("var active: bool = false: set = set_active\n"),
+            "var active: bool = false:\n\tset = set_active\n"
+        );
+        // Inline getter/setter bodies split too.
+        assert_eq!(
+            fmt("var q: int = 0:\n\tget: return _q\n\tset(v): _q = v\n"),
+            "var q: int = 0:\n\tget:\n\t\treturn _q\n\tset(v):\n\t\t_q = v\n"
         );
     }
 
