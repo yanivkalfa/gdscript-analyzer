@@ -962,14 +962,24 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
           collection's **suffix** and lets the collection's own wrapping place it (`][index]` on the close
           line). **Corpus delta: 454 → 455, os_test.gd now byte-exact, 0 regressions.** Test:
           `indexed_array_literal_explodes_the_array_keeps_index_on_close_line`.
-        - [ ] **(a) `town_scene.gd` — redundant sub-expression parens in an operator chain.** gdformat
-          **keeps** the source parens in `(A) or (B)` (where each operand is an `and`-chain) and threads
-          the chain's standalone comments around them; our `strip_parens` removes the (precedence-
-          redundant) parens and re-wraps, so the comment placement + paren shape diverge. A fix must make
-          paren-stripping **operand-aware** — keep a redundant paren that wraps a tighter-precedence
-          operand of a looser chain — which is a behaviour change with corpus-wide regression risk
-          (paren-stripping + comment-threading, the two most regression-prone formatter subsystems —
-          same risk profile as the deferred trivia-attachment). Held to the gold-corpus delta gate below.
+        - [ ] **(a) `town_scene.gd` — a comment leading a parenthesized operand → DEFERRED with a
+          *corrected* characterization (burndown Stage 6.28 investigation).** The TECH_DEBT framing
+          ("make `strip_parens` operand-aware") was **wrong** — probing `gdformat 4.5.0` directly shows
+          our paren-*retention already matches it byte-for-byte*: `(a and b) or (c and d)` is kept by both
+          short **and** exploded (`(...)\n or (...)`), no strip-behaviour change is needed. The **sole**
+          remaining divergence is **comment placement**: in `if (\n #c\n A and B\n) or (\n #c\n C and D\n):`
+          gdformat *compacts* each operand to one line and *hoists* the interior leading comment to AFTER
+          that operand (`(A and B)` / `# c` / `or (C and D)`), whereas we conservatively preserve the
+          source's hand-wrapping (the comment stays inside the paren — `chain_standalone_comments` leaves
+          an in-operand-span comment to the operand's own formatting, which then can't compact). Hoisting a
+          comment *across the paren boundary* + letting the operand compact without it needs coordinated
+          edits to `forcing_multiline` + the comment de-dup, all in the **comment-threading net** — the
+          single most regression-prone formatter subsystem (the very risk the user chose to avoid by
+          keeping trivia-attachment deferred). For **one** cosmetic file where our output is already valid,
+          meaning-preserving, and comment-complete, that trade is "harms more than helps." A reproducible
+          **gdformat gold-corpus differential** was built for the burndown (gdformat over godot-demo-projects
+          → gold; our CLI `format` per file; EOL-normalised byte-compare with an improved/regressed delta)
+          — it confirmed the 6.29 fix clean and is the gate any future attempt at (a) must pass.
 - [ ] **W4 — perf infra tail.** Landed: a warm-keystroke incremental bench (`crates/gdscript-ide/benches/analysis.rs`, ~2ms for ~300 loc — confirms the W1 gate-downstream + W2 flow-inside-`analyze_file` keep incrementality flat). Deferred: a tiered `fixtures/perf/{small,medium,large}` vendored corpus + project-scale cold bench; a **CI bench-regression gate** (CodSpeed / Bencher — needs the CI service + a baseline); `dhat` memory profiling + a documented resident ceiling; a salsa-LRU for cold-file derived data (measure first — only if `flow`/`infer` recompute shows hot); the `wasm-opt -Oz` + twiggy wasm-size CI guard (overlaps §1, needs `wasm-pack` on CI).
 - [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
 - [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
