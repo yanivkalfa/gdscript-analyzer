@@ -786,6 +786,12 @@ struct Unit {
     /// not force blank lines around such a comment (e.g. a trailing `#endregion`), and it is
     /// transparent to the surrounding defs' blank-line spacing.
     is_comment: bool,
+    /// The unit is a definition reached through an **annotation** prefix (`@rpc func …`). gdformat
+    /// forces blanks before such a unit only when the *previous* sibling was itself a def — not on the
+    /// unit's own def-ness (the annotation line, not the def, owns the leading blanks, and an
+    /// annotation is absent from the surrounding-empty-lines table). A *comment*-prefixed def forces
+    /// like a plain def.
+    ann_prefixed: bool,
 }
 
 /// Classify the statement line whose first significant-or-comment token is `toks[start]`. Scans the
@@ -974,6 +980,7 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
                     depth: h.depth,
                     is_def: heads[j].role == LineRole::Def,
                     is_comment: false,
+                    ann_prefixed: h.role == LineRole::Annotation,
                 });
                 i = j + 1;
             } else {
@@ -984,6 +991,7 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
                         depth: h.depth,
                         is_def: false,
                         is_comment: h.role == LineRole::Comment,
+                        ann_prefixed: false,
                     });
                 }
                 i = j;
@@ -994,6 +1002,7 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
                 depth: h.depth,
                 is_def: h.role == LineRole::Def,
                 is_comment: false,
+                ann_prefixed: false,
             });
             i += 1;
         }
@@ -1014,7 +1023,14 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
         // gdformat's end-of-block reconstruction. A standalone comment *between* statements still
         // resets def-adjacency (a following statement's spacing is measured from it, not the def above).
         let trailing_comment = u.is_comment && units.get(k + 1).is_none_or(|nx| nx.depth < u.depth);
-        if !trailing_comment && !first_in_block && (u.is_def || prev == Some(true)) {
+        // An annotation-prefixed def forces blanks only after a previous def; a plain or
+        // comment-prefixed def also forces on its own def-ness.
+        let needs = if u.ann_prefixed {
+            prev == Some(true)
+        } else {
+            u.is_def || prev == Some(true)
+        };
+        if !trailing_comment && !first_in_block && needs {
             required.insert(u.head_line, n);
         }
         last_is_def[u.depth] = Some(u.is_def);
@@ -2811,6 +2827,24 @@ mod tests {
         assert_eq!(fmt(src), src);
         let src2 = "#region Section\nvar a = 1\nvar b = 2\n#endregion\n";
         assert_eq!(fmt(src2), src2);
+    }
+
+    #[test]
+    fn annotation_prefixed_def_forces_blanks_only_after_a_def() {
+        // An `@rpc func` after a non-def (`extends`/`var`) keeps its source blanks; after a def it gets
+        // the usual 2; a plain func always forces 2.
+        assert_eq!(
+            fmt("extends Node\n\n@rpc(\"x\")\nfunc f():\n\tpass\n"),
+            "extends Node\n\n@rpc(\"x\")\nfunc f():\n\tpass\n"
+        );
+        assert_eq!(
+            fmt("func a():\n\tpass\n@rpc(\"x\")\nfunc b():\n\tpass\n"),
+            "func a():\n\tpass\n\n\n@rpc(\"x\")\nfunc b():\n\tpass\n"
+        );
+        assert_eq!(
+            fmt("extends Node\nfunc f():\n\tpass\n"),
+            "extends Node\n\n\nfunc f():\n\tpass\n"
+        );
     }
 
     #[test]
