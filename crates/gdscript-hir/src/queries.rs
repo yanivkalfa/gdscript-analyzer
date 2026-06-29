@@ -332,7 +332,8 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
 
 /// Whether a `res://` path is a *text* scene/resource we parse (`.tscn`/`.tres`). Binary
 /// `.scn`/`.res` are detected-and-degraded by the parser, but we don't waste a parse on a `.gd`.
-fn is_scene_path(path: &str) -> bool {
+#[must_use]
+pub fn is_scene_path(path: &str) -> bool {
     let ext = path.rsplit('.').next().unwrap_or("");
     ext.eq_ignore_ascii_case("tscn") || ext.eq_ignore_ascii_case("tres")
 }
