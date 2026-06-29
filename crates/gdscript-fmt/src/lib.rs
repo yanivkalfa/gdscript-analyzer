@@ -3943,6 +3943,18 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_comment_does_not_force_a_fitting_statement_to_wrap() {
+        // gdformat measures line width without the trailing comment (appended in a post-pass), so an
+        // author-wrapped statement whose code fits on one line is collapsed even though the comment
+        // pushes the rendered line past the width.
+        let src = "const C := [aaaaaaaaaa, bbbbbbbbbb, cccccccccc, dddddddddd, eeeeeeeeee, ffffffffff]  # note\n";
+        let multi = "const C := [\n\taaaaaaaaaa,\n\tbbbbbbbbbb,\n\tcccccccccc,\n\tdddddddddd,\n\teeeeeeeeee,\n\tffffffffff\n]  # note\n";
+        // code-without-comment is < 100, so both the already-flat and the author-wrapped forms collapse.
+        assert_eq!(fmt(src), src);
+        assert_eq!(fmt(multi), src);
+    }
+
+    #[test]
     fn standalone_comments_after_a_lambda_arg_hang_off_the_body() {
         // A call with a multi-line lambda argument followed by another argument explodes its arg list;
         // a standalone comment dedented between the lambda and the next arg is re-emitted at the lambda

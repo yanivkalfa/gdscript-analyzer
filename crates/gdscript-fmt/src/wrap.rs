@@ -189,14 +189,19 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
             lines[0] = prepended;
         }
     }
-    // The CST path owns only *multi-line* layout. A single-line result means the statement fits as-is;
-    // we delegate it to the caller's flat path, which re-emits the body's already-correct spacing
-    // verbatim (our `expr_to_str` is for the inline parts of a wrap, not a spacing oracle).
-    if lines.len() == 1 {
+    // A comment trailing the whole statement (`const X := {…}  # note`) sits on the rendered last line.
+    // gdformat measures the line width *without* the trailing comment (it is appended in a post-pass),
+    // so a statement whose code fits on one line stays single-line even when the comment pushes it past
+    // the width — the comment never forces a wrap.
+    let trailing = statement_trailing_comment(&container, &stmt, &w.src);
+    // The CST path owns only *multi-line* layout. A single-line result with no trailing comment means
+    // the statement fits as-is; we delegate it to the caller's flat path, which re-emits the body's
+    // already-correct spacing verbatim. A single-line result *with* a trailing comment cannot go to the
+    // flat path (it bails on comments) — collapse it here and append the comment.
+    if lines.len() == 1 && trailing.is_none() {
         return None;
     }
-    // A comment trailing the whole statement (`const X := {…}  # note`) sits on the rendered last line.
-    if let Some(c) = statement_trailing_comment(&container, &stmt, &w.src) {
+    if let Some(c) = trailing {
         let last = lines.last_mut()?;
         last.push_str("  ");
         last.push_str(&c);
