@@ -200,6 +200,10 @@ fn format_lf(source: &str, config: &FmtConfig) -> String {
     if config.safe_mode && !input_parses {
         return source.to_owned();
     }
+    // Move an inner class's `extends` onto its own body line (`class C extends B:` → `class C:` /
+    // `extends B`), matching gdformat. Self-validating; a no-op when there is no such class.
+    let unextended = split_inner_class_extends(source);
+    let source = unextended.as_deref().unwrap_or(source);
     // Collapse single-statement lambda bodies, strip redundant grouping parens, then de-inline suite
     // bodies, so the rest of the pipeline sees a paren-clean, one-statement-per-line tree with inline
     // lambdas. Each pre-pass self-validates and is a no-op otherwise.
@@ -246,6 +250,120 @@ fn format_lf(source: &str, config: &FmtConfig) -> String {
         }
     }
     out
+}
+
+/// gdformat splits an inner class header's `extends` clause onto the first body line
+/// (`class C extends B:` → `class C:` then `\textends B`). Source pre-pass, parse-tree-driven and
+/// self-validating; returns `None` (leave untouched) if it does not parse, has no such class, or the
+/// rewrite changes meaning or fails to parse.
+fn split_inner_class_extends(source: &str) -> Option<String> {
+    let parse = gdscript_syntax::parse(source);
+    if !parse.errors().is_empty() {
+        return None;
+    }
+    // (remove_start, remove_end, insert_pos, insert_text)
+    let mut edits: Vec<(usize, usize, usize, String)> = Vec::new();
+    collect_inner_class_extends(&parse.syntax_node(), source, &mut edits);
+    if edits.is_empty() {
+        return None;
+    }
+    // Apply highest-offset edit first so earlier byte spans stay valid.
+    edits.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
+    let mut out = source.to_owned();
+    for (rs, re, ins_pos, text) in &edits {
+        out.insert_str(*ins_pos, text);
+        out.replace_range(*rs..*re, "");
+    }
+    // This transform deliberately *moves* the `extends` clause (header → body), which the structural
+    // meaning net would flag as a reorder. It only relocates existing tokens, so validate that the
+    // significant-token multiset is unchanged and the result parses clean.
+    if !same_token_multiset(source, &out) || !gdscript_syntax::parse(&out).errors().is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Whether two sources contain the same multiset of significant (non-trivia) `(kind, text)` tokens —
+/// order-insensitive. Used to validate a transform that only *relocates* existing tokens.
+fn same_token_multiset(a: &str, b: &str) -> bool {
+    fn bag(s: &str) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = gdscript_syntax::tokenize(s)
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia() && t.kind != SyntaxKind::Semicolon)
+            .map(|t| (format!("{:?}", t.kind), s[t.range].to_owned()))
+            .collect();
+        v.sort();
+        v
+    }
+    bag(a) == bag(b)
+}
+
+/// Collect the edits that split each inner class's `extends` clause onto its first body line.
+fn collect_inner_class_extends(
+    node: &gdscript_syntax::GdNode,
+    src: &str,
+    edits: &mut Vec<(usize, usize, usize, String)>,
+) {
+    use SyntaxKind as S;
+    for child in node.children() {
+        let edit = (child.kind() == S::InnerClassDecl)
+            .then(|| inner_class_extends_edit(child, src))
+            .flatten();
+        if let Some(edit) = edit {
+            edits.push(edit);
+        }
+        collect_inner_class_extends(child, src, edits);
+    }
+}
+
+/// For an inner class whose header carries `extends T`, build the edit that removes ` extends T` from
+/// the header and inserts `<body-indent>extends T\n` before the first body statement. `None` when the
+/// class has no `extends`, no body statement, or any required token is missing.
+fn inner_class_extends_edit(
+    class: &gdscript_syntax::GdNode,
+    src: &str,
+) -> Option<(usize, usize, usize, String)> {
+    use SyntaxKind as S;
+    use cstree::util::NodeOrToken;
+    let name = class.children().find(|c| c.kind() == S::Name)?;
+    let body = class.children().find(|c| c.kind() == S::ClassBody)?;
+    // The header tokens (direct children) hold `extends`, the type spelling, and the `:`.
+    let mut extends_start = None;
+    let mut colon_start = None;
+    for c in class.children_with_tokens() {
+        if let NodeOrToken::Token(t) = c {
+            match t.kind() {
+                S::ExtendsKw if extends_start.is_none() => {
+                    extends_start = Some(usize::from(t.text_range().start()));
+                }
+                S::Colon if extends_start.is_some() && colon_start.is_none() => {
+                    colon_start = Some(usize::from(t.text_range().start()));
+                }
+                _ => {}
+            }
+        }
+    }
+    let extends_start = extends_start?;
+    let colon_start = colon_start?;
+    // The type spelling sits between `extends` and `:`.
+    let ty = src.get(extends_start..colon_start)?.trim();
+    let ty = ty.strip_prefix("extends")?.trim();
+    if ty.is_empty() {
+        return None;
+    }
+    // Remove ` extends T` — from the name's end up to the colon (drops the joining space too).
+    let remove_start = usize::from(name.text_range().end());
+    let remove_end = colon_start;
+    // Insert the `extends` line at the first body statement's indentation (its node range starts at
+    // the leading whitespace, so read it forward from there).
+    let first_stmt = body.children().next()?;
+    let stmt_start = usize::from(first_stmt.text_range().start());
+    let indent: String = src[stmt_start..]
+        .chars()
+        .take_while(|&c| c == '\t' || c == ' ')
+        .collect();
+    let insert = format!("{indent}extends {ty}\n");
+    Some((remove_start, remove_end, stmt_start, insert))
 }
 
 /// gdformat moves an inline suite body to its own indented line (`if c: x` → two lines, `func f():
@@ -3321,6 +3439,23 @@ mod tests {
         // precedence parens kept; an expr-statement assignment RHS keeps its parens (gdformat does too)
         assert_eq!(fmt("var a = (b + c) * d\n"), "var a = (b + c) * d\n");
         assert_eq!(fmt("func f():\n\tx = (y)\n"), "func f():\n\tx = (y)\n");
+    }
+
+    #[test]
+    fn inner_class_extends_moves_to_its_own_body_line() {
+        // gdformat splits `class C extends B:` into `class C:` + a leading `extends B` body line.
+        assert_eq!(
+            fmt("class CRProps extends RefCounted:\n\tvar x = 1\n"),
+            "class CRProps:\n\textends RefCounted\n\tvar x = 1\n"
+        );
+        // a file-level `extends` (not an inner class) is left alone
+        assert_eq!(
+            fmt("extends Node\n\nvar x = 1\n"),
+            "extends Node\n\nvar x = 1\n"
+        );
+        // idempotent
+        let once = fmt("class C extends B:\n\tpass\n");
+        assert_eq!(fmt(&once), once);
     }
 
     #[test]
