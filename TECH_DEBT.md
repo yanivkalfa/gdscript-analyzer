@@ -847,12 +847,24 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       member var never referenced in the file — same-file scan like `UNUSED_SIGNAL`; exported vars are
       excluded to stay no-false-positive). Corpus (2d/3d/gui/audio): 0 false positives.
 
-### W2 — narrowing: deferred precision (post-1.0 quality, MINOR/PATCH not API breaks)
+### W2 — narrowing: deferred precision — assessed in the burndown (Stage 5), kept **post-1.0 by design**
 
-- [ ] **Assignment re-narrowing** (`x = other` → x: typeof(other)). M1 made flow authoritative, and
-      flow runs pre-inference so it can only *invalidate* on assignment (the sound 1.0 floor), not
-      re-narrow to the assigned value's type. Re-narrowing needs the value's inferred type fed back
-      into the facts — a post-1.0 precision item.
+> **Burndown Stage 5 assessment (the W2 "multi-year polish tail").** All three were re-examined against
+> the flow architecture (`flow.rs`: facts hold a *type-reference* `AstPtr` resolved pre-inference; the
+> design is deliberately **sound** — intersection-at-join, invalidate-on-assign, loop-bodies-widened, and
+> *shallow* places so mutation/aliasing can't make a stale narrowing). Conclusion: doing any of them **now**
+> harms more than it helps — each is an architecture change to (or a removal of soundness margin from) the
+> very floor the **W6 freeze (Stage 10) must lock**, and two of the three move *away* from Godot parity
+> (Godot's `reduce_type_test` does **no** flow narrowing — our narrowing is already a Pyright-style,
+> widen-only value-add). They are correctly **post-1.0** (the W2 playbook §1 scopes them so) and ship as
+> additive MINOR/PATCH precision *after* the freeze, never as API breaks.
+
+- [ ] **Assignment re-narrowing** (`x = other` → x: typeof(other)) — **post-1.0 (assessed Stage 5).** Flow
+      runs *pre-inference*, so a fact can only *invalidate* on assignment (the sound floor), never re-narrow
+      to the assigned value's type — which isn't known until inference. Re-narrowing needs the RHS's inferred
+      type fed back into the facts, i.e. a flow⇄inference fixpoint / re-ordering — an architecture change that
+      risks the sound floor for a **non-parity** value-add (Godot doesn't narrow at all). No safe
+      pre-inference sliver exists (even `x = C.new()` needs the engine model + a cross-path fixpoint).
 - [x] **`UNREACHABLE_PATTERN` — DONE (Phase 2).** `body.rs` `MatchArm` now carries a `range` +
       `is_catch_all` (`arm_is_unconditional_catch_all`: sole top-level `_`/`var x`, no `when` guard);
       `flow.rs` records every arm after a catch-all; `infer.rs` emits it. Conservative (a multi-pattern
@@ -861,11 +873,19 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       `match` has **no type patterns** (patterns are literals/constants, `_`, `var x`, array, dict), so
       `match x: Node2D:` matches `x == Node2D` (a value compare), not `x is Node2D` — there is no
       scrutinee type to narrow, and doing so would be an *incorrect* (false) narrowing.
-- [ ] **`NotNull` / `Not(T)` consumption** — recorded by the flow pass but not used for typing in
-      1.0 (no null-access diagnostic to drive `NotNull`; `Not(T)` has no positive type). Wire when a
-      null-safety check lands.
+- [ ] **`NotNull` / `Not(T)` consumption** — **not actionable now (assessed Stage 5): no consumer.** The
+      flow pass *records* `NotNull`/`Not(T)`, but nothing can consume them in 1.0 — GDScript/Godot has **no
+      null-access diagnostic** to drive `NotNull` (the analyzer mirrors Godot's warning set; inventing a
+      null-safety check would be a novel **non-parity** feature, out of scope), and `Not(T)` has no positive
+      type to narrow *to*. Wiring it now is dead code. Revisit only **if** a null-safety diagnostic is ever
+      added (a separate scoping decision), at which point the facts are already there to consume.
 - [ ] **Loop-carried back-edge fixpoints, aliasing, narrowing through call results
-      (`if get_thing() is T:`)** — explicitly out of the 1.0 cut (per the W2 playbook §1 tail).
+      (`if get_thing() is T:`)** — **post-1.0, soundness-frozen (assessed Stage 5).** The shallow-`Place`
+      design (narrow `x`/`x.y`/`self.y`, never arbitrary call results) and loop-bodies-entered-widened (no
+      back-edge fixpoint) are *deliberate* soundness choices, not gaps: they guarantee a stale narrowing can
+      never hide a real diagnostic under mutation/aliasing/iteration. Adding them trades that guarantee for
+      edge-case precision — exactly the kind of change that must NOT land right before the W6 freeze. Out of
+      the 1.0 cut by design (W2 playbook §1 tail); soundness stays frozen (widen when unsure).
 
 ### W3/W4/W5 — Phase-6 deferrals (infra needing CI services or measurement-first decisions)
 
