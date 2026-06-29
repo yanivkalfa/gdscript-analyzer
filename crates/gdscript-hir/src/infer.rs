@@ -240,6 +240,36 @@ pub fn infer(
         }
     }
 
+    // SHADOWED_GLOBAL_IDENTIFIER — a parameter / local / `for` / pattern-bind whose name collides
+    // with a project/engine global (built-in type/function, native class, engine singleton, project
+    // `class_name`, or autoload). Godot's `is_shadowing` fires for every local-scope binding. A local
+    // `var`/`const` that *also* shadows a param/member emits THIS instead of `SHADOWED_VARIABLE` (the
+    // global check wins in `gdscript_analyzer.cpp`; `infer_local_var` suppresses the variable-shadow
+    // when a global one applies, so the two never double-fire on one declaration).
+    if is_func_body {
+        let global_shadows: Vec<(TextRange, String)> = cx
+            .bindings
+            .iter()
+            .filter_map(|b| {
+                let kind = shadowed_global_kind(db, api, &b.name)?;
+                let what = match b.kind {
+                    BindingKind::Param => "parameter",
+                    BindingKind::Var if b.is_const => "constant",
+                    BindingKind::Var => "variable",
+                    BindingKind::ForVar => "for loop variable",
+                    BindingKind::MatchBind => "pattern bind",
+                };
+                Some((
+                    b.name_range,
+                    format!("The {what} \"{}\" has the same name as a {kind}.", b.name),
+                ))
+            })
+            .collect();
+        for (range, msg) in global_shadows {
+            cx.warn(range, WarningCode::ShadowedGlobalIdentifier, msg);
+        }
+    }
+
     // UNREACHABLE_CODE — statements after a return/break/continue / exhaustive branch (Workstream 2).
     let unreachable = cx.flow.unreachable_ranges(body);
     for range in unreachable {
@@ -511,6 +541,17 @@ fn member_level_warnings(
         _ => None,
     };
     for m in &tree.members {
+        // SHADOWED_GLOBAL_IDENTIFIER — a value member (`var`/`const`/`signal`) whose name collides
+        // with a project/engine global. Godot's `is_shadowing` fires for member declarations too.
+        if let Some((name, range, what)) = member_value_decl(m)
+            && let Some(kind) = shadowed_global_kind(db, api, name)
+        {
+            out.push(RawWarning {
+                range,
+                code: WarningCode::ShadowedGlobalIdentifier,
+                message: format!("The {what} \"{name}\" has the same name as a {kind}."),
+            });
+        }
         match m {
             // An enum-typed field with no initializer (the local case is in `infer_local_var`).
             Member::Var(v) if !v.has_init => {
@@ -652,6 +693,55 @@ fn is_autoload_singleton(db: &dyn Db, name: &str) -> bool {
             .resolve_path(name)
             .is_some()
     })
+}
+
+/// Whether `name` is registered as a global `class_name` by some file in the project. `false` when
+/// no source root is set (single-file analysis can't observe the registry). Reads the firewalled
+/// [`crate::queries::global_registry`].
+fn is_registered_global_class(db: &dyn Db, name: &str) -> bool {
+    db.source_root().is_some_and(|root| {
+        crate::queries::global_registry(db, root)
+            .resolve(name)
+            .is_some()
+    })
+}
+
+/// Whether a declared identifier `name` shadows a project/engine **global**, returning Godot's
+/// category label for the `SHADOWED_GLOBAL_IDENTIFIER` message, else `None`. Mirrors
+/// `gdscript_analyzer.cpp`'s `is_shadowing` global checks: a built-in function, a built-in (Variant)
+/// type, a native class, an engine singleton, a project `class_name` global, or a `*`-autoload
+/// singleton. **Conservative:** bare global pseudo-constants (`PI`/`TAU`) and global enum namespaces
+/// (`Error`/`Key`) are deliberately excluded — they are rare as user identifiers (and the tokenizer
+/// treats the math constants as literals), so this only ever *under*-warns vs. Godot, never a false
+/// positive. With no source root / `project.godot`, the cross-file/autoload arms are silent (seam).
+fn shadowed_global_kind(db: &dyn Db, api: &EngineApi, name: &str) -> Option<&'static str> {
+    match resolve::resolve_global(api, name) {
+        Some(GlobalDef::Builtin | GlobalDef::Utility) => return Some("built-in function"),
+        Some(GlobalDef::BuiltinType(_)) => return Some("built-in type"),
+        Some(GlobalDef::ClassType(_)) => return Some("native class"),
+        Some(GlobalDef::Singleton(_)) => return Some("engine singleton"),
+        // Bare pseudo-constants / global enums: intentionally not flagged (see doc above).
+        Some(GlobalDef::Const(_) | GlobalDef::GlobalEnum) | None => {}
+    }
+    if is_registered_global_class(db, name) {
+        return Some("global class");
+    }
+    if is_autoload_singleton(db, name) {
+        return Some("autoload");
+    }
+    None
+}
+
+/// The `(name, name range, kind noun)` of a *value-declaring* member (`var`/`const`/`signal`) — the
+/// members that `SHADOWED_GLOBAL_IDENTIFIER` checks at the class level. `None` for funcs / enums /
+/// inner classes (where the "shadow" framing is weaker, matching Godot's `is_shadowing` callers).
+fn member_value_decl(m: &Member) -> Option<(&SmolStr, TextRange, &'static str)> {
+    match m {
+        Member::Var(v) => Some((&v.name, v.name_range, "variable")),
+        Member::Const(c) => Some((&c.name, c.name_range, "constant")),
+        Member::Signal(s) => Some((&s.name, s.name_range, "signal")),
+        _ => None,
+    }
 }
 
 /// The NAME range of the file's `class_name` declaration, trimmed to the bare identifier (the
@@ -1122,30 +1212,36 @@ impl Cx<'_> {
         };
         if self.is_func_body {
             let what = if v.is_const { "constant" } else { "variable" };
-            if shadows_param || shadows_member {
-                let outer = if shadows_param {
-                    "parameter"
-                } else {
-                    "class member"
-                };
-                self.warn(
-                    v.name_range,
-                    WarningCode::ShadowedVariable,
-                    format!(
-                        "The local {what} \"{}\" shadows a {outer} of the same name.",
-                        v.name
-                    ),
-                );
-            } else if self.engine_base_has_value_member(&v.name) {
-                // An own-member shadow already won above; only a *base*-member shadow reaches here.
-                self.warn(
-                    v.name_range,
-                    WarningCode::ShadowedVariableBaseClass,
-                    format!(
-                        "The local {what} \"{}\" shadows a member of a base class.",
-                        v.name
-                    ),
-                );
+            // A global-identifier shadow takes precedence over a variable/base-class shadow (Godot's
+            // `is_shadowing` checks globals first and returns), so the variable-shadow is emitted only
+            // when the name does NOT shadow a global — the global one is emitted by the binding
+            // post-pass in `infer`, keeping a single warning per declaration.
+            if shadowed_global_kind(self.db, self.api, &v.name).is_none() {
+                if shadows_param || shadows_member {
+                    let outer = if shadows_param {
+                        "parameter"
+                    } else {
+                        "class member"
+                    };
+                    self.warn(
+                        v.name_range,
+                        WarningCode::ShadowedVariable,
+                        format!(
+                            "The local {what} \"{}\" shadows a {outer} of the same name.",
+                            v.name
+                        ),
+                    );
+                } else if self.engine_base_has_value_member(&v.name) {
+                    // An own-member shadow already won above; only a *base*-member shadow reaches here.
+                    self.warn(
+                        v.name_range,
+                        WarningCode::ShadowedVariableBaseClass,
+                        format!(
+                            "The local {what} \"{}\" shadows a member of a base class.",
+                            v.name
+                        ),
+                    );
+                }
             }
             // ENUM_VARIABLE_WITHOUT_DEFAULT — a local typed as an enum with no initializer (the
             // implicit `0` may not name a valid enum value). Only an explicit `Ty::Enum` annotation.
@@ -2606,6 +2702,61 @@ mod tests {
             !codes(&h).contains(&"SHADOWED_VARIABLE_BASE_CLASS"),
             "{:?}",
             codes(&h)
+        );
+    }
+
+    #[test]
+    fn local_named_after_a_native_class_warns_shadowed_global() {
+        let h = infer_first_func("func f():\n\tvar Node = 1\n\treturn Node\n");
+        assert!(
+            codes(&h).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn param_named_after_a_builtin_type_warns_shadowed_global() {
+        let h = infer_first_func("func f(Vector2):\n\treturn Vector2\n");
+        assert!(
+            codes(&h).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn member_named_after_a_native_class_warns_shadowed_global() {
+        let cs = file_codes("var Timer = null\n");
+        assert!(
+            cs.iter().any(|c| c == "SHADOWED_GLOBAL_IDENTIFIER"),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_local_does_not_warn_shadowed_global() {
+        // A no-false-positive guard: a normal identifier is not a global.
+        let h = infer_first_func("func f():\n\tvar count = 1\n\treturn count\n");
+        assert!(
+            !codes(&h).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn global_shadow_takes_precedence_over_variable_shadow() {
+        // A member named after a built-in type (`Color`), shadowed by a local of the same name:
+        // Godot emits SHADOWED_GLOBAL_IDENTIFIER (global wins), NOT SHADOWED_VARIABLE on the local.
+        let cs = file_codes("var Color = null\nfunc f():\n\tvar Color = 1\n\treturn Color\n");
+        assert!(
+            cs.iter().any(|c| c == "SHADOWED_GLOBAL_IDENTIFIER"),
+            "{cs:?}"
+        );
+        assert!(
+            !cs.iter().any(|c| c == "SHADOWED_VARIABLE"),
+            "the local's variable-shadow must be suppressed in favor of the global one: {cs:?}"
         );
     }
 

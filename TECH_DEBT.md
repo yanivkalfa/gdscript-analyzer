@@ -680,9 +680,14 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       (`engine_base_has_value_member`), silent on an unresolved base. The **user-base** slice (a
       member shadowing a base declared by another script) stays deferred — the cross-file `MemberSig`
       is lossy (no kind/params), so a sound user-base walk needs it enriched first.
-- [ ] **`SHADOWED_GLOBAL_IDENTIFIER` (extend)** — currently fires only for a `class_name` collision
-      (file-level, ungated, direct `Diagnostic`). Godot also fires for a local/member shadowing a
-      global; extend + route through `gate` as a real `WarningCode`.
+- [x] **`SHADOWED_GLOBAL_IDENTIFIER` (extend) — DONE (burndown Stage 1).** Now also fires (gated, as
+      a real `WarningCode::ShadowedGlobalIdentifier`) for a parameter / local `var`/`const` / `for` /
+      pattern-bind / member `var`/`const`/`signal` whose name collides with a project/engine global
+      (built-in type/function, native class, engine singleton, project `class_name`, `*`-autoload),
+      mirroring `gdscript_analyzer.cpp`'s `is_shadowing`. A global shadow takes precedence over a
+      variable/base-class shadow (no double-warn). Conservative: bare pseudo-constants (`PI`) / global
+      enums excluded → only under-warns vs Godot, never a false positive. The pre-existing `class_name`
+      collision stays its own ungated file-level diagnostic (closer to Godot's hides-global error).
 - [ ] **`ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE`** — needs the bool *value* of a constant
       condition; the lowered `Literal::Bool` doesn't carry true/false. Recover it from the CST token
       at the expr range (like navigation does) or extend `Literal` to carry the value.
