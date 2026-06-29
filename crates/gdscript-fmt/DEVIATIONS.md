@@ -19,9 +19,9 @@ As of the CST-driven wrapping port (a faithful port of gdformat 4.5's `expressio
 `src/wrap.rs`) plus the full normalization set (inline-suite expansion, blank-line + comment rules,
 node-path / triple-quote / BOM, dict-entry & magic-comma chains), EOL-normalised:
 
-- **exact match**: **~98.5%** over `godot-demo-projects` (456 files; up from ~14% at the start of
-  Phase 4), **~98%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
-- **fixpoint** `format(gold)==gold`: **~99%** (both corpora)
+- **exact match**: **454/456 (99.6%)** over `godot-demo-projects` (up from ~14% at the start of
+  Phase 4), **88/88 (100%)** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
+- **fixpoint** `format(gold)==gold`: **455/456 (99.8%)** godot, **88/88 (100%)** ReactiveUI
 
 **Comments are threaded through a reshaped statement** (a faithful port of gdformat's comment model):
 a standalone comment keeps its own line at the block / element indent, a trailing inline comment is
@@ -34,11 +34,25 @@ placed, the whole statement falls back to verbatim — so this can only improve,
 **Multi-line strings** are rendered verbatim inside an exploded operator chain / paren-wrap
 (`x = (\n"""…"""\n% [...]\n)`), with the throwaway-parse re-indent skipping string-interior lines.
 
-The remaining exact-match gap is now a handful of files each, in unrelated categories: a few
-**blank-line** placement edge cases (a spurious blank between a compound header and its body), a
-standalone comment that gdformat attaches to a *lambda body* (deeper indent) rather than the
-surrounding arg list, and gdformat's own **BOM** limitation (it errors on a leading BOM and leaves
-the file unchanged, so its "gold" is just the source — we reformat it and legitimately differ).
+Comment-around-reshape placement is now matched across the board: a blank line at the **start of a
+block** (between a compound header and its body) is stripped; a block-boundary **standalone comment**
+is placed at the depth of the deepest open block containing it; standalone comments are threaded
+through an **operator-chain** wrap (at the operand indent) and through a **call argument list**,
+including the hard case where a comment **hangs off a lambda argument's body** (dedented between the
+lambda and the next argument — re-indented to the body's depth, with the argument separator `,` landing
+on the lambda's last body line before its trailing comment); a **trailing comment never forces a wrap**
+(gdformat measures width without it, so a fitting author-wrapped statement collapses); and a **column-0
+comment amid a function body** (commented-out code) is kept inside the function rather than gaining
+def-separating blank lines.
+
+The remaining exact-match gap on `godot-demo-projects` is **2 files**, both **deep wrap-choice
+nuances** (not comment / blank-line): `town_scene.gd` — gdformat keeps redundant sub-expression parens
+in `(A) or (B)` that our `strip_parens` removes, then threads the operator-chain comments around them;
+`os_test.gd` — a subscript on a large array literal (`[ … big array … ][index]`) where gdformat
+explodes the array one-element-per-line while we keep it compact and drop the subscript below. Plus
+gdformat's own **BOM** limitation (it errors on a leading BOM and leaves the file unchanged, so its
+"gold" is just the source — we reformat it and legitimately differ; these are excluded from the counts
+above).
 
 The CST wrapper additionally renders **lambdas** (inline `func(p): body`, multi-line bodies with
 recursively-formatted nested blocks, and the contains-a-lambda dot-chain bottom-up rule), drops a
