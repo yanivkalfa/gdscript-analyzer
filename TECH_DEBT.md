@@ -603,11 +603,28 @@ seam, and rename identifier hygiene; all with regression tests):
       a parse scan (`anon_enum_variant_target`) since `item_tree` drops per-variant ranges.
 
 **Deferred** (verified real, but needing an AST-layer change or pairing with later inner-class work):
-- [ ] **Inner-class member navigation identity is not modeled — considered + DEFERRED (Phase-5).**
-      Inner members refuse rather than corrupt (safe today). A full fix qualifies `GodotDef::Member` by
-      the declaring inner-class scope and resolves against the inner `ItemTree`, rippling through
-      `classify_decl` / `member_owner` / `resolve_name_to_def` / the rename collision checks — a
-      deliberate ~multi-day project, not a quick win, so explicitly deferred in the hardening pass.
+- [ ] **Inner-class member navigation identity — RISK-SEQUENCED to a focused effort (burndown Stage
+      4.24 review).** Inner members refuse rather than corrupt (safe today). Investigated in the burndown:
+      the full fix needs **two core-touching prerequisites**, not just an identity tweak — (1) **infer
+      inner-class method bodies** (today `analyze_file` Pass 2 iterates only top-level `tree.members` and
+      *skips* `Member::Class`, so inner bodies get NO units / diagnostics / resolvable references), and
+      (2) a **type representation for an inner-class instance** (today `own_member_ty` types a
+      `Member::Class` value as `Ty::Unknown`; without a real inner-class `Ty`, `self.member` inside an
+      inner method and `inner_instance.member` can't resolve, so find-refs can't be **complete** and a
+      safe rename is impossible). Only then can `GodotDef::Member` be qualified by the inner scope and
+      rippled through `classify_decl` / `member_owner` / `resolve_name_to_def` / the rename collision
+      checks. **Decisive risk data:** inner classes occur **0 times** across the 545-file corpus
+      (godot-demo-projects 456 + ReactiveUI-Gadot), so this is a rare feature **AND** the corpus cannot
+      validate the change — a core inference/type-system edit landed with synthetic-test coverage only,
+      against a component all of Stages 5–8 + the W6 freeze depend on. Rushing it mid-burndown
+      "harms more than helps." **Ready-to-execute spec (own focused PR):** add `Ty::InnerClass{file,
+      path}` (most `match ty` sites have a `_` fallback → safe seam by default); type a `Member::Class`
+      value + `Inner.new()` as it; resolve members on it by walking `InnerClassItem.tree` + its `extends`;
+      recurse `analyze_file` Pass 2 into `Member::Class` building a `ClassScope` with `self_ty =
+      InnerClass` (mind Godot's scoping — an inner class sees outer *constants/enums via the outer name*
+      but not outer instance members, the false-positive trap); qualify `GodotDef::Member` with the inner
+      path; enable rename once refs are provably complete. Validate on a vendored inner-class fixture set
+      (the corpus has none).
 - [x] **Symbols named with soft keywords (`match`/`when`) — DONE (Phase-5 hardening).** `Name::text()`
       and `EnumVariant::text()` now read the grammar's `at_name` whitelist (`Ident | MatchKw | WhenKw`)
       via a `name_token_text` helper, so such symbols reach item_tree / hover / completion. `classify`
