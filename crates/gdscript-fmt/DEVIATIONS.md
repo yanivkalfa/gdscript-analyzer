@@ -20,8 +20,16 @@ As of the CST-driven wrapping port (a faithful port of gdformat 4.5's `expressio
 node-path / triple-quote / BOM, dict-entry & magic-comma chains), EOL-normalised:
 
 - **exact match**: **~97%** over `godot-demo-projects` (456 files; up from ~14% at the start of
-  Phase 4), **~93%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
-- **fixpoint** `format(gold)==gold`: **~99%** (godot) / **~98%** (ReactiveUI)
+  Phase 4), **~94%** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
+- **fixpoint** `format(gold)==gold`: **~99%** (both corpora)
+
+The remaining exact-match gap is now dominated by three things, none a wrapping-choice bug:
+**(1) comments** — gdformat reformats a statement *and* re-emits the comment inside it
+(`call(func(): … # note\n)`, a collapsed array/dict with a trailing `# …`); we leave any
+comment-bearing statement verbatim, so it does not reach gold's reshaped form. **(2) multi-line
+strings** — gdformat paren-wraps a `"""…""" % [...]` assignment; we bail on multi-line string tokens.
+**(3) gdformat's own limits** — a leading **BOM** makes gdformat error out and leave the file
+unchanged, so its "gold" is just the source (we reformat it and legitimately differ).
 
 The CST wrapper additionally renders **lambdas** (inline `func(p): body`, multi-line bodies with
 recursively-formatted nested blocks, and the contains-a-lambda dot-chain bottom-up rule), drops a
