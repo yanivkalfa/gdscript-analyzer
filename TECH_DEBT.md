@@ -487,10 +487,19 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       gdscript-ide) now locks goto-def ↔ hover agreement at **every** rung — own member, inherited
       member, engine global, `class_name` global — alongside the two pre-existing shadowing guards. Any
       future drift at any rung fails CI.
-- [ ] **(M5) `Member`/`Global` find-refs scope is project-wide-candidates, not a precise referrer
-      graph.** Correct (the re-resolve confirms) but does wasted `classify`s on files that name-but-
-      don't-reference the symbol. A firewall-safe referrer reverse-index (keyed on `item_tree`, not
-      bodies) is a perf follow-up if the large-project benchmark regresses.
+- [x] **(M5) `Member`/`Global` find-refs scope — MEASURED, index NOT warranted (burndown Stage 4.21).**
+      find-refs is project-wide-candidates (word-boundary pre-filter → re-classify each hit), which is
+      *correct* (the re-resolve confirms) but does wasted `classify`s on files that name-but-don't-
+      reference the symbol. The reverse-index was explicitly gated on "*if* the large-project benchmark
+      regresses". **It doesn't:** a new `find_references_*_150files` bench (`crates/gdscript-ide/benches/
+      analysis.rs`) — a `class_name` + a method referenced in **every** file of a 150-file project (the
+      worst case the index would optimize) — measures **member ≈ 0.89 ms, global ≈ 1.09 ms** per
+      project-wide find-refs, far under any interactive budget (find-refs is user-triggered). The
+      word-boundary pre-filter already prunes to name-bearing files, and cost scales O(name-bearing
+      files) — ~10 ms even at 1500 such files, still fine. Building a firewall-touching tracked-query
+      reverse-index would add complexity + an invalidation edge for **zero** measured benefit, so it is
+      deliberately **not** built; the bench stays as the standing regression guard (surfaces it if the
+      cost ever does regress).
 - [x] **(M5) `ReferenceKind::Write` — DONE (Phase-5 hardening).** find-refs now tags a write when the
       reference is the direct LHS operand of an assignment `BinExpr` — a bare `NameRef` (`x = …`,
       `x += …`) or the member of a `FieldExpr` (`self.x = …`, `a.b = …`). Conservative: a receiver
