@@ -628,8 +628,13 @@ fn class_annotation_warnings(
 }
 
 /// File-level (member) warnings that need the whole item-tree, not a single body (W1):
-/// `ENUM_VARIABLE_WITHOUT_DEFAULT` on an enum-typed field with no initializer, and `UNUSED_SIGNAL`
-/// on a signal never referenced anywhere in the file. Both are sound + conservative.
+/// `ENUM_VARIABLE_WITHOUT_DEFAULT`, `UNUSED_SIGNAL`, `UNUSED_PRIVATE_CLASS_VARIABLE`,
+/// `SHADOWED_GLOBAL_IDENTIFIER`, `CONFUSABLE_IDENTIFIER`, the annotation-lifecycle checks, and
+/// `NATIVE_METHOD_OVERRIDE` — each independent + conservative.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat sequence of independent per-member warning checks; reads best as one walk"
+)]
 fn member_level_warnings(
     db: &dyn Db,
     api: &EngineApi,
@@ -639,8 +644,13 @@ fn member_level_warnings(
 ) -> Vec<RawWarning> {
     let mut out = Vec::new();
     let has_signal = tree.members.iter().any(|m| matches!(m, Member::Signal(_)));
-    // Only pay for the whole-file name scan when there is a signal to judge.
-    let uses = has_signal.then(|| NameUses::collect(root));
+    // A `_`-prefixed, non-exported member var is an UNUSED_PRIVATE_CLASS_VARIABLE candidate.
+    let has_private_var = tree
+        .members
+        .iter()
+        .any(|m| matches!(m, Member::Var(v) if v.name.starts_with('_') && !v.is_exported));
+    // Only pay for the whole-file name scan when there is a signal or a private var to judge.
+    let uses = (has_signal || has_private_var).then(|| NameUses::collect(root));
     // The resolved ENGINE base, for NATIVE_METHOD_OVERRIDE (an unresolved/user base ⇒ no check).
     let engine_base = match resolve::resolve_base(db, api, tree, res_path) {
         Ty::Object(c) => Some(c),
@@ -650,6 +660,24 @@ fn member_level_warnings(
     out.extend(class_annotation_warnings(db, api, root, tree, res_path));
 
     for m in &tree.members {
+        // UNUSED_PRIVATE_CLASS_VARIABLE — a `_`-prefixed, non-exported member var never referenced
+        // anywhere in the file (same-file scan, like UNUSED_SIGNAL). Exported vars are set externally
+        // (inspector / scene), so they are excluded to keep the contract no-false-positive.
+        if let Member::Var(v) = m
+            && v.name.starts_with('_')
+            && !v.is_exported
+            && let Some(uses) = &uses
+            && !uses.is_referenced(&v.name)
+        {
+            out.push(RawWarning {
+                range: v.name_range,
+                code: WarningCode::UnusedPrivateClassVariable,
+                message: format!(
+                    "The class variable \"{}\" is never used in this file.",
+                    v.name
+                ),
+            });
+        }
         // ONREADY_WITH_EXPORT — `@onready` and `@export` on the same member (Godot raises this).
         if let Member::Var(v) = m
             && has_annotation(&v.annotations, "onready")
@@ -1040,9 +1068,10 @@ struct Cx<'a> {
     raw_warnings: Vec<RawWarning>,
     /// Function-scoped local bindings (GDScript locals are function-, not block-, scoped).
     locals: FxHashMap<SmolStr, Ty>,
-    /// The names of locals/params that were *read* during the walk — drives the `UNUSED_*` family
-    /// (a declared binding whose name never appears here is unused). Conservative: a write-only use
-    /// also records the name (no false positives, only the occasional missed warning).
+    /// The names of locals/params that were *read* during the walk — drives the `UNUSED_*` family (a
+    /// declared binding whose name never appears here is unused). A bare assignment LHS (`x = …`) is a
+    /// write, NOT a read, and is excluded (so an assigned-but-never-read local is correctly unused);
+    /// a compound `x += …` still reads via its RHS, and a receiver / index target reads the base.
     used_locals: FxHashSet<SmolStr>,
     /// The active narrowing env for the current statement, keyed by a dotted access path. Rebuilt
     /// per statement from [`Cx::flow`] (Workstream 2) — not mutated ad-hoc anymore.
@@ -2556,9 +2585,12 @@ impl Cx<'_> {
     // ---- name resolution (local → class member → inherited → global) ----
 
     fn resolve_name(&mut self, id: ExprId, name: &str) -> Ty {
-        // Record a read of a local/param for the `UNUSED_*` analysis (before the narrowing check,
-        // so a narrowed read still counts as used).
-        if self.locals.contains_key(name) {
+        // Record a *read* of a local/param for the `UNUSED_*` analysis (before the narrowing check,
+        // so a narrowed read still counts as used). The direct LHS of an assignment (`x = …`) is a
+        // WRITE, not a read — excluding it lets `UNUSED_VARIABLE` catch an assigned-but-never-read
+        // local (Godot's precise behaviour). A compound `x += …` still reads `x` via its RHS NameRef
+        // (a distinct expr), and a receiver / index target (`x.f()`, `x[i] = …`) is a read of `x`.
+        if self.locals.contains_key(name) && !self.assign_lhs.contains(&id) {
             self.used_locals.insert(SmolStr::new(name));
         }
         // UNASSIGNED_VARIABLE (Workstream 2) — a *read* of a typed-no-init local that is not
@@ -3084,6 +3116,47 @@ mod tests {
         // Cyrillic `а` inside `balance`.
         let cs = file_codes("var b\u{0430}lance = 0\n");
         assert!(cs.iter().any(|c| c == "CONFUSABLE_IDENTIFIER"), "{cs:?}");
+    }
+
+    #[test]
+    fn an_assigned_but_never_read_local_is_unused() {
+        // Precise read-vs-write: `x` is only assigned, never read → UNUSED_VARIABLE.
+        let h = infer_first_func("func f():\n\tvar x = 1\n\tx = 2\n");
+        assert!(codes(&h).contains(&"UNUSED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn a_read_local_is_not_unused() {
+        let h = infer_first_func("func f() -> int:\n\tvar x = 1\n\tx = 2\n\treturn x\n");
+        assert!(!codes(&h).contains(&"UNUSED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn unused_private_class_variable_warns() {
+        let cs = file_codes("var _cache = 0\nfunc f():\n\tpass\n");
+        assert!(
+            cs.iter().any(|c| c == "UNUSED_PRIVATE_CLASS_VARIABLE"),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_private_class_variable_is_silent() {
+        let cs = file_codes("var _cache = 0\nfunc f() -> int:\n\treturn _cache\n");
+        assert!(
+            !cs.iter().any(|c| c == "UNUSED_PRIVATE_CLASS_VARIABLE"),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn an_exported_private_var_is_not_unused_private() {
+        // No false positive: an `@export`'d `_`-var is set externally (inspector / scene).
+        let cs = file_codes("@export var _hidden = 0\n");
+        assert!(
+            !cs.iter().any(|c| c == "UNUSED_PRIVATE_CLASS_VARIABLE"),
+            "{cs:?}"
+        );
     }
 
     #[test]

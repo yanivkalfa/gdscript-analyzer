@@ -753,9 +753,12 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       false positives on 545 real `.gd` (the 20 demo hits are genuine read-before-assign). The cosmetic
       **`_OP_ASSIGN`** variant stays deferred — compound-assign collapses to `BinOp::Assign` in lowering,
       so it can't be distinguished without the un-collapsed CST op.
-- [ ] **`UNUSED_*` precision** — the M1 use-tracking is name-based and counts a *write* as a use
-      (sound: only ever under-warns). A precise read-vs-write split (excluding assignment-LHS, the
-      `ReferenceKind::Write` logic) would catch assigned-but-never-read locals.
+- [x] **`UNUSED_*` precision → DONE (burndown Stage 2).** `used_locals` now records a *read* only —
+      the bare LHS of an assignment (`x = …`) is excluded (a compound `x += …` still reads via its RHS;
+      a receiver / index target reads the base), so an assigned-but-never-read local is correctly
+      `UNUSED_VARIABLE`. Also added **`UNUSED_PRIVATE_CLASS_VARIABLE`** (a `_`-prefixed, non-`@export`
+      member var never referenced in the file — same-file scan like `UNUSED_SIGNAL`; exported vars are
+      excluded to stay no-false-positive). Corpus (2d/3d/gui/audio): 0 false positives.
 
 ### W2 — narrowing: deferred precision (post-1.0 quality, MINOR/PATCH not API breaks)
 
