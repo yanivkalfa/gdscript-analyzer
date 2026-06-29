@@ -430,11 +430,13 @@ fn collect_inline_splits(
                 continue;
             }
         };
-        // A suite-introducing child: a statement/declaration `Block` (but never a `LambdaExpr`'s,
-        // which stays inline) or a property body (`var x: T: set = f`). Its body splits onto its own
-        // indented line when it shares the header's line.
-        let suite =
-            matches!(child.kind(), S::Block | S::PropertyBody) && node.kind() != S::LambdaExpr;
+        // A block-introducing child: a statement/declaration `Block` or a property body
+        // (`var x: T: set = f`). Its *inline-body split* (moving the body onto its own indented line)
+        // is skipped for a `LambdaExpr`'s block — a lambda's body stays inline; the wrapper owns its
+        // multi-line layout — but the block still counts as a depth increment so any `;`-separated
+        // statements *inside* the lambda body land at the correct indentation.
+        let is_block = matches!(child.kind(), S::Block | S::PropertyBody);
+        let suite = is_block && node.kind() != S::LambdaExpr;
         if suite {
             // The body offset: a `Block`'s first token, or — for a property body, whose own first
             // token is the `:` — its first getter/setter node (the content after the `:`).
@@ -452,7 +454,7 @@ fn collect_inline_splits(
         // A child is one indent level deeper when it is a suite, an inner class's `ClassBody` (whose
         // members sit a level below the `class` header), or a `match` arm (arms sit a level below the
         // `match` with no intervening `Block` node).
-        let deeper = suite
+        let deeper = is_block
             || child.kind() == S::ClassBody
             || (node.kind() == S::MatchStmt && child.kind() == S::MatchArm);
         collect_inline_splits(child, src, depth + usize::from(deeper), unit, splits);
@@ -3442,6 +3444,16 @@ mod tests {
         // precedence parens kept; an expr-statement assignment RHS keeps its parens (gdformat does too)
         assert_eq!(fmt("var a = (b + c) * d\n"), "var a = (b + c) * d\n");
         assert_eq!(fmt("func f():\n\tx = (y)\n"), "func f():\n\tx = (y)\n");
+    }
+
+    #[test]
+    fn semicolons_inside_lambda_body_expand_at_correct_depth() {
+        // A multi-line lambda body's `;`-separated statements expand one-per-line at the body depth
+        // (the lambda's block counts as a depth increment even though its own body is not split inline).
+        assert_eq!(
+            fmt("func r():\n\tvar cb = func():\n\t\ta(); b(); c()\n"),
+            "func r():\n\tvar cb = func():\n\t\ta()\n\t\tb()\n\t\tc()\n"
+        );
     }
 
     #[test]
