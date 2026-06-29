@@ -169,8 +169,16 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
     if !anns.is_empty() {
         let prefix = anns.iter().map(node_text).collect::<Vec<_>>().join(" ");
         let first = &lines[0];
-        let lead = first.len() - first.trim_start().len();
-        lines[0] = format!("{}{} {}", &first[..lead], prefix, &first[lead..]);
+        let lead = &first[..first.len() - first.trim_start().len()];
+        let prepended = format!("{lead}{prefix} {}", &first[lead.len()..]);
+        // gdformat moves the annotation to its own line when prepending it would overflow. Its check
+        // (`indent + len(annotations) + len(stripped_line) <= max`) does NOT count the joining space,
+        // so the threshold is one past the rendered width — hence `> max + 1`.
+        if width(&prepended) > w.max + 1 {
+            lines.insert(0, format!("{lead}{prefix}"));
+        } else {
+            lines[0] = prepended;
+        }
     }
     // The CST path owns only *multi-line* layout. A single-line result means the statement fits as-is;
     // we delegate it to the caller's flat path, which re-emits the body's already-correct spacing

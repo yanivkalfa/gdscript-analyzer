@@ -3234,6 +3234,17 @@ mod tests {
     }
 
     #[test]
+    fn long_annotated_var_splits_annotation_to_its_own_line() {
+        // A short annotated var stays prepended; a long one whose value cannot wrap moves the
+        // annotation to its own line (gdformat's `indent + len(ann) + len(line) <= max`, no space).
+        assert_eq!(fmt("@onready var x = $Path\n"), "@onready var x = $Path\n");
+        let long = "@onready var pelvis: PhysicalBone3D = $\"root/root_001/Skeleton3D/PhysicalBoneSimulator3D/Physical Bone pelvis\"\n";
+        let out = fmt(long);
+        assert!(out.starts_with("@onready\nvar pelvis:"), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn empty_signal_parens_are_removed() {
         // gdformat writes `signal s` not `signal s()`; a signal with parameters keeps its list.
         assert_eq!(fmt("signal done()\n"), "signal done\n");
