@@ -71,6 +71,10 @@ pub struct FmtConfig {
     /// nested `(…)` — matching gdformat's `remove_outer_parentheses`. Precedence-significant parens
     /// (`(a + b) * c`) are kept. On by default. Token-mutating; guarded by the meaning-equivalence net.
     pub strip_parens: bool,
+    /// Collapse a multi-line lambda whose body is a single simple statement onto one line
+    /// (`func():\n\tbody` → `func(): body`), matching gdformat, so the surrounding statement can re-flow
+    /// (and often fit on one line). On by default. Token-preserving (removes only a newline/indent).
+    pub collapse_lambdas: bool,
     /// Re-parse + significant-token-equality fallback to verbatim. Keep on unless you have a
     /// reason not to: it is the guarantee the formatter never changes meaning.
     pub safe_mode: bool,
@@ -89,6 +93,7 @@ impl Default for FmtConfig {
             normalize_strings: true,
             expand_inline_blocks: true,
             strip_parens: true,
+            collapse_lambdas: true,
             safe_mode: true,
         }
     }
@@ -195,8 +200,15 @@ fn format_lf(source: &str, config: &FmtConfig) -> String {
     if config.safe_mode && !input_parses {
         return source.to_owned();
     }
-    // Strip redundant grouping parens, then de-inline suite bodies, so the rest of the pipeline sees a
-    // paren-clean, one-statement-per-line tree. Each pre-pass self-validates and is a no-op otherwise.
+    // Collapse single-statement lambda bodies, strip redundant grouping parens, then de-inline suite
+    // bodies, so the rest of the pipeline sees a paren-clean, one-statement-per-line tree with inline
+    // lambdas. Each pre-pass self-validates and is a no-op otherwise.
+    let collapsed = if config.collapse_lambdas {
+        collapse_inline_lambdas(source, config)
+    } else {
+        None
+    };
+    let source = collapsed.as_deref().unwrap_or(source);
     let stripped = if config.strip_parens {
         strip_outer_parens(source)
     } else {
@@ -324,6 +336,112 @@ fn collect_inline_splits(
         let deeper = suite || (node.kind() == S::MatchStmt && child.kind() == S::MatchArm);
         collect_inline_splits(child, src, depth + usize::from(deeper), unit, splits);
     }
+}
+
+/// Collapse a multi-line lambda whose body is a single simple statement onto one line, matching
+/// gdformat (`func():\n\tbody` → `func(): body`), so the surrounding statement can re-flow. Restricted
+/// to a body that is a single statement, not a compound (`if`/`for`/…), on a single physical line, with
+/// only whitespace between the lambda's `:` and the body — so the join is a pure newline/indent removal.
+/// Returns `None` (leave the source) if nothing collapses or the result is not meaning-equivalent.
+fn collapse_inline_lambdas(source: &str, config: &FmtConfig) -> Option<String> {
+    let parse = gdscript_syntax::parse(source);
+    if !parse.errors().is_empty() {
+        return None;
+    }
+    let mut edits: Vec<(usize, usize)> = Vec::new(); // (start, end) byte ranges to replace with " "
+    collect_lambda_collapses(&parse.syntax_node(), source, config, &mut edits);
+    if edits.is_empty() {
+        return None;
+    }
+    edits.sort_unstable_by_key(|(s, _)| std::cmp::Reverse(*s));
+    let mut out = source.to_owned();
+    for (s, e) in &edits {
+        out.replace_range(*s..*e, " ");
+    }
+    if !meaning_preserved(source, &out) || !gdscript_syntax::parse(&out).errors().is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Collect `(start, end)` ranges (the whitespace/newline between a collapsible lambda's `:` and its
+/// body) to replace with a single space.
+fn collect_lambda_collapses(
+    node: &gdscript_syntax::GdNode,
+    src: &str,
+    config: &FmtConfig,
+    edits: &mut Vec<(usize, usize)>,
+) {
+    for child in node.children() {
+        let collapse = (child.kind() == SyntaxKind::LambdaExpr)
+            .then(|| lambda_collapse_range(child, src, config))
+            .flatten();
+        if let Some((s, e)) = collapse {
+            edits.push((s, e));
+        }
+        collect_lambda_collapses(child, src, config, edits);
+    }
+}
+
+/// The byte range between a lambda's `:` and its body to collapse, when the body is a single simple
+/// statement spanning one physical line, the gap is whitespace only (no comment), and the *enclosing*
+/// statement would fit on one line once collapsed (gdformat keeps a lambda multi-line otherwise).
+fn lambda_collapse_range(
+    lambda: &gdscript_syntax::GdNode,
+    src: &str,
+    config: &FmtConfig,
+) -> Option<(usize, usize)> {
+    use SyntaxKind as S;
+    let block = lambda.children().find(|c| c.kind() == S::Block)?;
+    let stmts: Vec<_> = block.children().collect(); // a block's child nodes are all statements
+    let [stmt] = stmts.as_slice() else {
+        return None;
+    };
+    // A compound body (`func(): if c: …`) stays multi-line, as does a body that itself spans lines.
+    if matches!(
+        stmt.kind(),
+        S::IfStmt | S::ElifClause | S::ElseClause | S::ForStmt | S::WhileStmt | S::MatchStmt
+    ) {
+        return None;
+    }
+    let bs = first_sig_offset(stmt)?; // skip the body's own leading indentation
+    let be = usize::from(stmt.text_range().end());
+    if src[bs..be].contains('\n') {
+        return None; // body wrapped over lines — leave it
+    }
+    let pre = src[..bs].trim_end_matches([' ', '\t', '\n', '\r']);
+    if !pre.ends_with(':') {
+        return None;
+    }
+    let gap = &src[pre.len()..bs];
+    if !gap.contains('\n') || gap.contains('#') {
+        return None; // already inline, or a comment sits in the gap
+    }
+    // gdformat only inlines a lambda when the *enclosing* statement then fits on one line; otherwise it
+    // keeps the lambda multi-line. Estimate the collapsed length of the enclosing top-level statement
+    // (the ancestor directly inside a `Block`): its content with every whitespace run squeezed to one
+    // space, plus its indentation. (The estimate matches our canonical spacing closely enough to decide.)
+    let mut top = lambda.clone();
+    while let Some(p) = top.parent() {
+        if p.kind() == S::Block {
+            break;
+        }
+        top = p.clone();
+    }
+    let r = top.text_range();
+    let (ts, te) = (usize::from(r.start()), usize::from(r.end()));
+    let indent_cols = src[..ts]
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b'\t' || b == b' ')
+        .map(|b| if b == b'\t' { 4 } else { 1 })
+        .sum::<usize>();
+    let content: usize = src[ts..te].split_whitespace().map(str::len).sum::<usize>()
+        + src[ts..te].split_whitespace().count().saturating_sub(1); // joined by single spaces
+    if indent_cols + content > config.line_width {
+        return None;
+    }
+    Some((pre.len(), bs))
 }
 
 /// Remove redundant grouping parens from standalone-expression positions, matching gdformat's
@@ -2277,9 +2395,11 @@ fn emit_tree_events(node: &gdscript_syntax::GdNode, out: &mut Vec<TreeEvent>) {
             NodeOrToken::Node(n) => emit_tree_events(n, out),
             NodeOrToken::Token(t) => {
                 let kind = t.kind();
-                // A `;` is a statement separator (equivalent to a newline) — dropping it lets the
-                // formatter split `a; b` onto two lines without the net seeing a meaning change.
-                if kind.is_trivia() || kind == SyntaxKind::Semicolon {
+                // Skip trivia, the synthetic block-structure markers (`Newline`/`Indent`/`Dedent` —
+                // the block nesting they encode is already captured by the surrounding node Open/Close
+                // events, and they differ between an inline and a multi-line form of the *same*
+                // construct, e.g. `func(): x` vs a wrapped lambda body), and a `;` statement separator.
+                if kind.is_trivia() || kind.is_synthetic_layout() || kind == SyntaxKind::Semicolon {
                     continue;
                 }
                 let text = if matches!(
@@ -2561,14 +2681,15 @@ mod tests {
     #[test]
     fn spacing_lambda_func_paren_is_tight() {
         // Corpus regression: a lambda `func(...)` must hug its `func` — `func (` does not parse.
-        // (A named function declaration has `func name(`, which is unaffected.)
+        // (A named function declaration has `func name(`, which is unaffected.) A single-statement
+        // lambda body that fits is collapsed onto one line, matching gdformat.
         assert_eq!(
             fmt_stmt("var cb = func( ) -> void:\n\t\tpass"),
-            "var cb = func() -> void:\n\t\tpass"
+            "var cb = func() -> void: pass"
         );
         assert_eq!(
             fmt_stmt("var g = func(_text:String)->void:\n\t\tpass"),
-            "var g = func(_text: String) -> void:\n\t\tpass"
+            "var g = func(_text: String) -> void: pass"
         );
         assert_eq!(
             fmt("func named(a,b):\n\tpass\n"),
@@ -2577,20 +2698,17 @@ mod tests {
     }
 
     #[test]
-    fn multiline_lambda_argument_interior_is_kept_verbatim() {
-        // A multi-line lambda passed as a call argument is a block *inside* brackets. The prepass
-        // re-emits synthetic layout (`Newline`/`Indent`/`Dedent`) for the lambda body even inside
-        // the brackets; the indenter treats that synthetic break like a `NewlinePhys` continuation
-        // and keeps the whole bracketed interior **verbatim** — it does NOT re-indent the body from
-        // block depth (which used to disagree with the verbatim-aligned header and emit non-parsing
-        // code, the one pre-existing limitation that previously needed a safe_mode fallback).
-        // Canonical reflow of the bracketed block is the increment-C reflow's job.
-        let src = "func _r():\n\tx.connect(func() -> void:\n\t\tdo_thing()\n\t)\n";
-        let out = fmt(src);
+    fn multiline_lambda_collapses_when_single_statement_else_kept() {
+        // gdformat inlines a multi-line lambda whose body is a single simple statement once the
+        // enclosing statement fits — but keeps a multi-statement (or non-fitting) lambda body.
         assert_eq!(
-            out, src,
-            "bracketed lambda interior must be preserved verbatim"
+            fmt("func _r():\n\tx.connect(func() -> void:\n\t\tdo_thing()\n\t)\n"),
+            "func _r():\n\tx.connect(func() -> void: do_thing())\n"
         );
+        // a two-statement lambda body stays multi-line (and parses)
+        let multi = "func _r():\n\tx.connect(func() -> void:\n\t\ta()\n\t\tb()\n\t)\n";
+        let out = fmt(multi);
+        assert!(out.contains("\n\t\ta()\n\t\tb()"), "{out:?}");
         assert!(parses_clean(&out), "{out:?}");
         assert_eq!(fmt(&out), out, "idempotent");
     }
