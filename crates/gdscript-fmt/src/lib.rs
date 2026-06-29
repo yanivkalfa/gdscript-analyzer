@@ -559,14 +559,21 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                     );
                     let comment_len = line_indent_ws.map_or(0, str::len);
                     let emit_depth = if is_comment {
-                        let (next_depth, next_len) = next_code_info(&toks, idx, depth);
-                        comment_depth(
-                            comment_len,
-                            depth,
-                            prev_code_indent_len,
-                            next_depth,
-                            next_len,
-                        )
+                        if comment_len == 0 {
+                            // gdformat keeps a column-0 comment (`line.startswith("#")`) at column 0 —
+                            // e.g. file-spanning `#region`/`#endregion` markers — rather than indenting
+                            // it to the enclosing block.
+                            0
+                        } else {
+                            let (next_depth, next_len) = next_code_info(&toks, idx, depth);
+                            comment_depth(
+                                comment_len,
+                                depth,
+                                prev_code_indent_len,
+                                next_depth,
+                                next_len,
+                            )
+                        }
                     } else {
                         prev_code_indent_len = comment_len;
                         depth
@@ -753,6 +760,10 @@ struct Unit {
     head_line: usize,
     depth: usize,
     is_def: bool,
+    /// A *standalone* comment (not a prefix that attaches to a following def/statement). gdformat does
+    /// not force blank lines around such a comment (e.g. a trailing `#endregion`), and it is
+    /// transparent to the surrounding defs' blank-line spacing.
+    is_comment: bool,
 }
 
 /// Classify the statement line whose first significant-or-comment token is `toks[start]`. Scans the
@@ -940,6 +951,7 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
                     head_line: h.line,
                     depth: h.depth,
                     is_def: heads[j].role == LineRole::Def,
+                    is_comment: false,
                 });
                 i = j + 1;
             } else {
@@ -949,6 +961,7 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
                         head_line: h.line,
                         depth: h.depth,
                         is_def: false,
+                        is_comment: h.role == LineRole::Comment,
                     });
                 }
                 i = j;
@@ -958,6 +971,7 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
                 head_line: h.line,
                 depth: h.depth,
                 is_def: h.role == LineRole::Def,
+                is_comment: false,
             });
             i += 1;
         }
@@ -966,14 +980,19 @@ fn insert_def_blanks(formatted: &str, config: &FmtConfig) -> String {
     // --- pass 3: the edge rule — N blanks before a unit whose own or previous sibling is a def ---
     let mut required: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut last_is_def: Vec<Option<bool>> = Vec::new();
-    for u in &units {
+    for (k, u) in units.iter().enumerate() {
         while last_is_def.len() <= u.depth {
             last_is_def.push(None);
         }
         let prev = last_is_def[u.depth];
         let first_in_block = prev.is_none();
         let n = if u.depth == 0 { 2 } else { 1 };
-        if !first_in_block && (u.is_def || prev == Some(true)) {
+        // A *trailing* standalone comment — one that ends its block (no following unit at its depth or
+        // shallower-after) such as a closing `#endregion` — keeps its source blanks unforced, matching
+        // gdformat's end-of-block reconstruction. A standalone comment *between* statements still
+        // resets def-adjacency (a following statement's spacing is measured from it, not the def above).
+        let trailing_comment = u.is_comment && units.get(k + 1).is_none_or(|nx| nx.depth < u.depth);
+        if !trailing_comment && !first_in_block && (u.is_def || prev == Some(true)) {
             required.insert(u.head_line, n);
         }
         last_is_def[u.depth] = Some(u.is_def);
@@ -2727,6 +2746,16 @@ mod tests {
             "func f():\n\tgravity_value = (\n\t\tfirst_long_operand_value_xx * second_long_operand_value_yy * third_long_operand_value_zz\n\t)\n"
         );
         assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn column_zero_trailing_region_comment_stays_put_without_forced_blanks() {
+        // gdformat keeps a column-0 `#endregion` at column 0 and forces no blank lines before a
+        // *trailing* comment (one that ends its block).
+        let src = "func f():\n\tvar x = 1\n#endregion\n";
+        assert_eq!(fmt(src), src);
+        let src2 = "#region Section\nvar a = 1\nvar b = 2\n#endregion\n";
+        assert_eq!(fmt(src2), src2);
     }
 
     // ---- Phase-4: string-quote normalization (gdformat / Black rule) ----
