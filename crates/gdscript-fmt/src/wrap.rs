@@ -141,6 +141,9 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
             leading_keyword(body),
             "if" | "elif" | "else" | "for" | "while" | "match" | "func" | "class"
         );
+    // `body` is at indent 0 (single physical line, or a multi-line statement already dedented by the
+    // caller). For a function-body statement we re-indent *every* line one level into the throwaway
+    // `func` (so a multi-line lambda body keeps its relative nesting and parses).
     let parse = if class_level {
         gdscript_syntax::parse(&if block_header {
             format!("{body}\n\tpass\n")
@@ -148,11 +151,11 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
             format!("{body}\n")
         })
     } else {
-        // Wrap in a function so the statement parses; its own block header gets a nested `pass`.
+        let indented = reindent_to(body, 1);
         gdscript_syntax::parse(&if block_header {
-            format!("func __():\n\t{body}\n\t\tpass\n")
+            format!("func __():\n{indented}\n\t\tpass\n")
         } else {
-            format!("func __():\n\t{body}\n")
+            format!("func __():\n{indented}\n")
         })
     };
     let root = parse.syntax_node();
@@ -192,9 +195,9 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
     // only the token structure is compared — `meaning_preserved` then allows exactly gdformat's
     // legitimate rewrites (redundant grouping parens, trailing commas, string quotes).
     let out_norm = reindent_to(&dedent(&out), 1);
-    let body_norm = format!("\t{}", body.trim_start());
+    let body_norm = reindent_to(&dedent(body), 1);
     let (mine, orig) = if class_level {
-        (dedent(&out), body.trim_start().to_owned())
+        (dedent(&out), dedent(body))
     } else {
         (
             format!("func __():\n{out_norm}\n"),
@@ -208,7 +211,7 @@ pub(crate) fn render(body: &str, indent: usize, cfg: &FmtConfig) -> Option<Strin
 }
 
 /// Strip the common leading-whitespace prefix from every non-blank line (preserves relative indent).
-fn dedent(s: &str) -> String {
+pub(crate) fn dedent(s: &str) -> String {
     let min = s
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -320,6 +323,66 @@ fn format_statement(w: &W, stmt: &GdNode, indent: usize) -> Option<Vec<String>> 
         }
         _ => None,
     }
+}
+
+/// Format a statement INCLUDING its nested block bodies — used inside a lambda body, where the
+/// wrapper owns the whole construct (unlike a top-level statement, whose body is a sequence of
+/// separate logical lines that reflow handles). Returns `None` for a compound we cannot fully render,
+/// so the enclosing lambda render falls back to verbatim.
+fn format_full_statement(w: &W, stmt: &GdNode, indent: usize) -> Option<Vec<String>> {
+    match stmt.kind() {
+        S::IfStmt => {
+            let mut out = format_branch(w, stmt, indent)?;
+            out.extend(format_block_body(
+                w,
+                &find_child(stmt, S::Block)?,
+                indent + 1,
+            )?);
+            for clause in stmt.children() {
+                match clause.kind() {
+                    S::ElifClause => {
+                        out.extend(format_branch(w, clause, indent)?);
+                        out.extend(format_block_body(
+                            w,
+                            &find_child(clause, S::Block)?,
+                            indent + 1,
+                        )?);
+                    }
+                    S::ElseClause => {
+                        out.push(format!("{}else:", w.indent(indent)));
+                        out.extend(format_block_body(
+                            w,
+                            &find_child(clause, S::Block)?,
+                            indent + 1,
+                        )?);
+                    }
+                    _ => {}
+                }
+            }
+            Some(out)
+        }
+        S::ForStmt | S::WhileStmt => {
+            let mut out = format_statement(w, stmt, indent)?;
+            out.extend(format_block_body(
+                w,
+                &find_child(stmt, S::Block)?,
+                indent + 1,
+            )?);
+            Some(out)
+        }
+        // `match` arms are not modelled here — bail so the lambda render falls back to verbatim.
+        S::MatchStmt => None,
+        _ => format_statement(w, stmt, indent),
+    }
+}
+
+/// Format every statement of a block (a lambda / compound body) fully, in order.
+fn format_block_body(w: &W, block: &GdNode, indent: usize) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for stmt in block.children() {
+        out.extend(format_full_statement(w, stmt, indent)?);
+    }
+    Some(out)
 }
 
 /// The first child node that is an expression kind.
@@ -743,10 +806,7 @@ fn format_lambda(
     let header = lambda_header_str(w, node)?;
     let mut out = vec![format!("{}{prefix}{header}", w.indent(indent))];
     let block = find_child(node, S::Block)?;
-    let child = indent + 1;
-    for stmt in block.children() {
-        out.extend(format_statement(w, stmt, child)?);
-    }
+    out.extend(format_block_body(w, &block, indent + 1)?);
     out.last_mut()?.push_str(suffix);
     Some(out)
 }
@@ -1172,19 +1232,24 @@ fn format_comma_list(
     let magic = has_trailing_comma(list_node);
     let mut out = vec![format!("{}{}", w.indent(indent), prefix)];
     let child = indent + 1;
-    // Compact: all elements on one continuation line, if they fit and there's no magic comma.
-    if !magic {
-        let flat = elems
-            .iter()
-            .map(|e| expr_to_str(w, e))
-            .collect::<Option<Vec<_>>>()?
-            .join(", ");
-        let compact = format!("{}{}", w.indent(child), flat);
-        if !elems.iter().any(forcing_multiline) && width(&compact) <= w.max {
-            out.push(compact);
-            out.push(format!("{}{}", w.indent(indent), suffix));
-            return Some(out);
-        }
+    // Compact: all elements on one continuation line, if they fit and there's no magic comma. When an
+    // element cannot render inline (a multi-line lambda body), the compact form is simply unavailable —
+    // fall through to the exploded form rather than abandoning the whole wrap.
+    let compact = (!magic && !elems.iter().any(forcing_multiline))
+        .then(|| {
+            elems
+                .iter()
+                .map(|e| expr_to_str(w, e))
+                .collect::<Option<Vec<_>>>()
+                .map(|parts| parts.join(", "))
+        })
+        .flatten()
+        .map(|flat| format!("{}{}", w.indent(child), flat))
+        .filter(|line| width(line) <= w.max);
+    if let Some(compact) = compact {
+        out.push(compact);
+        out.push(format!("{}{}", w.indent(indent), suffix));
+        return Some(out);
     }
     // Exploded: one element per line.
     let n = elems.len();

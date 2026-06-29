@@ -1997,6 +1997,32 @@ fn compact_paren_wrap(
 /// inter-token spacing from scratch (so an already-wrapped statement is flattened). Returns `None`
 /// when the statement must be kept **verbatim**: it contains a comment, a multi-line lambda body, a
 /// backslash continuation, or a multi-line string (whose own newlines must be preserved).
+/// Whether a multi-line statement that could not be flattened to one line is safe to re-lay-out via
+/// the CST wrapper. It must (a) carry no comment — the wrapper does not thread comments through — and
+/// (b) contain a lambda, the one legitimate reason a statement cannot collapse to a single line (so we
+/// leave a multi-line string or an already-wrapped plain call verbatim). A leading `func`/`static func`
+/// is a function *declaration* header (its `func` is not a lambda), so it is excluded.
+fn stmt_is_rewrappable_multiline(stmt: &str) -> bool {
+    let toks = gdscript_syntax::tokenize(stmt);
+    if toks.iter().any(|t| {
+        matches!(
+            t.kind,
+            SyntaxKind::LineComment
+                | SyntaxKind::DocComment
+                | SyntaxKind::RegionComment
+                | SyntaxKind::EndRegionComment
+        )
+    }) {
+        return false;
+    }
+    let lead = stmt.trim_start();
+    let lead = lead.strip_prefix("static ").unwrap_or(lead);
+    if lead.starts_with("func ") || lead.starts_with("func(") {
+        return false;
+    }
+    toks.iter().any(|t| t.kind == SyntaxKind::FuncKw)
+}
+
 fn flatten_statement(stmt: &str) -> Option<String> {
     use SyntaxKind as S;
     let raw = gdscript_syntax::tokenize(stmt);
@@ -2247,8 +2273,20 @@ fn reflow(formatted: &str, config: &FmtConfig) -> String {
                 .checked_div(config.indent_size)
                 .unwrap_or(0)
         };
-        let rendered =
-            flatten_statement(&stmt).map(|body| render_statement(&body, indent, config, tw, &unit));
+        let rendered = match flatten_statement(&stmt) {
+            Some(body) => Some(render_statement(&body, indent, config, tw, &unit)),
+            // A statement that cannot be collapsed onto one physical line *because it carries a
+            // multi-line lambda body* (a compound- or multi-statement-bodied lambda argument) is still
+            // re-laid-out by the CST wrapper directly, from its dedented multi-line form — gdformat
+            // reformats *every* statement, not just single-line ones. We only attempt this for a
+            // comment-free lambda-bearing statement (the wrapper does not carry comments through, and a
+            // plain multi-line string / already-wrapped statement is better left verbatim); the wrapper
+            // still self-validates meaning-equivalence and returns `None` (→ verbatim) otherwise.
+            None if stmt_is_rewrappable_multiline(&stmt) => {
+                wrap::render(&wrap::dedent(&stmt), indent, config)
+            }
+            None => None,
+        };
         out.push_str(rendered.as_deref().unwrap_or(&stmt));
         if j + 1 < lines.len() {
             out.push('\n');
@@ -2705,10 +2743,14 @@ mod tests {
             fmt("func _r():\n\tx.connect(func() -> void:\n\t\tdo_thing()\n\t)\n"),
             "func _r():\n\tx.connect(func() -> void: do_thing())\n"
         );
-        // a two-statement lambda body stays multi-line (and parses)
+        // a two-statement lambda body stays multi-line; the lambda argument explodes onto its own
+        // line (gdformat's `_format_lambda_to_multiple_lines`, reached via the multi-line re-wrap).
         let multi = "func _r():\n\tx.connect(func() -> void:\n\t\ta()\n\t\tb()\n\t)\n";
         let out = fmt(multi);
-        assert!(out.contains("\n\t\ta()\n\t\tb()"), "{out:?}");
+        assert_eq!(
+            out,
+            "func _r():\n\tx.connect(\n\t\tfunc() -> void:\n\t\t\ta()\n\t\t\tb()\n\t)\n"
+        );
         assert!(parses_clean(&out), "{out:?}");
         assert_eq!(fmt(&out), out, "idempotent");
     }
