@@ -66,6 +66,11 @@ pub struct FmtConfig {
     /// `func f(): return` → split, `a; b` → two lines), matching gdformat. An inline *lambda* body
     /// (`func(): x`) is preserved. On by default. Token-preserving (adds only newlines/indent).
     pub expand_inline_blocks: bool,
+    /// Remove redundant grouping parens from a *standalone-expression* position — a var/const/return
+    /// value, a `for` iterable, an `if`/`while` condition, a call argument, an array/dict element, a
+    /// nested `(…)` — matching gdformat's `remove_outer_parentheses`. Precedence-significant parens
+    /// (`(a + b) * c`) are kept. On by default. Token-mutating; guarded by the meaning-equivalence net.
+    pub strip_parens: bool,
     /// Re-parse + significant-token-equality fallback to verbatim. Keep on unless you have a
     /// reason not to: it is the guarantee the formatter never changes meaning.
     pub safe_mode: bool,
@@ -83,6 +88,7 @@ impl Default for FmtConfig {
             reflow: true,
             normalize_strings: true,
             expand_inline_blocks: true,
+            strip_parens: true,
             safe_mode: true,
         }
     }
@@ -189,7 +195,14 @@ fn format_lf(source: &str, config: &FmtConfig) -> String {
     if config.safe_mode && !input_parses {
         return source.to_owned();
     }
-    // De-inline suite bodies first, so the rest of the pipeline sees a one-statement-per-line tree.
+    // Strip redundant grouping parens, then de-inline suite bodies, so the rest of the pipeline sees a
+    // paren-clean, one-statement-per-line tree. Each pre-pass self-validates and is a no-op otherwise.
+    let stripped = if config.strip_parens {
+        strip_outer_parens(source)
+    } else {
+        None
+    };
+    let source = stripped.as_deref().unwrap_or(source);
     let expanded = if config.expand_inline_blocks {
         expand_inline_blocks(source, config)
     } else {
@@ -310,6 +323,71 @@ fn collect_inline_splits(
         // below the `match` with no intervening `Block` node).
         let deeper = suite || (node.kind() == S::MatchStmt && child.kind() == S::MatchArm);
         collect_inline_splits(child, src, depth + usize::from(deeper), unit, splits);
+    }
+}
+
+/// Remove redundant grouping parens from standalone-expression positions, matching gdformat's
+/// `remove_outer_parentheses`. A `ParenExpr` is redundant when its parent uses it as a *whole
+/// expression* (a value / condition / iterable / argument / element / nested paren) rather than as an
+/// *operand* of a larger expression — `(a + b) * c` keeps its parens because the parent is the `*`
+/// `BinExpr`. Returns `None` (leave the source) if it does not parse, has no such parens, or the
+/// result is not meaning-equivalent / does not parse (the net catches a precedence-changing strip).
+fn strip_outer_parens(source: &str) -> Option<String> {
+    let parse = gdscript_syntax::parse(source);
+    if !parse.errors().is_empty() {
+        return None;
+    }
+    let mut dels: Vec<usize> = Vec::new(); // byte offsets of `(`/`)` tokens to delete (1 byte each)
+    collect_redundant_parens(&parse.syntax_node(), &mut dels);
+    if dels.is_empty() {
+        return None;
+    }
+    dels.sort_unstable_by(|a, b| b.cmp(a)); // delete right-to-left
+    let mut out = source.to_owned();
+    for off in &dels {
+        out.replace_range(*off..=*off, "");
+    }
+    if !meaning_preserved(source, &out) || !gdscript_syntax::parse(&out).errors().is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Whether a `ParenExpr` child of a node of `parent` is a redundant grouping paren (a standalone
+/// expression), not a precedence-bearing operand.
+fn paren_parent_strips(parent: SyntaxKind) -> bool {
+    use SyntaxKind as S;
+    matches!(
+        parent,
+        S::VarDecl
+            | S::ConstDecl
+            | S::ReturnStmt
+            | S::ForStmt
+            | S::IfStmt
+            | S::ElifClause
+            | S::WhileStmt
+            | S::MatchStmt
+            | S::ExprStmt
+            | S::ArgList
+            | S::ArrayLit
+            | S::DictEntry
+            | S::ParenExpr
+    )
+}
+
+/// Collect the byte offsets of the `(`/`)` tokens of every redundant `ParenExpr`.
+fn collect_redundant_parens(node: &gdscript_syntax::GdNode, dels: &mut Vec<usize>) {
+    use cstree::util::NodeOrToken;
+    for child in node.children() {
+        if child.kind() == SyntaxKind::ParenExpr && paren_parent_strips(node.kind()) {
+            for c in child.children_with_tokens() {
+                let NodeOrToken::Token(t) = c else { continue };
+                if matches!(t.kind(), SyntaxKind::LParen | SyntaxKind::RParen) {
+                    dels.push(usize::from(t.text_range().start()));
+                }
+            }
+        }
+        collect_redundant_parens(child, dels);
     }
 }
 
@@ -2446,8 +2524,10 @@ mod tests {
         assert_eq!(fmt_stmt("var x = a if c else b"), "var x = a if c else b"); // ternary
         assert_eq!(fmt_stmt("var y = not  flag"), "var y = not flag");
         assert_eq!(fmt_stmt("var z = n is int"), "var z = n is int");
-        // a grouping paren after a value-keyword keeps its space; a call paren hugs.
-        assert_eq!(fmt_stmt("return ( x )"), "return (x)");
+        // a redundant grouping paren after a value-keyword is stripped; a precedence-significant one
+        // is kept (with its space after the keyword), and a call paren hugs.
+        assert_eq!(fmt_stmt("return ( x )"), "return x");
+        assert_eq!(fmt_stmt("return ( a + b ) * c"), "return (a + b) * c");
     }
 
     #[test]
@@ -2969,6 +3049,26 @@ mod tests {
             fmt("func h():\n\tvar a := func(): return 1\n"),
             "func h():\n\tvar a := func(): return 1\n"
         );
+    }
+
+    #[test]
+    fn redundant_grouping_parens_are_stripped() {
+        // gdformat strips parens that merely group a standalone expression (value / condition /
+        // iterable / argument / element / nested), but keeps precedence-significant ones.
+        assert_eq!(fmt("var x = (y)\n"), "var x = y\n");
+        assert_eq!(
+            fmt("func f():\n\treturn (g(a))\n"),
+            "func f():\n\treturn g(a)\n"
+        );
+        assert_eq!(
+            fmt("func f():\n\tfor i in (a * b):\n\t\tpass\n"),
+            "func f():\n\tfor i in a * b:\n\t\tpass\n"
+        );
+        assert_eq!(fmt("var a = g((x))\n"), "var a = g(x)\n"); // call arg + nested
+        assert_eq!(fmt("var a = {(k): (v)}\n"), "var a = {k: v}\n");
+        // precedence parens kept; an expr-statement assignment RHS keeps its parens (gdformat does too)
+        assert_eq!(fmt("var a = (b + c) * d\n"), "var a = (b + c) * d\n");
+        assert_eq!(fmt("func f():\n\tx = (y)\n"), "func f():\n\tx = (y)\n");
     }
 
     #[test]
