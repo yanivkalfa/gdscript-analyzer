@@ -104,6 +104,12 @@ impl FmtConfig {
 /// by flipping CRLF to LF (matching gdformat, which preserves line endings).
 #[must_use]
 pub fn format(source: &str, config: &FmtConfig) -> String {
+    // A leading byte-order mark is preserved (gdformat keeps it): strip it, format the rest, re-add it.
+    // Otherwise the reflow — which re-emits each statement from its *significant* tokens — would drop
+    // the BOM (a trivia token) when it re-renders the first line.
+    if let Some(rest) = source.strip_prefix('\u{feff}') {
+        return format!("\u{feff}{}", format(rest, config));
+    }
     if source.contains("\r\n") {
         let lf = source.replace("\r\n", "\n");
         return format_lf(&lf, config).replace('\n', "\r\n");
@@ -721,7 +727,16 @@ fn reindent(source: &str, config: &FmtConfig) -> String {
                         SyntaxKind::Tilde | SyntaxKind::Bang => true,
                         _ => false,
                     };
-                    prev_sig = Some(t.kind);
+                    // A soft keyword (`match`/`when`) used as a *member* (`obj.match`) is an ordinary
+                    // identifier operand — record it as `Ident` so a following `(` hugs it
+                    // (`obj.match(x)`), while a leading `match (x):` statement keeps its space.
+                    let member_soft_kw = matches!(t.kind, SyntaxKind::MatchKw | SyntaxKind::WhenKw)
+                        && prev_sig == Some(SyntaxKind::Dot);
+                    prev_sig = Some(if member_soft_kw {
+                        SyntaxKind::Ident
+                    } else {
+                        t.kind
+                    });
                 }
             }
         }
@@ -2796,6 +2811,30 @@ mod tests {
         assert_eq!(fmt(src), src);
         let src2 = "#region Section\nvar a = 1\nvar b = 2\n#endregion\n";
         assert_eq!(fmt(src2), src2);
+    }
+
+    #[test]
+    fn leading_bom_is_preserved() {
+        // gdformat keeps a leading byte-order mark; the reflow must not drop it when it re-renders the
+        // first statement from its significant tokens.
+        let src = "\u{feff}class_name Foo\nvar x = 1\n";
+        let out = fmt(src);
+        assert!(out.starts_with('\u{feff}'), "{out:?}");
+        assert_eq!(&out[3..], "class_name Foo\nvar x = 1\n");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn soft_keyword_member_call_hugs_paren_but_statement_keeps_space() {
+        // `obj.match(x)` is a member call (tight `(`), while a `match (x):` statement keeps its space.
+        assert_eq!(
+            fmt("func f():\n\tvar m = obj.match(\"a\", \"b\")\n"),
+            "func f():\n\tvar m = obj.match(\"a\", \"b\")\n"
+        );
+        assert_eq!(
+            fmt("func f():\n\tmatch (x):\n\t\tpass\n"),
+            "func f():\n\tmatch (x):\n\t\tpass\n"
+        );
     }
 
     // ---- Phase-4: string-quote normalization (gdformat / Black rule) ----
