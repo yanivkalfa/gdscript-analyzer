@@ -1292,24 +1292,75 @@ fn format_operator_chain(
     let (lpar, rpar) = if inside_par { ("", "") } else { ("(", ")") };
     let mut out = vec![format!("{}{}{}", w.indent(indent), prefix, lpar)];
     let child = indent + 1;
-    // Compact first: the whole chain on one continuation line, if it fits (gdformat renders the
-    // bracketed chain via `_format_foldable`, which tries single-line before exploding per operator).
+    // A standalone (own-line) comment interspersed between operands forces the chain multi-line and
+    // is re-emitted on its own line at the operand indent (gdformat's `_add_standalone_comments`,
+    // whose `_get_greater_indent` resolves to the operand lines' depth).
+    let (before, tail) = chain_standalone_comments(w, &operands, node);
+    let has_standalone = node_has_standalone_comment(node, &w.src);
+    // Compact first: the whole chain on one continuation line, if it fits and nothing forces it apart
+    // (gdformat renders the bracketed chain via `_format_foldable`, single-line before exploding).
     if let Some(flat) = expr_to_str(w, node) {
         let compact = format!("{}{}", w.indent(child), flat);
-        if !forcing_multiline(node) && width(&compact) <= w.max {
+        if !forcing_multiline(node) && !has_standalone && width(&compact) <= w.max {
             out.push(compact);
             out.push(format!("{}{}{}", w.indent(indent), rpar, suffix));
             return Some(out);
         }
     }
-    // Otherwise explode operator-leading, one operand per line.
+    // Otherwise explode operator-leading, one operand per line, threading any interspersed comments.
+    for c in &before[0] {
+        out.push(format!("{}{c}", w.indent(child)));
+    }
     out.extend(format_operand(w, &operands[0], child, "", "")?);
     for (i, op) in ops.iter().enumerate() {
+        for c in &before[i + 1] {
+            out.push(format!("{}{c}", w.indent(child)));
+        }
         let pfx = format!("{op} ");
         out.extend(format_operand(w, &operands[i + 1], child, &pfx, "")?);
     }
+    for c in &tail {
+        out.push(format!("{}{c}", w.indent(child)));
+    }
     out.push(format!("{}{}{}", w.indent(indent), rpar, suffix));
     Some(out)
+}
+
+/// Partition the standalone (own-line) comments that sit *between* an operator chain's operands into
+/// per-operand "before" buckets (`before[i]` precedes operand `i`) plus a `tail` (after the last
+/// operand). A comment inside an operand's own code span is left to that operand's recursive
+/// formatting; an inline (non-line-leading) comment is left to the comment-multiset net. The text is
+/// the comment verbatim (trimmed), to be emitted at the operand indent.
+fn chain_standalone_comments(
+    w: &W,
+    operands: &[Operand],
+    node: &GdNode,
+) -> (Vec<Vec<String>>, Vec<String>) {
+    let spans: Vec<Option<(usize, usize)>> = operands
+        .iter()
+        .map(|o| match o {
+            Operand::Node(n) => code_span(n),
+            Operand::Text(_) => None,
+        })
+        .collect();
+    let mut before: Vec<Vec<String>> = vec![Vec::new(); operands.len()];
+    let mut tail: Vec<String> = Vec::new();
+    let mut all = Vec::new();
+    comment_tokens(node, &w.src, &mut all);
+    for (off, _, text) in all {
+        let line_start = w.src[..off].rfind('\n').map_or(0, |i| i + 1);
+        if !w.src[line_start..off].trim().is_empty() {
+            continue; // an inline comment — left to the multiset net
+        }
+        if spans.iter().flatten().any(|&(s, e)| s <= off && off < e) {
+            continue; // inside an operand — handled by its own formatting
+        }
+        match spans.iter().position(|s| s.is_some_and(|(s, _)| s > off)) {
+            Some(i) => before[i].push(text),
+            None => tail.push(text),
+        }
+    }
+    (before, tail)
 }
 
 fn format_operand(

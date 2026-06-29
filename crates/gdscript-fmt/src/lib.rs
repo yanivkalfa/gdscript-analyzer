@@ -3943,6 +3943,16 @@ mod tests {
     }
 
     #[test]
+    fn comments_thread_through_an_operator_chain_wrap() {
+        // A standalone comment between operands of a paren-wrapped operator chain is re-emitted on its
+        // own line at the operand indent (one level past the assignment), matching gdformat — and the
+        // chain is forced multi-line by the comment even though it would otherwise fit on one line.
+        let src = "func f():\n\tx = (\n\t\t\ta\n\t\t\t# note\n\t\t\t- b\n\t)\n";
+        let want = "func f():\n\tx = (\n\t\ta\n\t\t# note\n\t\t- b\n\t)\n";
+        assert_eq!(fmt(src), want);
+    }
+
+    #[test]
     fn a_block_trailing_comment_keeps_its_shallower_indent() {
         // A comment after a nested block, indented to the enclosing function body, stays at the body's
         // depth (gdformat places it in the block whose range contains it), not snapped to column 0.
