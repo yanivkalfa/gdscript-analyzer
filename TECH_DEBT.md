@@ -683,11 +683,19 @@ The "do 1–8" follow-up batch. Each is documented in full under its own Phase s
 - [x] **§2 parser hardening:** **307 → 0** `GDSCRIPT_SYNTAX` errors on godot-demo-projects.
 
 ### Deferred (Phase-5)
-- [ ] **LSP read dispatch is thread-per-request** (`std::thread::spawn` per read), not a bounded pool.
-      Fine for an editor (request rate is editor-bounded); under adversarial load it could spawn many
-      threads. A bounded worker pool + a Worker/LatencySensitive split is the follow-up. **Low
-      criticality, no correctness gain** (salsa cancellation already makes thread-per-request correct);
-      deferred deliberately in the hardening pass rather than risk the snapshot-lifetime subtleties.
+- [x] **LSP read dispatch → BOUNDED WORKER POOL (burndown Stage 8.36).** Read requests were dispatched
+      with a `std::thread::spawn` *per read*, which under adversarial request load could spawn unboundedly
+      many threads. Replaced with a fixed `WorkerPool` (`crates/gdscript-lsp/src/lib.rs`): `available_
+      parallelism`-sized (clamped to `[2, 8]`) worker threads draining an unbounded job queue
+      (crossbeam, already a dep). Each `Job` still owns its `Analysis` snapshot taken at **dispatch**
+      time (so it reflects the host revision at request arrival) and posts its own `Response` to
+      `task_tx` — semantics-identical to before; only the thread count is now bounded. Salsa cancellation
+      already made each snapshot read correct, so this adds **no** correctness, only robustness. `Drop`
+      closes the queue (crossbeam drains the buffered jobs to the workers first) and joins — no leaked
+      threads across the LSP test `GlobalState`s. Validated: all 33 LSP tests pass through the pool +
+      `worker_pool_runs_every_submitted_job` (200 jobs ≫ pool size, all run). **The Worker/Latency-
+      Sensitive priority split stays a refinement** (a 2-lane queue prioritising completion/hover over
+      find-refs) — additive, no correctness gain, deferred until an editor-latency need is shown.
 - [ ] **napi cross-platform matrix is 6/10 triples** (mac x2, win x64 + arm64, linux gnu x2). DEFERRED:
       this is release-pipeline CI that **cannot be verified on the local Windows-gnu box** (no Linux
       cross-toolchain, no zig/cross/WASI-SDK), and pushing unverified cross-compile + publish YAML into

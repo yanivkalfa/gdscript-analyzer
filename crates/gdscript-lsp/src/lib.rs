@@ -253,11 +253,73 @@ struct GlobalState {
     /// burst of keystrokes recomputes+publishes diagnostics once, after a short quiescence, rather
     /// than synchronously on every keystroke. `None` when nothing is pending.
     diag_timer: Option<Receiver<Instant>>,
+    /// The bounded worker pool that read requests are dispatched onto (replacing a per-request
+    /// `thread::spawn` — see [`WorkerPool`]).
+    pool: WorkerPool,
 }
 
 /// How long to wait for typing to settle before recomputing diagnostics (debounce window). The
 /// incremental analyzer is fast (<5 ms warm), so this only collapses redundant work during a burst.
 const DIAG_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// A read-request closure: it already owns its [`Analysis`] snapshot (taken at *dispatch* time, so it
+/// reflects the host revision at request arrival) and posts its own `Response` to `task_tx` — a
+/// worker only has to run it.
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// A fixed-size pool of worker threads draining read-request [`Job`]s. Replaces a per-request
+/// `std::thread::spawn`, which under adversarial request load could spawn unboundedly many threads.
+/// Salsa cancellation already makes each snapshot read correct (a concurrent edit unwinds it), so the
+/// pool adds no correctness — it only **bounds** the live thread count. Size is `available_parallelism`
+/// clamped to a small range: ≥2 so a slow read can't starve the others, ≤8 since LSP request
+/// parallelism beyond a handful is pointless.
+struct WorkerPool {
+    /// `None` once [`Drop`] has closed the queue; [`submit`](Self::submit) is then a no-op.
+    job_tx: Option<Sender<Job>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl WorkerPool {
+    fn new() -> Self {
+        let size = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZeroUsize::get)
+            .clamp(2, 8);
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+        let workers = (0..size)
+            .map(|_| {
+                let rx = job_rx.clone();
+                // Drain jobs until the queue is closed (server shutdown / pool drop). Each job posts
+                // its own `Response`, so a worker only runs it.
+                std::thread::spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
+            })
+            .collect();
+        Self {
+            job_tx: Some(job_tx),
+            workers,
+        }
+    }
+
+    fn submit(&self, job: Job) {
+        if let Some(tx) = &self.job_tx {
+            let _ = tx.send(job);
+        }
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        // Close the queue (drop the only `Sender`) so idle workers' `recv()` returns `Err` and they
+        // exit, then join them — no leaked threads across the LSP test `GlobalState`s.
+        self.job_tx = None;
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
 
 impl GlobalState {
     fn new(encoding: PositionEncoding, task_tx: Sender<Message>, roots: Vec<Uri>) -> Self {
@@ -272,6 +334,7 @@ impl GlobalState {
             project_root: None,
             dirty_diags: HashSet::new(),
             diag_timer: None,
+            pool: WorkerPool::new(),
         }
     }
 
@@ -441,7 +504,7 @@ impl GlobalState {
     {
         let analysis = self.host.analysis();
         let tx = self.task_tx.clone();
-        std::thread::spawn(move || {
+        self.pool.submit(Box::new(move || {
             // Catch a query panic (a real bug — `Cancelled` is an `Err`, not a panic) so the client
             // always gets a reply instead of hanging forever on this request id. Salsa uses
             // non-poisoning locks, so discarding the panicked snapshot leaves the host intact.
@@ -455,7 +518,7 @@ impl GlobalState {
                 Err(_panic) => Response::new_err(id, INTERNAL_ERROR, "internal error".to_owned()),
             };
             let _ = tx.send(Message::Response(resp));
-        });
+        }));
     }
 
     /// Respond with `null` (a valid "nothing here" answer for the read requests).
@@ -542,7 +605,7 @@ impl GlobalState {
     {
         let analysis = self.host.analysis();
         let tx = self.task_tx.clone();
-        std::thread::spawn(move || {
+        self.pool.submit(Box::new(move || {
             let computed =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute(&analysis)));
             let resp = match computed {
@@ -554,7 +617,7 @@ impl GlobalState {
                 Err(_panic) => Response::new_err(id, INTERNAL_ERROR, "internal error".to_owned()),
             };
             let _ = tx.send(Message::Response(resp));
-        });
+        }));
     }
 
     /// Dispatch `textDocument/rename` (cross-file edit → a `WorkspaceEdit`, or a refusal error).
@@ -914,6 +977,30 @@ mod tests {
             crossbeam_channel::unbounded().0,
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn worker_pool_runs_every_submitted_job() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const N: usize = 200;
+        // Submit far more jobs than the pool's thread count: every one must run (the bounded pool
+        // never drops a request — it queues). Dropping the pool closes the queue; crossbeam drains
+        // the buffered jobs to the workers before `recv()` returns `Err`, then `Drop` joins them.
+        let pool = WorkerPool::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        for _ in 0..N {
+            let c = Arc::clone(&counter);
+            pool.submit(Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        drop(pool); // closes the queue + joins the workers after they drain all 200 jobs
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            N,
+            "the bounded pool must run every submitted job"
+        );
     }
 
     /// A unique scratch directory that wipes itself on drop (no `tempfile` dep).
