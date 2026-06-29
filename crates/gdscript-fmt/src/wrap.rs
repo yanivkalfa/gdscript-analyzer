@@ -629,9 +629,29 @@ fn is_foldable(node: &GdNode) -> bool {
     )
 }
 
-/// gdformat forces multiple lines when a magic trailing comma is present anywhere.
+/// gdformat forces multiple lines when a magic trailing comma is present anywhere, or for a lambda
+/// whose body is multi-statement or a single *compound* statement (`_is_multistatement_lambda` /
+/// `_is_unistatement_lambda_with_compound_statement`).
 fn forcing_multiline(node: &GdNode) -> bool {
+    if node.kind() == S::LambdaExpr && lambda_forces_multiline(node) {
+        return true;
+    }
     has_trailing_comma(node) || node.children().any(forcing_multiline)
+}
+
+/// A lambda body forces multiple lines: more than one statement, or a single compound statement.
+fn lambda_forces_multiline(node: &GdNode) -> bool {
+    let Some(block) = find_child(node, S::Block) else {
+        return false;
+    };
+    let stmts: Vec<GdNode> = block.children().cloned().collect();
+    match stmts.as_slice() {
+        [one] => matches!(
+            one.kind(),
+            S::IfStmt | S::ElifClause | S::ElseClause | S::ForStmt | S::WhileStmt | S::MatchStmt
+        ),
+        _ => true,
+    }
 }
 
 /// `true` if the bracket list `node` ends with a trailing comma (magic comma).
@@ -701,8 +721,29 @@ fn explode(w: &W, node: &GdNode, indent: usize, prefix: &str, suffix: &str) -> O
             )
         }
         S::DictEntry => format_dict_entry(w, node, indent, prefix, suffix),
+        S::LambdaExpr => format_lambda(w, node, indent, prefix, suffix),
         _ => None,
     }
+}
+
+/// gdformat's `_format_lambda_to_multiple_lines`: the header on the first line, the body block
+/// indented one level below, and the `suffix` appended to the body's last line.
+fn format_lambda(
+    w: &W,
+    node: &GdNode,
+    indent: usize,
+    prefix: &str,
+    suffix: &str,
+) -> Option<Vec<String>> {
+    let header = lambda_header_str(w, node)?;
+    let mut out = vec![format!("{}{prefix}{header}", w.indent(indent))];
+    let block = find_child(node, S::Block)?;
+    let child = indent + 1;
+    for stmt in block.children() {
+        out.extend(format_statement(w, stmt, child)?);
+    }
+    out.last_mut()?.push_str(suffix);
+    Some(out)
 }
 
 /// gdformat's `_format_kv_pair_to_multiple_lines`: the key keeps its `:`/` =` on its own line(s);
@@ -1555,6 +1596,43 @@ fn expr_to_str(w: &W, node: &GdNode) -> Option<String> {
             }
             Some(s)
         }
+        S::LambdaExpr => {
+            // Inline form (`func(params) [-> Type]: body`); only valid when the body is a single
+            // simple statement — otherwise `None` defers to the multi-line `explode` path.
+            let header = lambda_header_str(w, node)?;
+            let block = find_child(node, S::Block)?;
+            let stmts: Vec<GdNode> = block.children().cloned().collect();
+            let [stmt] = stmts.as_slice() else {
+                return None;
+            };
+            Some(format!("{header} {}", stmt_to_str(w, stmt)?))
+        }
+        _ => None,
+    }
+}
+
+/// The single-line lambda header `func{ name}(params)[ -> Type]:` (gdformat's `_lambda_header_to_str`).
+fn lambda_header_str(w: &W, node: &GdNode) -> Option<String> {
+    let name = name_of(node).map(|n| format!(" {n}")).unwrap_or_default();
+    let params = find_child(node, S::ParamList)?;
+    let ty = find_child_ty(node)
+        .map(|t| format!(" -> {}", node_text(&t)))
+        .unwrap_or_default();
+    Some(format!("func{name}({}){ty}:", args_to_str(w, &params)?))
+}
+
+/// Render a *simple* (non-compound, single-line) statement inline — used for an inline lambda body.
+/// Returns `None` for a compound or unmodelled statement so the caller falls back to multi-line.
+fn stmt_to_str(w: &W, stmt: &GdNode) -> Option<String> {
+    match stmt.kind() {
+        S::ExprStmt => expr_to_str(w, &first_expr_child(stmt)?),
+        S::ReturnStmt => match first_expr_child(stmt) {
+            Some(e) => Some(format!("return {}", expr_to_str(w, &e)?)),
+            None => Some("return".to_owned()),
+        },
+        S::PassStmt => Some("pass".to_owned()),
+        S::BreakStmt => Some("break".to_owned()),
+        S::ContinueStmt => Some("continue".to_owned()),
         _ => None,
     }
 }

@@ -2714,6 +2714,42 @@ mod tests {
     }
 
     #[test]
+    fn inline_lambda_value_in_exploded_dict_is_rendered() {
+        // A dict whose values include inline lambdas must wrap (the dict overflows) with each lambda
+        // kept inline — the CST wrapper renders `LambdaExpr` rather than bailing to the heuristic.
+        let src = "func r():\n\tvar n = V.line_edit({\"text\": t, \"on_changed\": func(x): cb.call(x), \"on_submit\": func(): add.call(), \"placeholder\": \"type a fairly long placeholder here\"})\n";
+        let out = fmt(src);
+        assert!(
+            out.contains("\"on_changed\": func(x): cb.call(x),"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("\"on_submit\": func(): add.call(),"),
+            "{out:?}"
+        );
+        assert!(parses_clean(&out), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn colon_dict_value_drops_below_key_when_entry_overflows() {
+        // A dict entry whose value pushes the line past the width splits `"key":` / value-below
+        // (gdformat's `_format_kv_pair_to_multiple_lines`); a fitting sibling stays inline.
+        let src = "func r():\n\tvar d = V.label({\"text\": \"a moderately long string value that does not fit on the line at all here for sure\" % n, \"style\": {\"c\": 1}})\n";
+        let out = fmt(src);
+        assert!(
+            out.contains("\t\t\t\"text\":\n"),
+            "value should drop below key: {out:?}"
+        );
+        assert!(
+            out.contains("\"style\": {\"c\": 1}"),
+            "fitting entry stays inline: {out:?}"
+        );
+        assert!(parses_clean(&out), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn over_indented_lambda_in_brackets_does_not_corrupt() {
         // The exact corpus shapes (godot-demo-projects rhythm_game) that used to format to
         // non-parsing code: the lambda HEADER sits on its own bracket-continuation line at an
