@@ -66,6 +66,16 @@ pub enum GodotDef {
         /// The engine symbol name.
         name: SmolStr,
     },
+    /// A node declared in a scene (`.tscn`), referenced by `$Path` / `%Unique` / `get_node("…")` in
+    /// scripts and by its `name="…"` in the scene. Identity = the owning scene + the node's full
+    /// name-path from (and including) the scene root — unique within a scene, stable across an edit.
+    /// The node's renamed name is the path's **last** segment.
+    SceneNode {
+        /// The owning `.tscn`.
+        scene: FileId,
+        /// The node's full path from (and including) the scene root (e.g. `"Main/Panel/StartButton"`).
+        path: SmolStr,
+    },
 }
 
 impl GodotDef {
@@ -77,6 +87,8 @@ impl GodotDef {
             | Self::Member { name, .. }
             | Self::Autoload { name, .. }
             | Self::Engine { name } => name,
+            // A node's own name is the last segment of its full path (e.g. `StartButton`).
+            Self::SceneNode { path, .. } => path.rsplit('/').next().unwrap_or(path),
             Self::Local { .. } => "", // filled by the caller from the decl range
         }
     }
@@ -94,8 +106,22 @@ impl GodotDef {
 #[must_use]
 pub fn classify(db: &dyn Db, pos: FilePosition) -> Option<GodotDef> {
     let ft = db.file_text(pos.file)?;
+    // A scene file (`.tscn`/`.tres`) is not GDScript: the only classifiable position is a node's
+    // `name="…"` value, which identifies that scene node (the rename target for `$Path` references).
+    if ft
+        .res_path(db)
+        .as_deref()
+        .is_some_and(crate::queries::is_scene_path)
+    {
+        return classify_scene_name(db, ft, pos.file, pos.offset);
+    }
     let root = parse(db, ft).syntax_node();
     let tok = ast::token_at(&root, pos.offset.into())?;
+    // The cursor inside a `$Path`/`%Unique` expression identifies the scene node at the segment under
+    // it (a mid-path segment resolves the path *up to* there) — so a node can be renamed from a script.
+    if let Some(def) = classify_node_path_at(db, ft, pos.file, &tok, pos.offset) {
+        return Some(def);
+    }
     let parent = tok.parent();
     // Identifiers are symbols. The soft keywords `match`/`when` are too — but ONLY in a name
     // position (a `Name` decl, or a `NameRef`/`FieldExpr` member). A bare `match` *statement* keyword
@@ -483,6 +509,111 @@ pub fn node_path_target(db: &dyn Db, pos: FilePosition) -> Option<NodePathTarget
         node_name: node.name.clone(),
         header_span: node.header_span,
         name_span: node.name_span,
+    })
+}
+
+// ---- W8: node-as-symbol classification (scene-aware rename) -------------------------------
+
+/// Classify the cursor when it sits inside a `$Path`/`%Unique` node-path expression: resolve the
+/// path **up to the segment under the cursor** to a scene node, returning its [`GodotDef::SceneNode`]
+/// identity. A mid-path segment (`$A/B/C` on `B`) resolves `A/B`, so renaming `B` is distinct from
+/// renaming `C`. `None` when the cursor is not in a node path, the attachment is ambiguous
+/// (multi-scene — we can't say *which* scene's node), or the path doesn't resolve.
+fn classify_node_path_at(
+    db: &dyn Db,
+    ft: FileText,
+    _file: FileId,
+    tok: &GdToken,
+    offset: u32,
+) -> Option<GodotDef> {
+    let np = node_path_ancestor(tok)?;
+    let unique = np.kind() == SyntaxKind::UniqueNodeExpr;
+    let truncated = node_path_up_to_cursor(&np, offset)?;
+    let ctx = crate::queries::scene_context(db, ft)?;
+    if ctx.ambiguous {
+        return None; // multi-scene attachment — we can't identify *which* scene's node
+    }
+    let idx = if unique {
+        ctx.model.resolve_unique(&truncated)
+    } else {
+        ctx.model.resolve_path_from(ctx.attach, &truncated)
+    }?;
+    Some(GodotDef::SceneNode {
+        scene: ctx.scene,
+        path: ctx.model.node_full_path(idx)?,
+    })
+}
+
+/// The innermost `GetNodeExpr`/`UniqueNodeExpr` ancestor of `tok`, if any.
+fn node_path_ancestor(tok: &GdToken) -> Option<GdNode> {
+    let mut cur = Some(tok.parent().clone());
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            SyntaxKind::GetNodeExpr | SyntaxKind::UniqueNodeExpr
+        ) {
+            return Some(n);
+        }
+        cur = n.parent().cloned();
+    }
+    None
+}
+
+/// The node path `np` truncated to (and including) the segment the cursor at `offset` is on. Two CST
+/// shapes: a token form (`$Panel/StartButton` — each segment its own `Ident`) and a string form
+/// (`$"Panel/StartButton"` — one `String` holding the path).
+fn node_path_up_to_cursor(np: &GdNode, offset: u32) -> Option<String> {
+    // String form: locate the segment by byte offset inside the quoted content.
+    if let Some(str_tok) = np
+        .children_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .find(|t| t.kind() == SyntaxKind::String)
+    {
+        let range = cst::token_range(str_tok);
+        let content = str_tok.text().trim_matches(['"', '\'']);
+        let content_start = range.start + 1; // past the opening quote
+        let rel = offset.checked_sub(content_start)? as usize;
+        if rel > content.len() {
+            return None;
+        }
+        let end = content[rel.min(content.len())..]
+            .find('/')
+            .map_or(content.len(), |i| rel + i);
+        return Some(content[..end].to_owned());
+    }
+    // Token form: the segment `Ident`s (range, text) in order; keep through the one at the cursor.
+    let idents: Vec<(TextRange, String)> = np
+        .children_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .filter(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| (cst::token_range(t), t.text().to_owned()))
+        .collect();
+    let hit = idents
+        .iter()
+        .position(|(r, _)| offset >= r.start && offset <= r.end)
+        // the cursor sits on a `/` or trailing space — attribute it to the preceding segment
+        .or_else(|| idents.iter().rposition(|(r, _)| r.start <= offset))?;
+    Some(
+        idents[..=hit]
+            .iter()
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// Classify a position in a `.tscn`: the node whose `name="…"` value contains the cursor →
+/// [`GodotDef::SceneNode`]. `None` if the cursor is not on a node name.
+fn classify_scene_name(db: &dyn Db, ft: FileText, file: FileId, offset: u32) -> Option<GodotDef> {
+    let model = crate::queries::scene_model(db, ft);
+    let idx = model
+        .nodes
+        .iter()
+        .position(|n| offset >= n.name_span.start && offset < n.name_span.end)?;
+    let node_idx = gdscript_scene::NodeIdx(u32::try_from(idx).ok()?);
+    Some(GodotDef::SceneNode {
+        scene: file,
+        path: model.node_full_path(node_idx)?,
     })
 }
 

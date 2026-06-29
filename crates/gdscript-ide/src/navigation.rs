@@ -320,6 +320,14 @@ fn refuse_if_crosses_boundary(db: &dyn Db, def: &GodotDef) -> Result<(), RenameE
         GodotDef::Autoload { .. } => Err(RenameError::CrossesUnsupportedBoundary {
             what: "autoload name is declared in project.godot (not rewritten by rename)".to_owned(),
         }),
+        // A scene-node rename rewrites its `name=` plus every `$Path`/`parent=`/`[connection]`
+        // segment referencing it. That write path (and its correct-or-refuse guards) is wired in the
+        // next milestone; until then read-side classify / goto / find-refs are available but a rename
+        // refuses rather than risk a partial edit.
+        GodotDef::SceneNode { .. } => Err(RenameError::CrossesUnsupportedBoundary {
+            what: "renaming a scene node is not yet supported (read-side navigation only)"
+                .to_owned(),
+        }),
         // A member refuses when it has a reference surface we cannot rewrite: a type-only inner
         // class / named enum, or a method/var/const/signal that may be named by a project string.
         GodotDef::Member { owner_file, name } => match member_symbol_kind(db, *owner_file, name) {
@@ -447,7 +455,9 @@ fn collision_check(db: &dyn Db, def: &GodotDef, new_name: &str) -> Result<(), Re
                 }
             }
         }
-        GodotDef::Autoload { .. } | GodotDef::Engine { .. } => {}
+        // Autoload/Engine have no rename collision surface here. A scene node's sibling-collision
+        // check is wired with its write path (the next milestone), where scene + parent are known.
+        GodotDef::Autoload { .. } | GodotDef::Engine { .. } | GodotDef::SceneNode { .. } => {}
     }
     Ok(())
 }
@@ -643,6 +653,19 @@ fn nav_target_of_def(db: &dyn Db, def: &GodotDef) -> Option<NavTarget> {
             target_file: None, ..
         }
         | GodotDef::Engine { .. } => None,
+        // A scene node's declaration is its `[node …]` line in the owning `.tscn` (focus = `name=`).
+        GodotDef::SceneNode { scene, path } => {
+            let ft = db.file_text(*scene)?;
+            let model = queries::scene_model(db, ft);
+            let node = model.node(model.node_by_full_path(path)?)?;
+            Some(NavTarget {
+                file: *scene,
+                full_range: node.header_span,
+                focus_range: node.name_span,
+                name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+                kind: SymbolKind::Class,
+            })
+        }
     }
 }
 
@@ -1395,6 +1418,40 @@ script = ExtResource(\"1\")\n\
             change.edits.iter().all(|e| e.file != FileId(2)),
             "{:?}",
             change.edits
+        );
+    }
+
+    const NODE_GD: &str = "extends Control\nfunc _ready():\n\tvar b = $Button\n";
+    const NODE_TSCN: &str = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://w.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Button\" type=\"Control\" parent=\".\"]\n";
+
+    #[test]
+    fn classify_agrees_from_a_node_path_and_the_scene_name() {
+        let db = db_paths(&[(0, "res://w.gd", NODE_GD), (1, "res://w.tscn", NODE_TSCN)]);
+        // The `$Button` in the script and the `name="Button"` in the scene resolve to the SAME node.
+        let from_gd = def::classify(&db, pos(0, "Button", 0, NODE_GD)).expect("gd classifies");
+        let from_tscn =
+            def::classify(&db, pos(1, "Button", 0, NODE_TSCN)).expect("tscn classifies");
+        assert_eq!(from_gd, from_tscn);
+        assert!(
+            matches!(&from_gd, GodotDef::SceneNode { path, .. } if path == "Main/Button"),
+            "{from_gd:?}"
+        );
+    }
+
+    #[test]
+    fn find_refs_on_a_node_path_spans_gd_and_tscn() {
+        let db = db_paths(&[(0, "res://w.gd", NODE_GD), (1, "res://w.tscn", NODE_TSCN)]);
+        let refs = find_references(&db, pos(0, "Button", 0, NODE_GD));
+        // The `$Button` use (gd) + the `name="Button"` declaration (tscn).
+        assert!(refs.iter().any(|r| r.file == FileId(0)), "gd ref: {refs:?}");
+        assert!(
+            refs.iter()
+                .any(|r| r.file == FileId(1) && r.kind == ReferenceKind::Declaration),
+            "tscn decl: {refs:?}"
         );
     }
 }

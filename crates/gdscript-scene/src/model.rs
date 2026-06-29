@@ -244,6 +244,36 @@ impl SceneModel {
         self.nodes.get(idx.0 as usize)
     }
 
+    /// The node's full name-path from (and **including**) the scene root, e.g.
+    /// `"Main/Panel/StartButton"` — the stable cross-reference identity of a node (the same value
+    /// whether reached from a `$Path` in a script or the node's `name="…"` in the scene). Walks
+    /// `parent_idx` to the root (depth-bounded against a cycle). `None` for an out-of-range index.
+    #[must_use]
+    pub fn node_full_path(&self, idx: NodeIdx) -> Option<SmolStr> {
+        let mut names: Vec<&str> = Vec::new();
+        let mut cur = Some(idx);
+        for _ in 0..1024 {
+            let Some(i) = cur else {
+                names.reverse();
+                return Some(SmolStr::new(names.join("/")));
+            };
+            let n = self.node(i)?;
+            names.push(n.name.as_str());
+            cur = n.parent_idx;
+        }
+        None // cyclic parent chain (degrade rather than loop)
+    }
+
+    /// The node whose [`node_full_path`](Self::node_full_path) equals `path` (the inverse lookup —
+    /// the node identified by a [`GodotDef::SceneNode`]'s stable path). `None` if no node matches.
+    #[must_use]
+    pub fn node_by_full_path(&self, path: &str) -> Option<NodeIdx> {
+        (0..self.nodes.len())
+            .filter_map(|i| u32::try_from(i).ok())
+            .map(NodeIdx)
+            .find(|&idx| self.node_full_path(idx).as_deref() == Some(path))
+    }
+
     /// Walk a name-path from the scene root. `""`/`"."` ⇒ the root. `None` ⇒ no such node (M1 reads
     /// that as "degrade to `Node`", never an error). A leading `/` (absolute) or a `..` segment is
     /// out of the slice and yields `None`.

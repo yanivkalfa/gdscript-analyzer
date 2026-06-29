@@ -498,9 +498,9 @@ impl<'a> Parser<'a> {
             .name
             .and_then(|s| self.extract_string(s))
             .unwrap_or_default();
-        let name_span = a
-            .name
-            .map_or(header_span, |(s, e)| TextRange::new(to_u32(s), to_u32(e)));
+        // The **inner** name span (quotes excluded) — a precise focus range for go-to-definition and
+        // the exact rewrite target for scene-aware rename (W8).
+        let name_span = a.name.map_or(header_span, |sp| self.inner_span(sp));
         let decl_type = a.typ.and_then(|s| self.extract_string(s));
         let parent_path = a.parent.and_then(|s| self.extract_string(s));
         let instance = a.instance.and_then(|(s, e)| self.extract_ext_id(s, e));
