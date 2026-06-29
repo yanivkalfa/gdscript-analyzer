@@ -466,6 +466,20 @@ fn line_of(src: &str, off: usize) -> usize {
     src[..off.min(src.len())].matches('\n').count()
 }
 
+/// The indentation level of an already-rendered line — how many leading `unit`s it begins with.
+fn line_level(line: &str, unit: &str) -> usize {
+    if unit.is_empty() {
+        return 0;
+    }
+    let mut rest = line;
+    let mut n = 0;
+    while let Some(r) = rest.strip_prefix(unit) {
+        rest = r;
+        n += 1;
+    }
+    n
+}
+
 /// Every comment token in `node`'s subtree, in source order: `(offset, line, text)` (text trimmed).
 fn comment_tokens(node: &GdNode, src: &str, out: &mut Vec<(usize, usize, String)>) {
     for c in node.children_with_tokens() {
@@ -527,6 +541,13 @@ fn collect_block_comments(block: &GdNode, src: &str, stmts: &[GdNode]) -> BlockC
         trailing: vec![None; n],
         tail: Vec::new(),
     };
+    // The block's body indent (the leading-whitespace length of its first statement). A *standalone*
+    // comment dedented below this is not part of the block — it trails the enclosing construct (e.g. a
+    // comment between a lambda argument and the next argument of the call) and is left to that owner.
+    let body_len = spans.iter().flatten().next().map(|&(cs, _)| {
+        let ls = src[..cs].rfind('\n').map_or(0, |i| i + 1);
+        src[ls..cs].len()
+    });
     let mut comments = Vec::new();
     comment_tokens(block, src, &mut comments);
     for (off, line, text) in comments {
@@ -546,6 +567,10 @@ fn collect_block_comments(block: &GdNode, src: &str, stmts: &[GdNode]) -> BlockC
         if let Some((i, _)) = prev.filter(|&(_, ce)| line_of(src, ce.saturating_sub(1)) == line) {
             bc.trailing[i] = Some(text);
             continue;
+        }
+        let ls = src[..off].rfind('\n').map_or(0, |i| i + 1);
+        if body_len.is_some_and(|bl| src[ls..off].len() < bl) {
+            continue; // a standalone comment dedented out of this block — not ours
         }
         // Otherwise standalone: it precedes the next statement, or trails the whole block.
         match spans.iter().position(|s| s.is_some_and(|(cs, _)| cs > off)) {
@@ -1585,11 +1610,16 @@ fn format_comma_list(
         last.push_str("  ");
         last.push_str(c);
     }
-    // Exploded: one element per line, with its surrounding comments.
+    // Exploded: one element per line, with its surrounding comments. A standalone comment between two
+    // elements sits at the greater of the surrounding lines' indents (gdformat's `_get_greater_indent`
+    // in `_add_standalone_comments`): the previous element's last line vs this element's first (always
+    // `child`). For plain elements that is `child`; after a multi-line lambda argument it is the
+    // lambda body's deeper indent, so the comment hangs off the body rather than the arg list.
     let n = elems.len();
+    let mut prev_last_level = child;
     for (i, e) in elems.iter().enumerate() {
         for c in &lc.before[i] {
-            out.push(format!("{}{c}", w.indent(child)));
+            out.push(format!("{}{c}", w.indent(prev_last_level.max(child))));
         }
         let elem_suffix = if i + 1 < n || magic { "," } else { "" };
         let mut lines = format_expression(w, e, child, "", elem_suffix)?;
@@ -1598,10 +1628,11 @@ fn format_comma_list(
             last.push_str("  ");
             last.push_str(c);
         }
+        prev_last_level = lines.last().map_or(child, |l| line_level(l, &w.unit));
         out.append(&mut lines);
     }
     for c in &lc.tail {
-        out.push(format!("{}{c}", w.indent(child)));
+        out.push(format!("{}{c}", w.indent(prev_last_level.max(child))));
     }
     out.push(format!("{}{}", w.indent(indent), suffix));
     Some(out)
@@ -1625,6 +1656,56 @@ impl ListComments {
             || self.before.iter().any(|v| !v.is_empty())
             || self.trailing.iter().any(Option::is_some)
             || !self.tail.is_empty()
+    }
+}
+
+/// The offset up to which a list element "owns" its trailing comments (those handled by the element's
+/// own recursive formatting, not by the surrounding list). It is the element's `text_range` end —
+/// except when the element carries a lambda, whose `text_range` greedily swallows the comments
+/// *dedented below its body* (which structurally belong between the list's arguments, not to the
+/// lambda). For such an element ownership ends at the first standalone comment indented *less* than
+/// the lambda body, so an in-block trailing / tail comment (at or below the body indent) stays owned
+/// while a dedented between-arguments comment falls through to the list and is re-indented there.
+fn owned_end(elem: &GdNode, src: &str) -> usize {
+    let full = usize::from(elem.text_range().end());
+    let (Some(body_len), Some((_, ce))) = (lambda_body_indent_len(elem, src), code_span(elem))
+    else {
+        return full;
+    };
+    let mut comments = Vec::new();
+    comment_tokens(elem, src, &mut comments);
+    for (off, _, _) in comments {
+        if off < ce {
+            continue;
+        }
+        let ls = src[..off].rfind('\n').map_or(0, |i| i + 1);
+        let lead = &src[ls..off];
+        if lead.trim().is_empty() && lead.len() < body_len {
+            return off; // a dedented standalone comment — ownership ends before it
+        }
+    }
+    full
+}
+
+/// The leading-whitespace length of a lambda body's first statement (its source indent), if `elem`
+/// carries a lambda. Used to tell an in-body comment from one dedented below the body.
+fn lambda_body_indent_len(elem: &GdNode, src: &str) -> Option<usize> {
+    let mut blocks = Vec::new();
+    collect_blocks(elem, &mut blocks);
+    let block = blocks.into_iter().next()?;
+    let first = block.children().next()?;
+    let (cs, _) = code_span(first)?;
+    let ls = src[..cs].rfind('\n').map_or(0, |i| i + 1);
+    Some(src[ls..cs].len())
+}
+
+/// Every `Block` node in `node`'s subtree (a lambda body, in practice), outermost first.
+fn collect_blocks(node: &GdNode, out: &mut Vec<GdNode>) {
+    for c in node.children() {
+        if c.kind() == S::Block {
+            out.push(c.clone());
+        }
+        collect_blocks(c, out);
     }
 }
 
@@ -1652,7 +1733,7 @@ fn collect_list_comments(list_node: &GdNode, src: &str, elems: &[GdNode]) -> Lis
     let owned: Vec<Option<(usize, usize)>> = elems
         .iter()
         .zip(&spans)
-        .map(|(e, s)| s.map(|(cs, _)| (cs, usize::from(e.text_range().end()))))
+        .map(|(e, s)| s.map(|(cs, _)| (cs, owned_end(e, src))))
         .collect();
     let first_start = spans.iter().flatten().map(|&(cs, _)| cs).min();
     let mut comments = Vec::new();
@@ -1678,12 +1759,6 @@ fn collect_list_comments(list_node: &GdNode, src: &str, elems: &[GdNode]) -> Lis
             .find_map(|(i, s)| s.filter(|&(_, ce)| ce <= off).map(|(_, ce)| (i, ce)));
         if let Some((i, _)) = prev.filter(|&(_, ce)| line_of(src, ce.saturating_sub(1)) == line) {
             lc.trailing[i] = Some(text);
-            continue;
-        }
-        // A standalone comment after a lambda argument belongs to the lambda *body* (gdformat indents
-        // it at the body, not the arg list). Rather than mis-place it, omit it — the comment-multiset
-        // net then falls back to the verbatim statement, which has it exactly right.
-        if prev.is_some_and(|(i, _)| node_contains_lambda(&elems[i])) {
             continue;
         }
         match spans.iter().position(|s| s.is_some_and(|(cs, _)| cs > off)) {

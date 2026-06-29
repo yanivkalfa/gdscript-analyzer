@@ -3943,6 +3943,18 @@ mod tests {
     }
 
     #[test]
+    fn standalone_comments_after_a_lambda_arg_hang_off_the_body() {
+        // A call with a multi-line lambda argument followed by another argument explodes its arg list;
+        // a standalone comment dedented between the lambda and the next arg is re-emitted at the lambda
+        // *body's* indent (gdformat's `_get_greater_indent`), and the arg separator `,` lands on the
+        // lambda's last body line before its trailing comment.
+        let src =
+            "func f():\n\tcall(func():\n\t\ta()\n\t\treturn b  # t\n\t# between\n\t, [x, y])\n";
+        let want = "func f():\n\tcall(\n\t\tfunc():\n\t\t\ta()\n\t\t\treturn b,  # t\n\t\t\t# between\n\t\t[x, y]\n\t)\n";
+        assert_eq!(fmt(src), want);
+    }
+
+    #[test]
     fn comments_thread_through_an_operator_chain_wrap() {
         // A standalone comment between operands of a paren-wrapped operator chain is re-emitted on its
         // own line at the operand indent (one level past the assignment), matching gdformat — and the
