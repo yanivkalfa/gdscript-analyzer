@@ -3547,6 +3547,19 @@ mod tests {
     }
 
     #[test]
+    fn lambda_arg_trailing_comment_keeps_separator_before_it() {
+        // A lambda argument whose last body statement carries a trailing comment: the enclosing call's
+        // argument separator `,` lands before the comment (`return when,  # block`), not after it
+        // (which would swallow the `,` into the comment text).
+        let src = "func p():\n\tg(func():\n\t\tif c:\n\t\t\twork()\n\t\treturn when  # block\n\t, other)\n";
+        assert_eq!(
+            fmt(src),
+            "func p():\n\tg(\n\t\tfunc():\n\t\t\tif c:\n\t\t\t\twork()\n\t\t\treturn when,  # block\n\t\tother\n\t)\n"
+        );
+        assert_eq!(fmt(&fmt(src)), fmt(src), "idempotent");
+    }
+
+    #[test]
     fn multiline_string_operator_chain_paren_wraps_verbatim() {
         // gdformat paren-wraps `x = """…""" % [args]`: the string's interior lines stay verbatim
         // (literal content, not re-indented), the `% [` goes on its own line, the array explodes.

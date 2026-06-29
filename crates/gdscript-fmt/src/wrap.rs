@@ -408,6 +408,7 @@ fn format_full_statement(w: &W, stmt: &GdNode, indent: usize) -> Option<Vec<Stri
                 w,
                 &find_child(stmt, S::Block)?,
                 indent + 1,
+                "",
             )?);
             for clause in stmt.children() {
                 match clause.kind() {
@@ -417,6 +418,7 @@ fn format_full_statement(w: &W, stmt: &GdNode, indent: usize) -> Option<Vec<Stri
                             w,
                             &find_child(clause, S::Block)?,
                             indent + 1,
+                            "",
                         )?);
                     }
                     S::ElseClause => {
@@ -425,6 +427,7 @@ fn format_full_statement(w: &W, stmt: &GdNode, indent: usize) -> Option<Vec<Stri
                             w,
                             &find_child(clause, S::Block)?,
                             indent + 1,
+                            "",
                         )?);
                     }
                     _ => {}
@@ -438,6 +441,7 @@ fn format_full_statement(w: &W, stmt: &GdNode, indent: usize) -> Option<Vec<Stri
                 w,
                 &find_child(stmt, S::Block)?,
                 indent + 1,
+                "",
             )?);
             Some(out)
         }
@@ -555,15 +559,26 @@ fn collect_block_comments(block: &GdNode, src: &str, stmts: &[GdNode]) -> BlockC
 /// Format every statement of a block (a lambda / compound body) fully, in order, re-emitting the
 /// block's comments: a standalone comment on its own indented line, an inline comment appended to its
 /// statement's last line with gdformat's two-space offset.
-fn format_block_body(w: &W, block: &GdNode, indent: usize) -> Option<Vec<String>> {
+fn format_block_body(
+    w: &W,
+    block: &GdNode,
+    indent: usize,
+    tail_suffix: &str,
+) -> Option<Vec<String>> {
     let stmts: Vec<GdNode> = block.children().cloned().collect();
     let bc = collect_block_comments(block, &w.src, &stmts);
     let mut out = Vec::new();
+    let n = stmts.len();
     for (i, stmt) in stmts.iter().enumerate() {
         for c in &bc.before[i] {
             out.push(format!("{}{c}", w.indent(indent)));
         }
         let mut lines = format_full_statement(w, stmt, indent)?;
+        // The lambda's own suffix (the enclosing call's argument separator) belongs on the body's last
+        // line *before* any trailing comment, so the `,` is not swallowed into the comment text.
+        if i + 1 == n && bc.tail.is_empty() {
+            lines.last_mut()?.push_str(tail_suffix);
+        }
         if let Some(c) = &bc.trailing[i] {
             let last = lines.last_mut()?;
             last.push_str("  ");
@@ -1061,8 +1076,8 @@ fn format_lambda(
     let header = lambda_header_str(w, node)?;
     let mut out = vec![format!("{}{prefix}{header}", w.indent(indent))];
     let block = find_child(node, S::Block)?;
-    out.extend(format_block_body(w, &block, indent + 1)?);
-    out.last_mut()?.push_str(suffix);
+    // Pass the suffix into the body so it lands on the last statement before any trailing comment.
+    out.extend(format_block_body(w, &block, indent + 1, suffix)?);
     Some(out)
 }
 
@@ -1578,16 +1593,26 @@ fn collect_list_comments(list_node: &GdNode, src: &str, elems: &[GdNode]) -> Lis
     };
     let open_line = line_of(src, open_off);
     let spans: Vec<Option<(usize, usize)>> = elems.iter().map(code_span).collect();
+    // The half-open range `[code_start, node_end)` of each element: from its first significant token
+    // (so a *leading* standalone comment, which is leading trivia *before* the code, is NOT covered)
+    // to its node end (so a trailing comment inside the element — e.g. one in a lambda body's block,
+    // after the lambda's code span — IS covered). Comments in this range are handled by the element's
+    // own recursion; emitting them here too would double them.
+    let owned: Vec<Option<(usize, usize)>> = elems
+        .iter()
+        .zip(&spans)
+        .map(|(e, s)| s.map(|(cs, _)| (cs, usize::from(e.text_range().end()))))
+        .collect();
     let first_start = spans.iter().flatten().map(|&(cs, _)| cs).min();
     let mut comments = Vec::new();
     comment_tokens(list_node, src, &mut comments);
     for (off, line, text) in comments {
-        if spans
+        if owned
             .iter()
             .flatten()
-            .any(|&(cs, ce)| cs <= off && off < ce)
+            .any(|&(cs, ne)| cs <= off && off < ne)
         {
-            continue; // inside an element — handled by its own recursion
+            continue; // inside an element's subtree (code or trailing) — handled by its recursion
         }
         // A comment on the open-bracket line, before the first element, trails the open bracket.
         if line == open_line && first_start.is_none_or(|fs| off < fs) {
