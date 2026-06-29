@@ -77,9 +77,11 @@ The post-M0 hunt (9 confirmed, 6 rejected; never-panic + UTF-8 safety signed off
       `unique_nodes`; `children_of` still lists both.
 
 Deferred (low / cosmetic / engine-impossible):
-- [ ] **`unescape` drops `\uXXXX`/`\UXXXXXX`/`\b`/`\f`** → a name with such an escape mis-decodes
-      (e.g. `A` → `u0041`). Cosmetic *and consistent* (applied to both `name=` and `parent=`, so
-      path matching still works); display/go-to-def only. Rare. Extend `unescape` if it surfaces.
+- [x] **`unescape` Unicode + control escapes → DONE (burndown Stage 1).** The scene-string
+      `unescape` now decodes `\uXXXX` (4-hex UTF-16, with surrogate-pair combining), `\UXXXXXX`
+      (6-hex code point), and the `\a \b \f \v` control escapes, mirroring Godot's
+      `variant_parser.cpp` / tokenizer. Invalid / empty escapes fall back safely (lone surrogate →
+      U+FFFD). 6 unit tests.
 - [ ] **Cascading dangling:** a node parented to a sibling whose own parent dangled is itself
       flagged. Secondary effect; rare. Track an "upstream-dangling" set to suppress the secondary.
 

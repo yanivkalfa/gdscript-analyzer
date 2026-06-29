@@ -713,32 +713,149 @@ fn walk_path(
     Walk::Resolved(cur)
 }
 
-/// Resolve the C-style escapes a `.tscn` quoted string may carry. Unknown escapes pass through
-/// (the backslash is dropped, the next char kept) — a lossy-but-safe simplification for M0 (escapes
-/// in node names are vanishingly rare and resolved consistently for both `name=` and `parent=`).
+/// Resolve the C-style escapes a `.tscn` quoted string may carry, including `\uXXXX` / `\UXXXXXX`
+/// Unicode and the `\a \b \f \v` control escapes — mirroring Godot's `variant_parser.cpp` /
+/// tokenizer string decoding. Unknown escapes pass through (the backslash is dropped, the next char
+/// kept). Resolved consistently for both `name=` and `parent=`, so path matching is unaffected.
 fn unescape(s: &str) -> String {
     if !s.contains('\\') {
         return s.to_owned();
     }
+    // Index over a char vector so a `\u` surrogate pair can look ahead cheaply.
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         if c != '\\' {
             out.push(c);
+            i += 1;
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some(other) => out.push(other), // \" \\ and anything else → the literal char
-            None => out.push('\\'),
+        i += 1; // consume the backslash
+        let Some(&esc) = chars.get(i) else {
+            out.push('\\'); // a trailing lone backslash
+            break;
+        };
+        i += 1; // consume the escape selector
+        match esc {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'a' => out.push('\u{07}'),
+            'b' => out.push('\u{08}'),
+            'f' => out.push('\u{0C}'),
+            'v' => out.push('\u{0B}'),
+            // `\uXXXX` — a 4-hex-digit UTF-16 code unit (with surrogate-pair combining);
+            // `\UXXXXXX` — a 6-hex-digit code point.
+            'u' => i = push_unicode_escape(&mut out, &chars, i, 4),
+            'U' => i = push_unicode_escape(&mut out, &chars, i, 6),
+            other => out.push(other), // \" \\ \' and anything else → the literal char
         }
     }
     out
 }
 
+/// Decode up to `max_digits` hex digits at `chars[start..]` into a code point and push it, combining
+/// a UTF-16 surrogate pair for the `\u` form (a high surrogate followed by a `\uXXXX` low surrogate
+/// becomes one scalar). Returns the index past everything consumed. A run with no hex digit pushes
+/// nothing and leaves the index unchanged (Godot treats an escape with no digits as empty).
+fn push_unicode_escape(out: &mut String, chars: &[char], start: usize, max_digits: usize) -> usize {
+    let (code, i) = read_hex(chars, start, max_digits);
+    let Some(code) = code else { return start };
+    // A high surrogate (`\uD800`..=`\uDBFF`) combines with a following `\uXXXX` low surrogate.
+    if (0xD800..=0xDBFF).contains(&code)
+        && chars.get(i) == Some(&'\\')
+        && chars.get(i + 1) == Some(&'u')
+    {
+        let (low, j) = read_hex(chars, i + 2, 4);
+        if let Some(low) = low
+            && (0xDC00..=0xDFFF).contains(&low)
+        {
+            let combined = 0x1_0000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+            if let Some(c) = char::from_u32(combined) {
+                out.push(c);
+                return j;
+            }
+        }
+    }
+    out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+    i
+}
+
+/// Read up to `max_digits` hex digits at `chars[start..]`, returning `(value, next index)`. `value`
+/// is `None` (and the index unmoved) when no hex digit is present.
+fn read_hex(chars: &[char], start: usize, max_digits: usize) -> (Option<u32>, usize) {
+    let mut value: u32 = 0;
+    let mut count = 0;
+    let mut i = start;
+    while count < max_digits {
+        let Some(d) = chars.get(i).and_then(|c| c.to_digit(16)) else {
+            break;
+        };
+        value = value * 16 + d;
+        i += 1;
+        count += 1;
+    }
+    if count == 0 {
+        (None, start)
+    } else {
+        (Some(value), i)
+    }
+}
+
 /// `usize → u32`, saturating (a `.tscn` over 4 GiB / 4 G nodes is not a real input).
 fn to_u32(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod unescape_tests {
+    use super::unescape;
+
+    #[test]
+    fn passes_plain_strings_and_simple_escapes() {
+        assert_eq!(unescape("Node"), "Node");
+        assert_eq!(unescape("a\\nb"), "a\nb");
+        assert_eq!(unescape("tab\\there"), "tab\there");
+        assert_eq!(unescape("quote\\\"end"), "quote\"end");
+        assert_eq!(unescape("back\\\\slash"), "back\\slash");
+    }
+
+    #[test]
+    fn decodes_control_escapes() {
+        assert_eq!(unescape("\\b"), "\u{08}");
+        assert_eq!(unescape("\\f"), "\u{0C}");
+        assert_eq!(unescape("\\a"), "\u{07}");
+        assert_eq!(unescape("\\v"), "\u{0B}");
+    }
+
+    #[test]
+    fn decodes_lowercase_u_4_hex() {
+        // `A` is the letter `A` — the bug fixed here (it used to decode to `u0041`).
+        assert_eq!(unescape("\\u0041"), "A");
+        assert_eq!(unescape("X\\u00e9Y"), "XéY");
+    }
+
+    #[test]
+    fn decodes_uppercase_u_6_hex() {
+        // U+1F600 GRINNING FACE.
+        assert_eq!(unescape("\\U01F600"), "😀");
+    }
+
+    #[test]
+    fn combines_a_utf16_surrogate_pair() {
+        // The same emoji written as a `😀` surrogate pair.
+        assert_eq!(unescape("\\uD83D\\uDE00"), "😀");
+    }
+
+    #[test]
+    fn invalid_or_empty_escapes_are_safe() {
+        // A lone backslash at EOF is kept.
+        assert_eq!(unescape("ends\\"), "ends\\");
+        // `\u` with no hex digits emits nothing for the escape (the chars after are kept).
+        assert_eq!(unescape("\\uZ"), "Z");
+        // A lone high surrogate (no low surrogate) falls back to U+FFFD.
+        assert_eq!(unescape("\\uD83D!"), "\u{FFFD}!");
+    }
 }
