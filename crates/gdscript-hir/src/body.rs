@@ -33,8 +33,8 @@ pub enum Literal {
     Int,
     /// A float literal.
     Float,
-    /// `true` / `false`.
-    Bool,
+    /// `true` / `false` (carries the value, for constant checks like `ASSERT_ALWAYS_*`).
+    Bool(bool),
     /// A `String` literal.
     Str,
     /// A `&"…"` `StringName` literal.
@@ -941,7 +941,8 @@ fn literal_kind(node: &GdNode) -> Literal {
         Some(K::String) => Literal::Str,
         Some(K::StringName) => Literal::StringName,
         Some(K::NodePath) => Literal::NodePath,
-        Some(K::True | K::False) => Literal::Bool,
+        Some(K::True) => Literal::Bool(true),
+        Some(K::False) => Literal::Bool(false),
         Some(K::ConstPi | K::ConstTau | K::ConstInf | K::ConstNan) => Literal::MathConst,
         _ => Literal::Null,
     }

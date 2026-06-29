@@ -1145,8 +1145,42 @@ impl Cx<'_> {
             Stmt::Assert(cond) => {
                 if let Some(cond) = cond {
                     self.infer_expr(cond, &Expectation::None);
+                    self.check_assert_constant(cond);
                 }
             }
+        }
+    }
+
+    /// `ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE` — fire when the assert condition is a constant
+    /// with a known boolean value (Godot `resolve_assert`: a constant condition is booleanized and
+    /// warned). Sound subset via [`Cx::const_bool_of`]: a literal `true`/`false`, or `null` (false).
+    fn check_assert_constant(&mut self, cond: ExprId) {
+        let Some(always) = self.const_bool_of(cond) else {
+            return;
+        };
+        let (code, msg) = if always {
+            (
+                WarningCode::AssertAlwaysTrue,
+                "The assert condition is always true, so this assert has no effect.",
+            )
+        } else {
+            (
+                WarningCode::AssertAlwaysFalse,
+                "The assert condition is always false, so this assert will always fail.",
+            )
+        };
+        self.warn(self.range_of(cond), code, msg.to_owned());
+    }
+
+    /// The constant boolean value of `expr`, when it is a literal whose booleanization is known — a
+    /// bool literal, or `null` (false). `None` for any other / non-constant expression (the sound
+    /// default: no false `ASSERT_ALWAYS_*`). Mirrors Godot's `reduced_value.booleanize()` restricted
+    /// to the literal forms (named-constant / arithmetic folding is deliberately not attempted).
+    fn const_bool_of(&self, expr: ExprId) -> Option<bool> {
+        match self.body.expr(expr) {
+            Expr::Literal(Literal::Bool(b)) => Some(*b),
+            Expr::Literal(Literal::Null) => Some(false),
+            _ => None,
         }
     }
 
@@ -1450,7 +1484,7 @@ impl Cx<'_> {
         match lit {
             Literal::Int => self.int_ty(),
             Literal::Float | Literal::MathConst => self.float_ty(),
-            Literal::Bool => self.bool_ty(),
+            Literal::Bool(_) => self.bool_ty(),
             Literal::Str => self.builtin("String"),
             Literal::StringName => self.builtin("StringName"),
             Literal::NodePath => self.builtin("NodePath"),
@@ -2757,6 +2791,43 @@ mod tests {
         assert!(
             !cs.iter().any(|c| c == "SHADOWED_VARIABLE"),
             "the local's variable-shadow must be suppressed in favor of the global one: {cs:?}"
+        );
+    }
+
+    #[test]
+    fn assert_true_warns_always_true() {
+        let h = infer_first_func("func f():\n\tassert(true)\n");
+        assert!(codes(&h).contains(&"ASSERT_ALWAYS_TRUE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn assert_false_warns_always_false() {
+        let h = infer_first_func("func f():\n\tassert(false, \"nope\")\n");
+        assert!(
+            codes(&h).contains(&"ASSERT_ALWAYS_FALSE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn assert_null_warns_always_false() {
+        let h = infer_first_func("func f():\n\tassert(null)\n");
+        assert!(
+            codes(&h).contains(&"ASSERT_ALWAYS_FALSE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn assert_on_a_variable_is_silent() {
+        // No false positive: a runtime condition is not a constant.
+        let h = infer_first_func("func f(x):\n\tassert(x)\n");
+        assert!(
+            !codes(&h).iter().any(|c| c.starts_with("ASSERT_ALWAYS")),
+            "{:?}",
+            codes(&h)
         );
     }
 

@@ -688,9 +688,11 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       variable/base-class shadow (no double-warn). Conservative: bare pseudo-constants (`PI`) / global
       enums excluded → only under-warns vs Godot, never a false positive. The pre-existing `class_name`
       collision stays its own ungated file-level diagnostic (closer to Godot's hides-global error).
-- [ ] **`ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE`** — needs the bool *value* of a constant
-      condition; the lowered `Literal::Bool` doesn't carry true/false. Recover it from the CST token
-      at the expr range (like navigation does) or extend `Literal` to carry the value.
+- [x] **`ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE` — DONE (burndown Stage 1).** `Literal::Bool`
+      now carries its value, so `Stmt::Assert` can fire `ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE`
+      when the condition is a constant literal whose booleanization is known (a bool literal, or
+      `null` = false), mirroring Godot's `resolve_assert`. Named-constant / arithmetic folding is
+      deliberately not attempted (sound under-warn — no false positive on a runtime condition).
 - [ ] **`CONFUSABLE_IDENTIFIER` / `_LOCAL_DECLARATION` / `_LOCAL_USAGE` / `_CAPTURE_REASSIGNMENT` /
       `_TEMPORARY_MODIFICATION`** — Unicode mixed-script/homoglyph detection; needs a confusables
       table (`unicode-security` crate or the Unicode confusables data). `_TEMPORARY_MODIFICATION` is
