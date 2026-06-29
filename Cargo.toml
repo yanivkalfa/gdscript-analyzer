@@ -122,7 +122,7 @@ toml = "0.8"
 # `PositionEncodingKind` negotiation) + a hand-rolled event loop. Deliberately NOT tower-lsp/async-lsp
 # — our engine is synchronous + cancellation-via-unwind (salsa), so an async runtime is pure
 # impedance. See plans/PHASE-5-LSP-PLAYBOOK.md §1.
-lsp-server = "0.7"
+lsp-server = "0.8"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
 # dev/test
