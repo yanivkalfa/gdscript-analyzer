@@ -465,10 +465,13 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
 - [x] **`project.godot` `config/features` parsing → DONE (Phase-5 hardening §6).** The engine version
       line is parsed into the `engine_version()` salsa query + `project_engine_version()` plumbing
       (informational until Phase-6 multi-version API bundling). `[autoload]` is no longer the only line read.
-- [ ] **No per-`project.godot` corpus mode yet.** M4 was validated on a single autoload subproject
-      (faithful: one `project.godot`, one namespace). A `--multi-project` harness mode (discover every
-      `project.godot`, one host per sub-project) is the exhaustive demo-projects gate — deferred; the
-      merged `--project` mode remains the panic/robustness stress test. (Supersedes the M2 stress-test note.)
+- [x] **Per-`project.godot` corpus mode → DONE (burndown Stage 3).** The corpus runner gained
+      `--per-project`: it discovers every `project.godot` under the root and analyzes each sub-project
+      in its OWN host — the faithful single-namespace validation (one `project.godot`, one `class_name`
+      namespace, cross-file resolution active). On godot-demo-projects: **138 projects, 456 files, 0
+      parse errors, 0 panics** — and only **120** type diagnostics vs **1973** in per-file mode (full
+      project context resolves the seam-induced `UNSAFE_*`). Wired into the corpus CI gate; the merged
+      `--project` mode stays the cross-project robustness stress test.
 - [x] **Relative `preload`/`extends` paths (`preload("sibling.gd")`) — DONE.** Anchored to the importing
       script's dir (`get_base_dir().path_join(p).simplify_path()`) via `resolve::anchor_res_path`, then
       resolved through the `res://` path map. Absolute + relative both handled (`anchor_res_path` tests).
@@ -492,9 +495,9 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       `multiline_lambda_body_ending_at_a_comma`. **Still open:** grow the *differential* (tree-sitter)
       oracle + a CI gate that clones godot-demo-projects and asserts 0 parse errors (the run is ad hoc
       via `cargo run -p gdscript-ide --example corpus -- <dir>` today).
-- [ ] **`corpus --project` is a robustness stress test, not a single-project run.** Merging many
-      sub-projects into one host shares the `class_name` namespace; cross-project collisions are
-      expected. A faithful per-project validation needs `project.godot`-scoped roots (M4).
+- [x] **`corpus --per-project` faithful run → DONE (burndown Stage 3).** `--project` (merge) stays
+      the cross-project robustness stress test; `--per-project` is the faithful `project.godot`-scoped
+      validation (one host per project). See the per-project entry above.
 
 ### Post-M5 bug hunt (adversarial 6-finder + 3-vote-verify pass over all Phase-3 code)
 

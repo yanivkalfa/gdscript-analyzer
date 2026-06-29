@@ -33,5 +33,7 @@ jobs:
         run: git clone --depth 1 https://github.com/godotengine/godot-demo-projects.git "${{ runner.temp }}/godot-demo-projects"
       - name: Parse-check every .gd (0 GDSCRIPT_SYNTAX errors, 0 panics)
         run: cargo run --release -p gdscript-ide --example corpus -- "${{ runner.temp }}/godot-demo-projects" --ci
+      - name: Faithful per-project check (one host per project.godot, cross-file resolution)
+        run: cargo run --release -p gdscript-ide --example corpus -- "${{ runner.temp }}/godot-demo-projects" --per-project --ci
       - name: Parse-check every .tscn (0 panics)
         run: cargo run --release -p gdscript-scene --example scene_corpus -- "${{ runner.temp }}/godot-demo-projects" --ci
