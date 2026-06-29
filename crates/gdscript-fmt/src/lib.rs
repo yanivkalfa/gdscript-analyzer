@@ -1875,6 +1875,11 @@ fn flatten_statement(stmt: &str) -> Option<String> {
             // A synthetic newline inside brackets is a multi-line lambda body — cannot collapse.
             S::Newline if !stack.is_empty() => return None,
             S::Indent | S::Dedent | S::Bom | S::Newline => {}
+            // A backslash line continuation is collapsed away: trim the space before the `\` so the
+            // join is not double-spaced; the following physical newline then sets `pending_break` and
+            // the next token re-spaces once (and the statement is later re-wrapped) like gdformat,
+            // which converts `\`-continued statements to paren-wrapped multi-line form.
+            S::LineContinuation => trim_trailing_inline_ws(&mut out),
             S::Whitespace => {
                 // Keep intra-line spacing verbatim (it is already canonical / the user's, when
                 // spacing-normalisation is off); drop a line's leading indentation.
@@ -1882,11 +1887,7 @@ fn flatten_statement(stmt: &str) -> Option<String> {
                     out.push_str(&stmt[t.range]);
                 }
             }
-            S::LineComment
-            | S::DocComment
-            | S::RegionComment
-            | S::EndRegionComment
-            | S::LineContinuation => return None,
+            S::LineComment | S::DocComment | S::RegionComment | S::EndRegionComment => return None,
             k => {
                 let text = &stmt[t.range];
                 if matches!(k, S::String | S::StringName | S::NodePath) && text.contains('\n') {
@@ -3049,6 +3050,22 @@ mod tests {
             fmt("func h():\n\tvar a := func(): return 1\n"),
             "func h():\n\tvar a := func(): return 1\n"
         );
+    }
+
+    #[test]
+    fn backslash_line_continuations_collapse_and_rewrap() {
+        // gdformat collapses a `\`-continued statement and re-lays it out — onto one line when it now
+        // fits, or re-wrapped (an operator chain becomes paren-wrapped) when it does not.
+        assert_eq!(
+            fmt("func f():\n\tvar x = a + \\\n\t\tb\n"),
+            "func f():\n\tvar x = a + b\n"
+        );
+        let out = fmt(
+            "func f():\n\tif long_condition_name_one == 1 or \\\n\t\t\tlong_condition_name_two == 2 or long_condition_name_three == 3:\n\t\tpass\n",
+        );
+        assert!(out.contains("\tif (\n"), "{out}");
+        assert!(!out.contains('\\'), "backslash removed: {out}");
+        assert_eq!(fmt(&out), out, "idempotent");
     }
 
     #[test]
