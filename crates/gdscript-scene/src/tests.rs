@@ -431,3 +431,25 @@ fn never_panics_on_garbage() {
         let _ = parse_scene(g); // must not panic
     }
 }
+
+#[test]
+fn captures_connections_with_inner_identifier_spans() {
+    let src = "[gd_scene format=3]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+[node name=\"StartButton\" type=\"Button\" parent=\".\"]\n\
+[connection signal=\"pressed\" from=\"StartButton\" to=\".\" method=\"_on_start_pressed\"]\n";
+    let m = parse_scene(src);
+    assert!(m.problems.is_empty(), "{:?}", m.problems);
+    assert_eq!(m.connections.len(), 1);
+    let c = &m.connections[0];
+    assert_eq!(c.signal, "pressed");
+    assert_eq!(c.from, "StartButton");
+    assert_eq!(c.to, ".");
+    assert_eq!(c.method, "_on_start_pressed");
+    // Each span is the inner identifier (quotes excluded) — exactly what a rename rewrites.
+    let at = |r: gdscript_base::TextRange| &src[r.start as usize..r.end as usize];
+    assert_eq!(at(c.signal_span), "pressed");
+    assert_eq!(at(c.from_span), "StartButton");
+    assert_eq!(at(c.to_span), ".");
+    assert_eq!(at(c.method_span), "_on_start_pressed");
+}

@@ -61,6 +61,10 @@ pub struct SceneModel {
     /// `unique_name_in_owner` nodes: bare name → node (the `%Name` lookup; scene-wide in the slice).
     pub unique_nodes: FxHashMap<SmolStr, NodeIdx>,
 
+    /// Every `[connection …]` (a signal wired to a method), in file order. Drives scene-aware rename
+    /// of a script's connected methods/signals (W8); read-side typing ignores it.
+    pub connections: Vec<SceneConnection>,
+
     /// Non-fatal problems found while parsing (the parser never errors).
     pub problems: Vec<SceneProblem>,
 
@@ -95,6 +99,31 @@ pub struct SceneNode {
     pub header_span: TextRange,
     /// Byte span of the `name="…"` value (finer go-to-definition / highlight).
     pub name_span: TextRange,
+}
+
+/// One `[connection …]` section — a signal wired to a method in the editor. The four spans are the
+/// **inner identifier** byte ranges (surrounding quotes excluded), so a rename rewrites exactly the
+/// name. A connection has no body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneConnection {
+    /// `signal="…"` — the emitted signal name (a member of the `from` node's type).
+    pub signal: SmolStr,
+    /// Byte span of the `signal=` value (quotes excluded).
+    pub signal_span: TextRange,
+    /// `from="…"` — the emitter node path (root-relative; `"."` = root). Empty if absent.
+    pub from: SmolStr,
+    /// Byte span of the `from=` value (quotes excluded).
+    pub from_span: TextRange,
+    /// `to="…"` — the receiver node path (the node whose attached script declares `method`).
+    pub to: SmolStr,
+    /// Byte span of the `to=` value (quotes excluded).
+    pub to_span: TextRange,
+    /// `method="…"` — the receiving method name (a member of the `to` node's attached script).
+    pub method: SmolStr,
+    /// Byte span of the `method=` value (quotes excluded).
+    pub method_span: TextRange,
+    /// Byte span of the whole `[connection …]` header line.
+    pub header_span: TextRange,
 }
 
 /// An `[ext_resource …]` declaration.
@@ -179,6 +208,7 @@ impl SceneModel {
             root: None,
             by_path: FxHashMap::default(),
             unique_nodes: FxHashMap::default(),
+            connections: Vec::new(),
             problems: Vec::new(),
             child_index: FxHashMap::default(),
             children: FxHashMap::default(),

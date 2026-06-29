@@ -15,7 +15,8 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 use crate::model::{
-    ExtId, ExtResource, NodeIdx, SceneKind, SceneModel, SceneNode, SceneProblem, SubResource,
+    ExtId, ExtResource, NodeIdx, SceneConnection, SceneKind, SceneModel, SceneNode, SceneProblem,
+    SubResource,
 };
 
 /// Parse `.tscn`/`.tres` text into a [`SceneModel`]. Pure, never panics, never returns `Err`.
@@ -59,6 +60,10 @@ struct HeaderAttrs {
     script_class: Option<Span>,
     id: Option<Span>,
     path: Option<Span>,
+    signal: Option<Span>,
+    from: Option<Span>,
+    to: Option<Span>,
+    method: Option<Span>,
 }
 
 impl HeaderAttrs {
@@ -74,6 +79,10 @@ impl HeaderAttrs {
             "script_class" => &mut self.script_class,
             "id" => &mut self.id,
             "path" => &mut self.path,
+            "signal" => &mut self.signal,
+            "from" => &mut self.from,
+            "to" => &mut self.to,
+            "method" => &mut self.method,
             _ => return, // unknown attribute — ignored, never an error
         };
         *slot = Some(value);
@@ -404,8 +413,12 @@ impl<'a> Parser<'a> {
                 self.consume_body(false);
             }
             Some("node") => self.add_node(&attrs, header_span),
-            Some("connection" | "editable" | "resource") => {
-                self.consume_body(false); // recognized, structurally ignored in M0
+            Some("connection") => {
+                self.add_connection(&attrs, header_span);
+                self.consume_body(false); // a connection has no body, but stay robust
+            }
+            Some("editable" | "resource") => {
+                self.consume_body(false); // recognized, structurally ignored
             }
             Some(_) => {
                 self.model
@@ -502,6 +515,43 @@ impl<'a> Parser<'a> {
             header_span,
             name_span,
         });
+    }
+
+    fn add_connection(&mut self, a: &HeaderAttrs, header_span: TextRange) {
+        // A connection requires `signal`/`from`/`to`/`method`; a malformed one degrades to empty
+        // fields (rename simply finds no match). The spans are the inner identifier ranges so a
+        // rewrite replaces exactly the name, never the surrounding quotes.
+        let value = |s: Option<Span>| s.and_then(|sp| self.extract_string(sp)).unwrap_or_default();
+        let span = |s: Option<Span>| s.map_or(header_span, |sp| self.inner_span(sp));
+        self.model.connections.push(SceneConnection {
+            signal: value(a.signal),
+            signal_span: span(a.signal),
+            from: value(a.from),
+            from_span: span(a.from),
+            to: value(a.to),
+            to_span: span(a.to),
+            method: value(a.method),
+            method_span: span(a.method),
+            header_span,
+        });
+    }
+
+    /// The **inner** byte range of an attribute value `(start, end)`: leading/trailing whitespace
+    /// trimmed, and a single pair of surrounding `"` quotes excluded. (Identifier-valued attributes —
+    /// node names, signal/method names, node paths — carry no escapes, so this maps 1:1 to the
+    /// decoded value's bytes, which is what a rename rewrites.)
+    fn inner_span(&self, (s, e): Span) -> TextRange {
+        let raw = self.src.get(s..e).unwrap_or("");
+        let lead = raw.len() - raw.trim_start().len();
+        let trail = raw.len() - raw.trim_end().len();
+        let mut lo = s + lead;
+        let mut hi = e - trail;
+        let trimmed = &raw[lead..raw.len() - trail];
+        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+            lo += 1;
+            hi -= 1;
+        }
+        TextRange::new(to_u32(lo), to_u32(hi))
     }
 
     // ---- pass 2: build the tree ----
