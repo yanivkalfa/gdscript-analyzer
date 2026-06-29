@@ -487,7 +487,9 @@ impl Parser<'_> {
             IfKw => self.if_stmt(),
             ForKw => self.for_stmt(),
             WhileKw => self.while_stmt(),
-            MatchKw => self.match_stmt(),
+            // `match` is a soft keyword: a statement-initial `match` used as an identifier (`match.x`,
+            // `match = …`, `match(x)` with no trailing `:`) is an expression, not the match statement.
+            MatchKw if self.match_begins_statement() => self.match_stmt(),
             ReturnKw => self.return_stmt(),
             BreakKw => self.simple_stmt(BreakStmt),
             ContinueKw => self.simple_stmt(ContinueStmt),

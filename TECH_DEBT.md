@@ -222,9 +222,12 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
       The four math constants stay literal tokens (their near-universal use), so
       `var PI = …`-style shadowing of a constant isn't modeled — a deliberate choice, not
       a gap.
-- [ ] **Statement-initial bare `match` is always the `match` statement.** `match(...)` /
-      `match.x` used as an *identifier* at statement start isn't handled (needs lookahead
-      in `stmt`). Rare; not seen in real corpora (member/`func` uses are handled).
+- [x] **Statement-initial bare `match` lookahead → DONE (burndown Stage 1).** `stmt()` now treats a
+      statement-initial `match` used as an *identifier* as an expression, not the match statement:
+      `match.x` (member), `match = …` / `match += …` (assignment), and `match(x)` / `match[i]` whose
+      bracket group is NOT colon-terminated (a parenthesised/array match *subject* `match (x):` stays a
+      statement). The disambiguation (`Parser::match_begins_statement`) reads the raw token buffer
+      directly (fuel-free, unbounded-safe); the keyword reading is the safe default for any ambiguity.
 - [x] **UTF-8 BOM at file start — FIXED.** A leading `U+FEFF` is now lexed as a dedicated
       `Bom` trivia token (not `Whitespace`, so it does not mis-count the first line's indent;
       not `Error`, since the file is valid GDScript). It round-trips byte-for-byte and the
