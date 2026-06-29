@@ -352,9 +352,13 @@ tokens); the quoted `$"…"` completion was never byte-scannable, so nothing is 
         mirror. Zero false-positive surface (every `gdscript-base` `file` field is a `FileId`).
 
 ### Validation
-- [ ] **Differential corpus is small + error-agreement only.** The tree-sitter oracle
-      checks whether both parsers consider a file well-formed over ~14 core snippets. Grow
-      it (e.g. the Godot demo-projects corpus) and add a structural skeleton comparison.
+- [x] **Differential oracle grown → DONE (burndown Stage 3).** The tree-sitter error-agreement set
+      went from ~16 to **28** core-GDScript snippets (default params, static funcs, compound assign,
+      `await`, annotations-with-args, multi-line strings/dicts, `@tool`, `is`/`not`, …) + more
+      both-reject broken cases, and a new **structural skeleton cross-check** (`top_level_function_count
+      _agrees`) asserts both parsers see the same number of top-level functions — beyond pure
+      error-agreement. The broad per-file corpus gate (456 demo files, 0 parse errors) is the
+      complementary breadth check. (tree-sitter's missing-`:` leniency stays in `KNOWN_DIVERGENCES`.)
       *(The parser is now also exercised by `cargo run -p gdscript-ide --example corpus --
       <dir>` against real projects — the ReactiveUI-Godot codebase parses **88/89 files
       clean, 0 panics**; the one remaining diagnostic is the BOM item above.)*
