@@ -3466,6 +3466,25 @@ mod tests {
     }
 
     #[test]
+    fn subscript_on_a_long_call_chain_wraps_leading_dot() {
+        // `Fmt.format(…)["text"]` is a dot-chain ending in a subscript; when the flat subscriptee
+        // overflows, gdformat wraps leading-dot, keeping `. format(…)["text"]` (call then index) on
+        // one segment line. (Routes `IndexExpr`-on-a-chain through the dot-chain formatter.)
+        let src = "func f():\n\tvar no_space: String = Fmt.format(src, {\"singleAttributePerLine\": true, \"insertSpaceBeforeSelfClose\": false})[\"text\"]\n";
+        let out = fmt(src);
+        assert!(
+            out.contains("\tvar no_space: String = (\n\t\tFmt\n"),
+            "leading-dot: {out:?}"
+        );
+        assert!(
+            out.contains("\n\t\t. format(src, {") && out.contains("})[\"text\"]\n"),
+            "call+index segment: {out:?}"
+        );
+        assert!(parses_clean(&out), "{out:?}");
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn dot_chain_with_lambda_in_earlier_segment_uses_leading_dot() {
         // gdformat bottom-ups a chain whose lambda is in the *final* call's args, but falls back to
         // leading-dot when the lambda sits in an earlier segment (`a.m(func…).n(…)`).

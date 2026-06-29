@@ -1157,6 +1157,12 @@ fn format_index(
     let nodes = child_nodes(node);
     let obj = nodes.first()?;
     let idx = nodes.get(1)?;
+    // A subscript on a chain (`a.b(…)["k"]`) is part of that dot-chain: gdformat collapses it and
+    // wraps bottom-up, or leading-dot when the flat subscriptee would overflow. Delegate so we get the
+    // same choice (mirrors `format_call`'s delegation for a chained callee).
+    if matches!(obj.kind(), S::FieldExpr | S::CallExpr | S::IndexExpr) {
+        return format_dot_chain(w, node, indent, prefix, suffix);
+    }
     let obj_str = expr_to_str(w, obj)?;
     format_expression(
         w,
@@ -1446,7 +1452,9 @@ fn format_chain_leading_dot(
             }
             Seg::Index(idx) => {
                 let u = units.last_mut()?;
-                if u.call.is_some() || u.index.is_some() {
+                // A `.field(args)[idx]` unit is fine (the index trails the call); only a second index
+                // on the same unit (`a[i][j]`) is too unusual for this path.
+                if u.index.is_some() {
                     return None;
                 }
                 u.index = Some(idx);
@@ -1475,10 +1483,15 @@ fn format_chain_leading_dot(
         } else {
             u.head.clone()
         };
+        // A trailing `[idx]` on this unit (`.field(args)[idx]`) is appended after the call's `)`.
+        let idx_suffix = match &u.index {
+            Some(idx) if u.call.is_some() => format!("[{}]", expr_to_str(w, idx)?),
+            _ => String::new(),
+        };
         // Each segment is itself rendered single-line-if-it-fits, else exploded (gdformat's recursion).
         if let Some(args) = &u.call {
             let flat = format!(
-                "{}{}{}({})",
+                "{}{}{}({}){idx_suffix}",
                 w.indent(child),
                 lead,
                 head,
@@ -1487,14 +1500,14 @@ fn format_chain_leading_dot(
             if !forcing_multiline(args) && width(&flat) <= w.max {
                 out.push(flat);
             } else if list_elements(args).is_empty() {
-                out.push(format!("{}{}{}()", w.indent(child), lead, head));
+                out.push(format!("{}{}{}(){idx_suffix}", w.indent(child), lead, head));
             } else {
                 out.extend(format_comma_list(
                     w,
                     args,
                     child,
                     &format!("{lead}{head}("),
-                    ")",
+                    &format!("){idx_suffix}"),
                 )?);
             }
         } else if let Some(idx) = &u.index {
