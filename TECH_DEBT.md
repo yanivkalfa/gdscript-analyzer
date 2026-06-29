@@ -82,8 +82,11 @@ Deferred (low / cosmetic / engine-impossible):
       (6-hex code point), and the `\a \b \f \v` control escapes, mirroring Godot's
       `variant_parser.cpp` / tokenizer. Invalid / empty escapes fall back safely (lone surrogate →
       U+FFFD). 6 unit tests.
-- [ ] **Cascading dangling:** a node parented to a sibling whose own parent dangled is itself
-      flagged. Secondary effect; rare. Track an "upstream-dangling" set to suppress the secondary.
+- [x] **Cascading dangling → DONE (burndown Stage 1).** A node parented *through* an already-dangling
+      ancestor (whose own parent was missing, so it was never indexed) is no longer double-flagged: the
+      parser tracks the intended full paths of detached nodes (`dangling_subtrees`) and suppresses a
+      miss whose parent path lies within one — only the root-cause node is flagged. Two siblings that
+      independently miss the same parent are each still flagged (not a cascade of one another).
 
 ### M1 — scene-aware node-path typing — **DONE**
 `$Path` / `%Unique` / `@onready var x := $Path` / `get_node("literal")` resolve to the node's concrete

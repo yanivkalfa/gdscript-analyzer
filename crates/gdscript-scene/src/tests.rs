@@ -339,6 +339,48 @@ fn parent_into_instanced_subscene_is_not_dangling_but_a_real_typo_is() {
 }
 
 #[test]
+fn a_cascading_dangling_parent_is_reported_only_once() {
+    // `A` is parented to a missing node `Ghost`; `B` is parented *through* `A` (`Ghost/A`). Only the
+    // root-cause `A` must be flagged — `B`'s miss is a cascade of `A` being detached, not a separate
+    // problem. `C` (one level deeper, `Ghost/A/B`) must also be suppressed.
+    let m = parse_scene(
+        "[gd_scene format=3]\n\
+         [node name=\"Root\" type=\"Node\"]\n\
+         [node name=\"A\" type=\"Node\" parent=\"Ghost\"]\n\
+         [node name=\"B\" type=\"Node\" parent=\"Ghost/A\"]\n\
+         [node name=\"C\" type=\"Node\" parent=\"Ghost/A/B\"]\n",
+    );
+    let dangling = m
+        .problems
+        .iter()
+        .filter(|p| matches!(p, SceneProblem::DanglingParent { .. }))
+        .count();
+    assert_eq!(
+        dangling, 1,
+        "only the root-cause node `A` should be flagged: {:?}",
+        m.problems
+    );
+}
+
+#[test]
+fn two_siblings_missing_the_same_parent_are_both_flagged() {
+    // Both `A` and `A2` directly reference the missing `Ghost` — each is its own root cause (not a
+    // cascade of the other), so BOTH are flagged.
+    let m = parse_scene(
+        "[gd_scene format=3]\n\
+         [node name=\"Root\" type=\"Node\"]\n\
+         [node name=\"A\" type=\"Node\" parent=\"Ghost\"]\n\
+         [node name=\"A2\" type=\"Node\" parent=\"Ghost\"]\n",
+    );
+    let dangling = m
+        .problems
+        .iter()
+        .filter(|p| matches!(p, SceneProblem::DanglingParent { .. }))
+        .count();
+    assert_eq!(dangling, 2, "{:?}", m.problems);
+}
+
+#[test]
 fn override_children_under_an_inherited_root_are_not_dangling() {
     // The websocket_chat pattern: an INHERITED-scene root whose override children reference base
     // nodes (`Connect`) not redeclared here. The resolved prefix isn't itself an instance, but it

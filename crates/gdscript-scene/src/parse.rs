@@ -11,7 +11,7 @@
 //! byte scan is safe and every slice boundary lands on a char boundary (it's an ASCII delimiter).
 
 use gdscript_base::TextRange;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use crate::model::{
@@ -588,6 +588,10 @@ impl<'a> Parser<'a> {
         let mut child_index: FxHashMap<(NodeIdx, SmolStr), NodeIdx> = FxHashMap::default();
         let mut children: FxHashMap<NodeIdx, Vec<NodeIdx>> = FxHashMap::default();
         let mut full_paths: Vec<SmolStr> = vec![SmolStr::default(); n];
+        // The intended full paths of nodes whose parent did NOT resolve (a dangling node detaches its
+        // whole subtree). A later node parented *into* such a subtree misses only because its detached
+        // ancestor was never indexed — a cascade we suppress so only the root-cause node is flagged.
+        let mut dangling_subtrees: FxHashSet<SmolStr> = FxHashSet::default();
 
         for i in 0..n {
             let idx = NodeIdx(to_u32(i));
@@ -610,12 +614,18 @@ impl<'a> Parser<'a> {
                     // dangling parent (Playbook §5/§7 — M1 degrades it to `Node`).
                     Walk::Escaped => None,
                     Walk::Missed(deepest) => {
-                        // A genuine in-scene miss. If the deepest node reached — or any ancestor up
-                        // to the root — is an instance boundary, the missing tail lives in an
-                        // instanced/inherited sub-scene we don't recurse into (an override line) —
-                        // expected, NOT dangling (Playbook C12/C13/C20). The root being an inherited
-                        // scene makes every override child's missing segment a base-scene node.
-                        if !self.model.descends_from_instance(deepest) {
+                        // This node's parent didn't resolve, so it detaches its own subtree — record
+                        // its intended path so a *descendant*'s later miss is recognized as a cascade
+                        // (its detached ancestor was never indexed) rather than a separate root cause.
+                        let is_cascade = within_dangling_subtree(p, &dangling_subtrees);
+                        dangling_subtrees.insert(SmolStr::new(format!("{p}/{name}")));
+                        // Flag only a genuine, non-cascading miss into a non-instance subtree. If the
+                        // deepest node reached — or any ancestor up to the root — is an instance
+                        // boundary, the missing tail lives in an instanced/inherited sub-scene we don't
+                        // recurse into (an override line) — expected, NOT dangling (Playbook
+                        // C12/C13/C20). The root being an inherited scene makes every override child's
+                        // missing segment a base-scene node.
+                        if !is_cascade && !self.model.descends_from_instance(deepest) {
                             self.model.problems.push(SceneProblem::DanglingParent {
                                 node: idx,
                                 parent_path: SmolStr::new(p),
@@ -671,6 +681,17 @@ impl<'a> Parser<'a> {
 
         self.model.set_indices(child_index, children);
     }
+}
+
+/// Whether the parent path `p` lies within a detached (dangling) node's subtree — `p` equals, or is
+/// a `/`-descendant of, some already-recorded dangling intended path. Such a miss is a cascade of the
+/// upstream dangling node, not a separate root cause, so it is not re-flagged.
+fn within_dangling_subtree(p: &str, dangling: &FxHashSet<SmolStr>) -> bool {
+    dangling.iter().any(|d| {
+        p == d.as_str()
+            || p.strip_prefix(d.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// The outcome of resolving a `parent=`/node path against the in-scene tree.
