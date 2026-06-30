@@ -2171,6 +2171,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inner_class_value_and_members_type_via_its_item_tree() {
+        // Burndown Stage 4.24 inc.1: an inner `class Inner:` value/instance types instead of seaming
+        // (`Ty::InnerClass`, was `Ty::Unknown`). `Inner.new()` constructs an instance; member access
+        // resolves against the inner class's own item-tree (by annotation) + its `extends` chain — so
+        // `x.hp`/`x.ping()` type as `int` (no false `INFERENCE_ON_VARIANT`), and a member inherited
+        // from the inner class's engine base (`extends Node` → `Object.get_class`) resolves to `String`.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class Inner extends Node:\n\
+             \tvar hp: int = 5\n\
+             \tfunc ping() -> int:\n\
+             \t\treturn 1\n\
+             func f():\n\
+             \tvar x := Inner.new()\n\
+             \tvar a := x.hp\n\
+             \tvar b := x.ping()\n\
+             \tvar c := x.get_class()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let ft = db.file_text(FileId(0)).unwrap();
+        let fi = analyze_file(&db, ft);
+        assert!(
+            fi.diagnostics.is_empty(),
+            "no hard diagnostics expected: {:?}",
+            fi.diagnostics
+        );
+        let api = db.engine().unwrap();
+        let labels: Vec<String> = fi
+            .units
+            .iter()
+            .flat_map(|u| &u.result.bindings)
+            .filter_map(|b| b.ty.label(api))
+            .collect();
+        assert!(
+            labels.iter().filter(|l| *l == "int").count() >= 2,
+            "x.hp and x.ping() should both type as int: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "String"),
+            "x.get_class() should resolve via the inner class's `extends Node` chain to String: {labels:?}"
+        );
+    }
+
     // ---- Phase-4 hunt fixes: `%`-segment paths (no false INVALID_NODE_PATH) ----------------
 
     #[test]

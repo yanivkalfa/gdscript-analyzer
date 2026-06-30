@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::body::{self, BinOp, Body, Expr, ExprId, Literal, ParamBinding, Stmt, UnOp};
 use crate::cst::{self, AstPtr};
 use crate::flow::{self, FlowAnalysis, NarrowedTy, Place};
-use crate::item_tree::{ItemTree, Member, has_annotation, item_tree};
+use crate::item_tree::{InnerClassItem, ItemTree, Member, has_annotation, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
 use crate::ty::{self, Assign, EnumRef, ScriptRefId, Ty};
 use crate::warnings::{RawWarning, WarningCode};
@@ -1051,6 +1051,21 @@ enum Expectation {
     None,
     /// The expression is checked against this declared type.
     Has(Ty),
+}
+
+/// Navigate a dotted inner-class path (`Inner` / `Outer.Inner`) from a file's top item-tree to the
+/// target [`InnerClassItem`]. `None` if any segment isn't an inner class.
+fn find_inner_class<'a>(tree: &'a ItemTree, path: &str) -> Option<&'a InnerClassItem> {
+    let mut members: &'a [Member] = &tree.members;
+    let mut found: Option<&'a InnerClassItem> = None;
+    for seg in path.split('.') {
+        found = members.iter().find_map(|m| match m {
+            Member::Class(c) if c.name == seg => Some(c),
+            _ => None,
+        });
+        members = &found?.tree.members;
+    }
+    found
 }
 
 struct Cx<'a> {
@@ -2276,8 +2291,94 @@ impl Cx<'_> {
             Ty::Enum(er) => Ty::Enum(er.clone()),
             // A cross-file script reference: resolve the member against its (own) member table.
             Ty::ScriptRef(sref) => self.script_member_ty(*sref, name, as_method),
+            // An inner-class value/instance: resolve against its own item-tree + `extends` chain.
+            Ty::InnerClass(iref) => self.inner_class_member_ty(iref, name, as_method),
             _ => Ty::Variant,
         }
+    }
+
+    /// Resolve `name` on an inner-class value/instance (`Ty::InnerClass`). `Inner.new()` constructs an
+    /// instance (the same `InnerClass`); otherwise the inner class's own members (typed by their
+    /// annotation — lossy, like the cross-file `ScriptRef` path: an inferred/unannotated member seams)
+    /// then its `extends` chain. The seam (`Unknown`) for an unresolved member — never a false
+    /// `UNSAFE_*`.
+    fn inner_class_member_ty(
+        &self,
+        iref: &crate::ty::InnerClassRef,
+        name: &str,
+        as_method: bool,
+    ) -> Ty {
+        if name == "new" && as_method {
+            return Ty::InnerClass(iref.clone());
+        }
+        self.inner_member_walk(iref, name, as_method, 0)
+            .unwrap_or(Ty::Unknown)
+    }
+
+    /// Walk an inner class's own members, then its `extends` base (an engine class, a `class_name`, or
+    /// another inner/script class), for `name`. Depth-bounded like [`script_member_walk`].
+    fn inner_member_walk(
+        &self,
+        iref: &crate::ty::InnerClassRef,
+        name: &str,
+        as_method: bool,
+        depth: u32,
+    ) -> Option<Ty> {
+        if depth > 32 {
+            return None;
+        }
+        let ft = self.db.file_text(FileId(iref.file))?;
+        let tree = crate::queries::item_tree(self.db, ft);
+        let inner = find_inner_class(&tree, &iref.path)?;
+        if let Some(m) = inner.tree.member(name) {
+            return self.inner_member_item_ty(m, as_method, iref);
+        }
+        // Not an own member — walk the inner class's `extends` base.
+        let res_path = self.self_res_path();
+        match resolve::resolve_base(self.db, self.api, &inner.tree, res_path.as_deref()) {
+            Ty::Object(class) => self
+                .api
+                .lookup_member(class, name)
+                .map(|m| self.member_ref_ty(&m, as_method)),
+            Ty::ScriptRef(base) => self.script_member_walk(base, name, as_method, depth + 1),
+            Ty::InnerClass(base) => self.inner_member_walk(&base, name, as_method, depth + 1),
+            _ => None,
+        }
+    }
+
+    /// Type an inner class's own member by its written **annotation** (the inner body isn't inferred
+    /// here — Increment 2 adds that). An unannotated `var`/`const` or an untyped `func` return seams.
+    fn inner_member_item_ty(
+        &self,
+        m: &Member,
+        as_method: bool,
+        iref: &crate::ty::InnerClassRef,
+    ) -> Option<Ty> {
+        Some(match m {
+            Member::Func(f) => {
+                if as_method {
+                    f.return_type.as_deref().map_or(Ty::Variant, |t| {
+                        resolve::resolve_type_name(self.db, self.api, t)
+                    })
+                } else {
+                    Ty::Callable
+                }
+            }
+            Member::Var(v) => resolve::resolve_type_name(self.db, self.api, v.type_ref.as_deref()?),
+            Member::Const(c) => {
+                resolve::resolve_type_name(self.db, self.api, c.type_ref.as_deref()?)
+            }
+            Member::Signal(_) => Ty::Signal(None),
+            Member::Enum(e) => Ty::Enum(EnumRef {
+                qualified: e.name.clone()?,
+                bitfield: false,
+            }),
+            // A nested inner class → `Ty::InnerClass` with the extended dotted path.
+            Member::Class(c) => Ty::InnerClass(crate::ty::InnerClassRef {
+                file: iref.file,
+                path: SmolStr::new(format!("{}.{}", iref.path, c.name)),
+            }),
+        })
     }
 
     /// A member of a cross-file script (`ScriptRef`): looked up in the script's own member table
@@ -2770,7 +2871,17 @@ impl Cx<'_> {
                     }
                 }
                 Some(Member::Signal(_)) => Ty::Signal(None),
-                Some(Member::Class(_)) => Ty::Unknown,
+                // An inner `class Name:` used as a value → `Ty::InnerClass` (was the `Unknown` seam),
+                // so `Inner.CONST` / `Inner.new()` / a typed instance's members resolve against its own
+                // item-tree. The path is the inner class's name (resolved from the top-level scope;
+                // nested inner classes get their dotted path once inner bodies are inferred).
+                Some(Member::Class(c)) => match &self.self_ty {
+                    Ty::ScriptRef(sref) => Ty::InnerClass(crate::ty::InnerClassRef {
+                        file: sref.0,
+                        path: c.name.clone(),
+                    }),
+                    _ => Ty::Unknown,
+                },
                 // A same-file named `enum State` used as a value/namespace → the enum type, so
                 // `State.IDLE` (member access below) types as `State`, not a false-`INFERENCE_ON_
                 // VARIANT` seam. An anonymous enum has no namespace name (its variants are direct
