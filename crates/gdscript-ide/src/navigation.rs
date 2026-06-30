@@ -1267,6 +1267,23 @@ mod tests {
     }
 
     #[test]
+    fn inner_class_body_refs_do_not_corrupt_a_top_level_same_named_member() {
+        // 4.24 inc.2 inferred inner-method bodies (units now exist at inner offsets); the inc.3 guard
+        // keeps navigation correct-or-refuse inside inner classes, so a bare inner-member ref is NOT
+        // mis-resolved to a top-level same-named member. `update` exists both top-level and in
+        // `class Inner` — find-refs on the TOP `update` must include only the top decl + `self.update()`,
+        // never the inner class's `func update` decl or its bare `update()` call (Inner.update).
+        let src = "func update():\n\tpass\nfunc go():\n\tself.update()\nclass Inner:\n\tfunc update():\n\t\tpass\n\tfunc run():\n\t\tupdate()\n";
+        let db = db_with(&[(0, src)]);
+        let refs = find_references(&db, pos(0, "update", 0, src)); // the top-level `func update` decl
+        assert_eq!(
+            refs.len(),
+            2,
+            "top `update` find-refs must be the decl + self.update() only, excluding inner refs: {refs:?}",
+        );
+    }
+
+    #[test]
     fn soft_keyword_named_member_is_navigable() {
         // A member named `match` (a Godot soft-keyword identifier) must be reachable by goto-def and
         // find-refs. It used to be dropped at the AST layer (`Name::text()` read only `Ident`), so

@@ -611,29 +611,32 @@ seam, and rename identifier hygiene; all with regression tests):
       flattening), so find-refs, goto-definition, and rename reach it; its declaration is located by
       a parse scan (`anon_enum_variant_target`) since `item_tree` drops per-variant ranges.
 
-**Deferred** (verified real, but needing an AST-layer change or pairing with later inner-class work):
-- [ ] **Inner-class member navigation identity — RISK-SEQUENCED to a focused effort (burndown Stage
-      4.24 review).** Inner members refuse rather than corrupt (safe today). Investigated in the burndown:
-      the full fix needs **two core-touching prerequisites**, not just an identity tweak — (1) **infer
-      inner-class method bodies** (today `analyze_file` Pass 2 iterates only top-level `tree.members` and
-      *skips* `Member::Class`, so inner bodies get NO units / diagnostics / resolvable references), and
-      (2) a **type representation for an inner-class instance** (today `own_member_ty` types a
-      `Member::Class` value as `Ty::Unknown`; without a real inner-class `Ty`, `self.member` inside an
-      inner method and `inner_instance.member` can't resolve, so find-refs can't be **complete** and a
-      safe rename is impossible). Only then can `GodotDef::Member` be qualified by the inner scope and
-      rippled through `classify_decl` / `member_owner` / `resolve_name_to_def` / the rename collision
-      checks. **Decisive risk data:** inner classes occur **0 times** across the 545-file corpus
-      (godot-demo-projects 456 + ReactiveUI-Gadot), so this is a rare feature **AND** the corpus cannot
-      validate the change — a core inference/type-system edit landed with synthetic-test coverage only,
-      against a component all of Stages 5–8 + the W6 freeze depend on. Rushing it mid-burndown
-      "harms more than helps." **Ready-to-execute spec (own focused PR):** add `Ty::InnerClass{file,
-      path}` (most `match ty` sites have a `_` fallback → safe seam by default); type a `Member::Class`
-      value + `Inner.new()` as it; resolve members on it by walking `InnerClassItem.tree` + its `extends`;
-      recurse `analyze_file` Pass 2 into `Member::Class` building a `ClassScope` with `self_ty =
-      InnerClass` (mind Godot's scoping — an inner class sees outer *constants/enums via the outer name*
-      but not outer instance members, the false-positive trap); qualify `GodotDef::Member` with the inner
-      path; enable rename once refs are provably complete. Validate on a vendored inner-class fixture set
-      (the corpus has none).
+**Inner-class member navigation — burndown Stage 4.24 (incremental):**
+- [x] **inc.1 — inner-class TYPING → DONE.** `Ty::InnerClass(InnerClassRef{file, path})` (collapsed
+      meta/instance, like `ScriptRef`; most `match ty` sites take it via their `_` fallback — safe seam).
+      `own_member_ty` produces it for a `Member::Class` value (was the `Unknown` seam); `infer_field`
+      resolves a member on it — `Inner.new()` constructs an instance, else the inner class's own members
+      (typed by annotation, lossy) then its `extends` chain (engine base / inner / script). So
+      `Inner.new().hp`/`.ping()` type from the inner item-tree and `x.get_class()` resolves via `extends
+      Node` — no false `INFERENCE_ON_VARIANT` on inner code. Test:
+      `inner_class_value_and_members_type_via_its_item_tree`.
+- [x] **inc.2 — inner-class method-BODY inference → DONE.** A depth-bounded Pass 2b
+      (`infer_inner_class_bodies`) recurses into `Member::Class` and infers each inner method with `self`
+      typed as the inner class, so `self.member` / bare member refs resolve against the inner item-tree +
+      `extends` chain; unresolved stays the seam (no false positives). Inner code is now type-checked.
+- [x] **inc.2 navigation safety guard → DONE.** Because inc.2 added inner-method units, a *reference*
+      inside an inner body could be mis-resolved by the (not-yet-inner-aware) `resolve_name_to_def` to a
+      top-level same-named member. `classify` now refuses a reference inside an `InnerClassDecl` body
+      (the inner class's own name + member *decls* are still handled / still refuse via `classify_decl`),
+      so navigation stays **correct-or-refuse** inside inner classes — zero corruption. Test:
+      `inner_class_body_refs_do_not_corrupt_a_top_level_same_named_member`.
+- [ ] **inc.3 — inner-member NAVIGATION (goto/find-refs/rename) — remaining.** Qualify
+      `GodotDef::Member` with the inner-class path, make `resolve_name_to_def`/`classify_body_ref`
+      inner-scope-aware (resolve a bare/`self`/instance inner ref against the inner tree, not the top
+      class), and ripple through `member_owner` + the rename collision checks; enable rename once refs are
+      provably complete (now feasible — inc.1+2 give typed instances + inner-body units). Until then
+      navigation is correct-or-refuse for inner members (the guard above). Still 0 corpus coverage →
+      validate on a vendored inner-class fixture set.
 - [x] **Symbols named with soft keywords (`match`/`when`) — DONE (Phase-5 hardening).** `Name::text()`
       and `EnumVariant::text()` now read the grammar's `at_name` whitelist (`Ident | MatchKw | WhenKw`)
       via a `name_token_text` helper, so such symbols reach item_tree / hover / completion. `classify`

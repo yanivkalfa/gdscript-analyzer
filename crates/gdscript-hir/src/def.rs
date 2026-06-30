@@ -173,6 +173,16 @@ pub fn classify(db: &dyn Db, pos: FilePosition) -> Option<GodotDef> {
     if has_ancestor(&tok, SyntaxKind::TypeRef) {
         return classify_type_name(db, &name);
     }
+    // (C-guard) A *reference* inside an inner `class Name:` body (a `self.member` / bare member ref in
+    // an inner method, now that inner bodies are inferred — burndown 4.24 inc.2) resolves against the
+    // INNER scope, which `resolve_name_to_def` doesn't model yet: it would mis-resolve a bare inner
+    // member to a top-level same-named one, corrupting that top member's rename. So navigation stays
+    // **correct-or-refuse** inside inner-class bodies until the inner-scope-aware resolution lands
+    // (4.24 inc.3). The inner class's own *name* and its member *declarations* are handled by
+    // `classify_decl` above (an inner decl already refuses there) — this guards only the body refs.
+    if has_ancestor(&tok, SyntaxKind::InnerClassDecl) {
+        return None;
+    }
     // (C) A reference inside a function body / field initializer (a `NameRef`, or the member token
     //     of a `FieldExpr`). Resolve through the inference units.
     classify_body_ref(db, ft, pos.file, pos.offset, &name)
