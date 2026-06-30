@@ -19,9 +19,10 @@ As of the CST-driven wrapping port (a faithful port of gdformat 4.5's `expressio
 `src/wrap.rs`) plus the full normalization set (inline-suite expansion, blank-line + comment rules,
 node-path / triple-quote / BOM, dict-entry & magic-comma chains), EOL-normalised:
 
-- **exact match**: **454/456 (99.6%)** over `godot-demo-projects` (up from ~14% at the start of
-  Phase 4), **88/88 (100%)** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
-- **fixpoint** `format(gold)==gold`: **455/456 (99.8%)** godot, **88/88 (100%)** ReactiveUI
+- **exact match**: **456/456 (100%)** over `godot-demo-projects` (up from ~14% at the start of
+  Phase 4 — the last 2 misses, `os_test.gd` + `town_scene.gd`, were closed in burndown Stages 6.29 +
+  6.28), **88/88 (100%)** over the denser, React-like `ReactiveUI-Gadot` library code (up from ~2%)
+- **fixpoint** `format(gold)==gold`: **456/456 (100%)** godot, **88/88 (100%)** ReactiveUI
 
 **Comments are threaded through a reshaped statement** (a faithful port of gdformat's comment model):
 a standalone comment keeps its own line at the block / element indent, a trailing inline comment is

@@ -954,8 +954,8 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
         block-boundary comment placed at its block depth, a trailing comment that never forces a wrap,
         and a column-0 comment amid a function body). Each is guarded by the meaning-equivalence net +
         a dedicated **comment-multiset net** (any unplaceable comment → verbatim fallback). **gdformat
-        differential (EOL-normalised): byte-exact godot 454/456 (99.6%), ReactiveUI-Gadot 88/88 (100%);
-        `format(gold)==gold` 455/456 / 88/88; 110 unit tests. Corpus safety (544 files, safe_mode OFF):
+        differential (EOL-normalised): byte-exact godot 456/456 (100%) [was 454/456 — burndown Stages
+        6.29 + 6.28 closed the last 2], ReactiveUI-Gadot 88/88 (100%); 112 unit tests. Corpus safety (544 files, safe_mode OFF):
         0 non-parsing, 0 token changes, 0 idempotence breaks.** Every behaviour + remaining gap is
         catalogued in **`crates/gdscript-fmt/DEVIATIONS.md`**. **`format_range`** (LSP range formatting)
         is also DONE (`fmt::format_range` → `ide` → LSP `textDocument/rangeFormatting`).
@@ -970,24 +970,23 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
           collection's **suffix** and lets the collection's own wrapping place it (`][index]` on the close
           line). **Corpus delta: 454 → 455, os_test.gd now byte-exact, 0 regressions.** Test:
           `indexed_array_literal_explodes_the_array_keeps_index_on_close_line`.
-        - [ ] **(a) `town_scene.gd` — a comment leading a parenthesized operand → DEFERRED with a
-          *corrected* characterization (burndown Stage 6.28 investigation).** The TECH_DEBT framing
-          ("make `strip_parens` operand-aware") was **wrong** — probing `gdformat 4.5.0` directly shows
-          our paren-*retention already matches it byte-for-byte*: `(a and b) or (c and d)` is kept by both
-          short **and** exploded (`(...)\n or (...)`), no strip-behaviour change is needed. The **sole**
-          remaining divergence is **comment placement**: in `if (\n #c\n A and B\n) or (\n #c\n C and D\n):`
-          gdformat *compacts* each operand to one line and *hoists* the interior leading comment to AFTER
-          that operand (`(A and B)` / `# c` / `or (C and D)`), whereas we conservatively preserve the
-          source's hand-wrapping (the comment stays inside the paren — `chain_standalone_comments` leaves
-          an in-operand-span comment to the operand's own formatting, which then can't compact). Hoisting a
-          comment *across the paren boundary* + letting the operand compact without it needs coordinated
-          edits to `forcing_multiline` + the comment de-dup, all in the **comment-threading net** — the
-          single most regression-prone formatter subsystem (the very risk the user chose to avoid by
-          keeping trivia-attachment deferred). For **one** cosmetic file where our output is already valid,
-          meaning-preserving, and comment-complete, that trade is "harms more than helps." A reproducible
-          **gdformat gold-corpus differential** was built for the burndown (gdformat over godot-demo-projects
-          → gold; our CLI `format` per file; EOL-normalised byte-compare with an improved/regressed delta)
-          — it confirmed the 6.29 fix clean and is the gate any future attempt at (a) must pass.
+        - [x] **(a) `town_scene.gd` — a comment leading a parenthesized operand → DONE (burndown Stage
+          6.28).** The original framing ("make `strip_parens` operand-aware") was **wrong** — probing
+          `gdformat 4.5.0` directly showed our paren-*retention already matched it byte-for-byte*
+          (`(a and b) or (c and d)` kept by both, short and exploded). The **sole** divergence was
+          **comment placement**: in `if (\n #c\n A and B\n) or (\n #c\n C and D\n):` gdformat compacts each
+          operand and hoists the interior leading comment to *after* it (`(A and B)` / `# c` /
+          `or (C and D)`). Fixed with a **localized** helper `paren_operand_with_leading_comment` (in
+          `format_operand`): a parenthesized operator-chain operand whose only interior standalone
+          comment(s) *lead* it renders compact (`expr_to_str` drops the comment) and re-emits the comment
+          on its own next line — and `chain_standalone_comments` already leaves an in-operand-span comment
+          to the operand's own formatting, so it is emitted **once** (the comment-multiset net stays
+          balanced). Bails (→ the unchanged general path) for a non-leading/inline/trailing comment, a
+          forcing-multiline operand, or an over-width compact — so the blast radius is exactly the target
+          pattern. **gdformat gold-corpus differential (gdformat 4.5.0 over godot-demo-projects, EOL-norm):
+          byte-exact 454 → 456/456 (100%), 0 regressions** (with 6.29). Test:
+          `operator_chain_paren_operand_with_leading_comment_compacts_and_hoists`. (The reproducible gold
+          harness lives at `$SCRATCH/fmtdiff.sh`.)
 - [~] **W4 — perf infra tail — burndown Stage 7 (locally-buildable parts DONE; CI-service parts deferred).**
       Landed: a warm-keystroke incremental bench (~2 ms / ~300 loc — confirms the W1 gate-downstream + W2
       flow-inside-`analyze_file` keep incrementality flat). **Stage 7.30 — project-scale COLD bench DONE:**

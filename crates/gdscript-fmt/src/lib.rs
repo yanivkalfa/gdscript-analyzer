@@ -2680,6 +2680,29 @@ mod tests {
     }
 
     #[test]
+    fn operator_chain_paren_operand_with_leading_comment_compacts_and_hoists() {
+        // gdformat parity (town_scene.gd, burndown Stage 6.28): a parenthesized `and`-chain operand of
+        // an `or` chain, with a comment leading the operand *inside* its parens, renders the operand
+        // compact and hoists the comment to its own next line — not the source's hand-wrapped paren
+        // block. (Our paren-retention already matched gdformat; this closes the comment placement.)
+        let src = "func f():\n\tif (\n\t\t\t# on\n\t\t\taaa and bbb\n\t) or (\n\t\t\t# off\n\t\t\tccc and ddd\n\t):\n\t\tpass\n";
+        let out = fmt(src);
+        assert!(out.contains("(aaa and bbb)"), "operand 0 compacts:\n{out}");
+        assert!(
+            out.contains("or (ccc and ddd)"),
+            "operator leads the compacted operand 1:\n{out}"
+        );
+        assert!(
+            out.contains("# on") && out.contains("# off"),
+            "comments preserved:\n{out}"
+        );
+        // (No raw `same_significant_tokens` here: a multi-line operator chain is wrapped in an
+        // injected `(…)` — gdformat does the same, and the formatter's own net accounts for it, but a
+        // raw token compare would not. The byte-exact gdformat corpus parity is the real guard.)
+        assert_eq!(fmt(&out), out, "idempotent");
+    }
+
+    #[test]
     fn preserves_significant_tokens_including_strings() {
         let src = "func f():\n\tvar s = \"a + b\"\n\treturn s\n";
         let out = fmt(src);

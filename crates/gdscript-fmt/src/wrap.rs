@@ -1401,7 +1401,8 @@ fn format_operand(
     suffix: &str,
 ) -> Option<Vec<String>> {
     match operand {
-        Operand::Node(n) => format_concrete(w, n, indent, prefix, suffix),
+        Operand::Node(n) => paren_operand_with_leading_comment(w, n, indent, prefix, suffix)
+            .or_else(|| format_concrete(w, n, indent, prefix, suffix)),
         Operand::Text(t) => Some(vec![format!(
             "{}{}{}{}",
             w.indent(indent),
@@ -1410,6 +1411,58 @@ fn format_operand(
             suffix
         )]),
     }
+}
+
+/// A parenthesized operator-chain operand whose interior standalone comment(s) *lead* it
+/// (`(\n\t# c\n\tA and B\n)`): gdformat renders the operand compact and re-emits the comment on its
+/// own next line — `(A and B)` then `# c` — rather than preserving the source's hand-wrapped paren
+/// block. Returns those lines, or `None` to fall through to the general formatting (operand isn't a
+/// paren, has no leading comment, has a non-leading/trailing/inline comment, contains a
+/// forcing-multiline construct, or won't fit compact). The comment-multiset net stays balanced:
+/// `expr_to_str` drops the comment and we re-emit it here, and `chain_standalone_comments` already
+/// leaves an in-operand-span comment to the operand's own formatting (this), so it is emitted once.
+fn paren_operand_with_leading_comment(
+    w: &W,
+    n: &GdNode,
+    indent: usize,
+    prefix: &str,
+    suffix: &str,
+) -> Option<Vec<String>> {
+    if n.kind() != S::ParenExpr {
+        return None;
+    }
+    // The inner expression (the node between the parens) — its first significant token bounds the
+    // "leading" region.
+    let inner = n.children().find(|c| is_expr_kind(c.kind()))?;
+    let inner_start = code_span(inner)?.0;
+    // Every standalone (line-leading) comment of this operand must LEAD the inner expr (sit between
+    // `(` and the inner's first token); an inline / interior / trailing comment → bail (let the
+    // general path + the multiset net handle it, unchanged).
+    let mut comments = Vec::new();
+    comment_tokens(n, &w.src, &mut comments);
+    let mut leading: Vec<String> = Vec::new();
+    for (off, _, text) in &comments {
+        let line_start = w.src[..*off].rfind('\n').map_or(0, |i| i + 1);
+        if !w.src[line_start..*off].trim().is_empty() || *off >= inner_start {
+            return None;
+        }
+        leading.push(text.clone());
+    }
+    if leading.is_empty() || forcing_multiline(inner) {
+        return None;
+    }
+    let flat = expr_to_str(w, n)?;
+    let compact = format!("{}{prefix}{flat}{suffix}", w.indent(indent));
+    if width(&compact) > w.max {
+        return None; // too wide compact → let the general path explode it
+    }
+    let mut out = vec![compact];
+    out.extend(
+        leading
+            .into_iter()
+            .map(|c| format!("{}{c}", w.indent(indent))),
+    );
+    Some(out)
 }
 
 fn format_unary(
