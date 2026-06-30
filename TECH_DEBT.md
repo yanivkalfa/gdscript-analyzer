@@ -1009,7 +1009,21 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       (changes no decision today — no memory pressure is demonstrated — and would add a profiling dep to the
       contract crate; ready spec: optional `dhat` dep behind a `dhat-heap` feature + a `mem_profile` example
       that holds a large project's host under `dhat::Profiler::new_heap()`).
-- [ ] **W5 — docs tail.** Landed: the generated Warning Reference (anti-drift test in `cargo test`) + the Configuration page + **`crates/gdscript-ide/examples/analyze.rs`** (a CI-built public-API tour — added in the §1 pass). Deferred: the W6 **contract page** (authored *with* the freeze — it embeds the verbatim semver policy + the Godot-version matrix, so it is W6's job by definition); the docs.rs polish pass (`deny(missing_docs)` on the public crates, doctest the POD docs, "internal — not stable" banners on the non-contract crates — **W6-entangled**, since which crates are "contract" vs "internal" is the freeze decision); playground-as-live-docs deep links.
+- [~] **W5 / Stage 9 — DOCUMENTATION SWEEP (in progress).** Landed earlier: the generated Warning
+      Reference (anti-drift test) + the Configuration page + `crates/gdscript-ide/examples/analyze.rs`
+      (a CI-built public-API tour). **Burndown Stage 9 (this pass)** completes the docs sweep — it is
+      **not** W6-entangled (the contract-vs-internal split is already settled: `gdscript-ide` +
+      `gdscript-base` are the public contract per their READMEs; everything else is the "internal layer"):
+      - per-crate READMEs — author the 4 missing (`gdscript-cli`/`gdscript-ffi`/`gdscript-lsp`/
+        `gdscript-session`) + `xtask`, uniform with the existing 8.
+      - rustdoc completeness — `#![deny(missing_docs)]` on the **contract** crates (`gdscript-base` is
+        already gap-free; `gdscript-ide` — fill), an **"internal — not a stable API"** banner on the
+        non-contract crates, and `missing_docs` enforcement where the gap is bounded (the gate's
+        `-D warnings` promotes `missing_docs` to an error, so the lint is added only when the crate is
+        fully filled).
+      - mdBook (`docs/src`) — verified all 13 referenced pages exist; light link/coverage pass.
+      **Remains for W6 (by definition):** the **contract page** (verbatim semver policy + the
+      Godot-version matrix, authored *with* the freeze) + the playground-as-live-docs deep links.
 - [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
       (non-salsa) `WarningOverride` field on the `Db` (read only by the downstream `type_diagnostics`,
       so the W1 firewall holds), `WarningSettings::with_strict_opt_in` flipping only the opt-in

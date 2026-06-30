@@ -3,6 +3,7 @@ name = "xtask"
 description = "Repository automation for gdscript-analyzer (cargo xtask: ci | codegen-api | fixtures | dist | release)."
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

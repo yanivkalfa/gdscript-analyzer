@@ -3,6 +3,7 @@ name = "gdscript-ffi"
 description = "napi-rs binding surface for gdscript-analyzer — the Node .node addon over gdscript-ide."
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
