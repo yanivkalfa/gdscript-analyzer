@@ -85,7 +85,7 @@ smol_str = "0.3"
 # and the core is single-writer/multi-reader anyway). `inventory` does the ingredient
 # registration (dropping it panics "ingredient … was not registered" at runtime); `macros`,
 # `accumulator`, `salsa_unstable` are the API surface M0+ uses.
-salsa = { version = "=0.27.1", default-features = false, features = [
+salsa = { version = "=0.27.2", default-features = false, features = [
     "macros",
     "inventory",
     "accumulator",
