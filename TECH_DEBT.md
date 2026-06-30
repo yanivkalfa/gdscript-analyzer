@@ -1009,13 +1009,14 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       (changes no decision today — no memory pressure is demonstrated — and would add a profiling dep to the
       contract crate; ready spec: optional `dhat` dep behind a `dhat-heap` feature + a `mem_profile` example
       that holds a large project's host under `dhat::Profiler::new_heap()`).
-- [~] **W5 / Stage 9 — DOCUMENTATION SWEEP (in progress).** Landed earlier: the generated Warning
-      Reference (anti-drift test) + the Configuration page + `crates/gdscript-ide/examples/analyze.rs`
-      (a CI-built public-API tour). **Burndown Stage 9 (this pass)** completes the docs sweep — it is
-      **not** W6-entangled (the contract-vs-internal split is already settled: `gdscript-ide` +
-      `gdscript-base` are the public contract per their READMEs; everything else is the "internal layer"):
-      - per-crate READMEs — author the 4 missing (`gdscript-cli`/`gdscript-ffi`/`gdscript-lsp`/
-        `gdscript-session`) + `xtask`, uniform with the existing 8.
+- [~] **W5 / Stage 9 — DOCUMENTATION SWEEP — DONE (only the W6-reserved bits remain).** Landed earlier:
+      the generated Warning Reference (anti-drift test) + the Configuration page +
+      `crates/gdscript-ide/examples/analyze.rs` (a CI-built public-API tour). **Burndown Stage 9** completed
+      the docs sweep — it was **not** W6-entangled (the contract-vs-internal split is already settled:
+      `gdscript-ide` + `gdscript-base` are the public contract per their READMEs; everything else is the
+      "internal layer"):
+      - per-crate READMEs — **DONE.** Authored the 4 missing (`gdscript-cli`/`gdscript-ffi`/`gdscript-lsp`/
+        `gdscript-session`) + `xtask`, uniform with the existing 8 (each Cargo.toml now sets `readme`).
       - rustdoc completeness — **DONE.** `#![deny(missing_docs)]` on **6 crates**, all verified gap-free:
         the contract crates `gdscript-base` + `gdscript-ide` (both already complete), and the internal
         `gdscript-fmt` / `gdscript-hir` / `gdscript-scene` / `gdscript-session` (gap-free after a 1-item
@@ -1024,7 +1025,11 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
         fields), `gdscript-db` (salsa-derived items), or `gdscript-syntax` (the 157-variant `SyntaxKind`
         token/node catalog + ast accessors — a self-describing bulk surface) — the gate's `-D warnings`
         would force documenting macro-generated / low-value items; the banner + module docs carry those.
-      - mdBook (`docs/src`) — verified all 13 referenced pages exist; light link/coverage pass.
+      - POD doctests — **DONE.** Added a CI-run doctest to `gdscript_base::LineIndex` demonstrating the
+        byte-vs-UTF-16 column divergence (the position-encoding footgun the type exists for).
+      - mdBook (`docs/src`) — verified: all 13 referenced pages exist, no stub/TODO markers, no empty
+        pages; the Warning-Reference anti-drift test (`warning_reference_doc_is_current`) is green in the
+        gate.
       **Remains for W6 (by definition):** the **contract page** (verbatim semver policy + the
       Godot-version matrix, authored *with* the freeze) + the playground-as-live-docs deep links.
 - [x] **CLI `--strict` / `--engine-defaults` override — DONE (Phase 1, `feat/w1-warnings`).** A plain
