@@ -158,8 +158,12 @@ impl PrePass<'_> {
         // Close any lambda bodies this line has dedented back out of.
         self.close_lambdas(col, at);
 
-        let in_lambda = !self.lambda_stack.is_empty();
-        let suppressed = !in_lambda && self.bracket_depth > 0;
+        let suppressed = self.indentation_suppressed();
+        // Whether this physical line, when it ends with `:` inside brackets, is a *lambda header*
+        // (`… func(params) [-> Type]:`) rather than a dict entry whose value sits on the next line
+        // (`"key":\n value`). Both end with `:` inside brackets, but only the lambda opens a body
+        // block; a dict-entry colon must keep its newline suppressed so the value continues the entry.
+        let is_lambda_header = line_is_lambda_header(line);
 
         // Indentation markers only where indentation is significant.
         if !suppressed {
@@ -167,16 +171,19 @@ impl PrePass<'_> {
             self.emit_indent_dedent(col, at);
         }
 
-        // Copy the line's tokens, tracking brackets and the last meaningful token, and
-        // emit a logical Newline at the terminator where appropriate.
+        // Copy the line's tokens, tracking brackets, and emit a logical Newline at the terminator
+        // where appropriate.
         let mut has_terminator = false;
-        let mut last_meaningful: Option<SyntaxKind> = None;
         for tok in line {
             if tok.kind == SyntaxKind::NewlinePhys {
                 has_terminator = true;
-                let opens_lambda =
-                    self.bracket_depth > 0 && last_meaningful == Some(SyntaxKind::Colon);
-                if self.bracket_depth == 0 || in_lambda || opens_lambda {
+                let opens_lambda = self.bracket_depth > 0 && is_lambda_header;
+                // Emit a logical `Newline` at a significant statement boundary — re-evaluating
+                // suppression with the *current* bracket/lambda state (not the line-start value): a
+                // lambda body that closed mid-line (`func(): … return X,`) is no longer significant,
+                // and a line that sits inside a bracket nested *within* the lambda body
+                // (`return new(\n …\n)`) stays suppressed too.
+                if !self.indentation_suppressed() || opens_lambda {
                     self.push_marker(SyntaxKind::Newline, tok.range.start());
                 }
                 self.out.push(*tok);
@@ -209,25 +216,32 @@ impl PrePass<'_> {
                 }
                 self.out.push(*tok);
                 self.track_bracket(tok.kind);
-                if !tok.kind.is_trivia() {
-                    last_meaningful = Some(tok.kind);
-                }
             }
         }
         // A final line with content but no trailing newline still terminates a statement.
-        if !has_terminator && (self.bracket_depth == 0 || in_lambda) {
+        if !has_terminator && !self.indentation_suppressed() {
             self.push_marker(SyntaxKind::Newline, src_end(self.src));
         }
 
-        // A line that ends with `:` while inside brackets is a lambda header: open a
-        // fresh indentation context for its body, based at this line's column.
-        if self.bracket_depth > 0 && last_meaningful == Some(SyntaxKind::Colon) {
+        // A lambda header inside brackets opens a fresh indentation context for its body, based at
+        // this line's column. (A dict-entry colon with the value on the next line is *not* a header.)
+        if self.bracket_depth > 0 && is_lambda_header {
             let saved = std::mem::replace(&mut self.indent_stack, vec![col]);
             self.lambda_stack.push(LambdaCtx {
                 saved_indent_stack: saved,
                 base: col,
                 open_bracket_depth: self.bracket_depth,
             });
+        }
+    }
+
+    /// Whether indentation / logical newlines are currently *not* significant. Outside all lambdas
+    /// that is any open bracket; inside a lambda body it is only a bracket nested *deeper* than the
+    /// lambda's own level (the body itself, at the lambda's bracket depth, stays significant).
+    fn indentation_suppressed(&self) -> bool {
+        match self.lambda_stack.last() {
+            Some(ctx) => self.bracket_depth > ctx.open_bracket_depth,
+            None => self.bracket_depth > 0,
         }
     }
 
@@ -388,6 +402,58 @@ impl PrePass<'_> {
 /// The end-of-source offset as a `TextSize`.
 fn src_end(src: &str) -> TextSize {
     TextSize::of(src)
+}
+
+/// Whether a physical line is a **lambda header** — `… func(params) [-> Type]:` ending in `:`.
+///
+/// Used to distinguish a lambda whose body follows on the next line (its `:` opens an indented
+/// block) from a dict entry whose value sits on the next line (`"key":\n value`), since both end
+/// with `:` inside brackets. We find the last `func` keyword and require that what follows is a
+/// balanced parameter list, then only an optional `-> Type` return annotation, then the line's
+/// terminal `:` — i.e. no further `:` (which would mean an inline lambda body or a dict colon owns
+/// the terminal one).
+fn line_is_lambda_header(line: &[RawToken]) -> bool {
+    use SyntaxKind as S;
+    let toks: Vec<S> = line
+        .iter()
+        .map(|t| t.kind)
+        .filter(|k| !k.is_trivia())
+        .collect();
+    if toks.last() != Some(&S::Colon) {
+        return false;
+    }
+    let Some(func_pos) = toks.iter().rposition(|&k| k == S::FuncKw) else {
+        return false;
+    };
+    // `func` is followed by an optional name (named lambda) then the parameter list `(...)`.
+    let mut i = func_pos + 1;
+    if toks.get(i) == Some(&S::Ident) {
+        i += 1;
+    }
+    if toks.get(i) != Some(&S::LParen) {
+        return false;
+    }
+    let mut depth = 0u32;
+    while i < toks.len() {
+        match toks[i] {
+            S::LParen => depth += 1,
+            S::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 {
+        return false;
+    }
+    // Between the params' `)` and the terminal `:` only a `-> Type` may appear — no other colon.
+    let last = toks.len() - 1;
+    !toks[i..last].contains(&S::Colon)
 }
 
 #[cfg(test)]

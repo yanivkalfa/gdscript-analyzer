@@ -75,7 +75,11 @@ enum LexKind {
     #[token("^\"", lex_string)]
     #[token("^'", lex_string)]
     NodePath,
-    #[regex(r"[A-Za-z_][A-Za-z0-9_]*")]
+    // Unicode identifiers (UAX #31 / Godot's `is_unicode_identifier_*`): a `_` or XID_Start, then
+    // XID_Continue. A strict superset of `[A-Za-z_][A-Za-z0-9_]*` on ASCII (so ASCII tokenization is
+    // byte-identical), now also accepting e.g. `café` / non-Latin names — and letting the analyzer
+    // see (and `CONFUSABLE_IDENTIFIER`-check) the mixed-script identifiers Godot accepts.
+    #[regex(r"[_\p{XID_Start}]\p{XID_Continue}*")]
     Ident,
 
     // ---- brackets & punctuation ----
@@ -415,6 +419,17 @@ mod tests {
         assert_eq!(kinds("PI"), vec![S::ConstPi]);
         assert_eq!(kinds("my_var"), vec![S::Ident]);
         assert_eq!(kinds("class_name"), vec![S::ClassNameKw]);
+    }
+
+    #[test]
+    fn unicode_identifiers_lex_as_one_ident() {
+        use SyntaxKind as S;
+        // UAX #31 identifiers (valid in Godot) lex as a single Ident — not split at the non-ASCII
+        // char as the old ASCII-only rule did.
+        assert_eq!(kinds("café"), vec![S::Ident]);
+        // A Latin identifier carrying a Cyrillic homoglyph (`\u{0430}` = `а`) is still ONE Ident, so
+        // the analyzer can flag it as CONFUSABLE_IDENTIFIER.
+        assert_eq!(kinds("p\u{0430}ypal"), vec![S::Ident]);
     }
 
     #[test]

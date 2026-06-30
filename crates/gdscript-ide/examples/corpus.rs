@@ -6,9 +6,12 @@
 //! stable diagnostic count on a real project.
 //!
 //! `--project` loads every file into ONE host so the global `class_name` registry is populated
-//! and cross-file references resolve — validating project-scale fidelity (M1+).
+//! and cross-file references resolve — validating project-scale fidelity (M1+). `--per-project`
+//! discovers every `project.godot` under the root and loads each sub-project into its OWN host —
+//! the *faithful* validation (one `project.godot`, one `class_name` namespace), whereas `--project`
+//! merges everything (cross-project collisions expected; the robustness stress test).
 //!
-//! Usage: `cargo run -p gdscript-ide --example corpus -- <dir> [--show] [--project]`
+//! Usage: `cargo run -p gdscript-ide --example corpus -- <dir> [--show] [--project|--per-project] [--ci]`
 
 use std::path::{Path, PathBuf};
 
@@ -33,11 +36,23 @@ fn collect_gd(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Project mode: load EVERY file into one host so the global `class_name` registry is populated
-/// and cross-file references actually resolve. Validates that lighting up cross-file resolution
-/// (M1+) introduces no project-scale false positives.
-fn run_project(dir: &str, files: &[PathBuf], show: bool) {
-    let root = Path::new(dir);
+/// The per-project analysis result.
+#[derive(Default)]
+struct ProjectStats {
+    files: usize,
+    total_diags: usize,
+    parse_errors: usize,
+    panics: Vec<PathBuf>,
+}
+
+/// Analyze ONE project: load every `.gd` under `root` into a single host (so the global `class_name`
+/// registry + cross-file resolution work), supply `root/project.godot` if present, then collect each
+/// file's diagnostics (catching panics). The shared core of `--project` and `--per-project`.
+fn analyze_project(root: &Path, show: bool) -> ProjectStats {
+    let mut files = Vec::new();
+    collect_gd(root, &mut files);
+    files.sort();
+
     let mut host = AnalysisHost::new();
     let mut change = Change::new();
     let mut loaded = Vec::new();
@@ -45,32 +60,33 @@ fn run_project(dir: &str, files: &[PathBuf], show: bool) {
         if let Ok(src) = std::fs::read_to_string(path) {
             let id = FileId(u32::try_from(i).expect("< 4B files"));
             change.change_file(id, src.as_str());
-            // The `res://` path = the file's path relative to the project root (the arg `dir`),
-            // forward-slashed — so `preload("res://…")`/`extends "res://…"` resolve cross-file.
+            // The `res://` path = the file's path relative to the project root, forward-slashed — so
+            // `preload("res://…")`/`extends "res://…"` resolve cross-file.
             let rel = path.strip_prefix(root).unwrap_or(path);
             let res_path = format!("res://{}", rel.to_string_lossy().replace('\\', "/"));
             change.set_file_path(id, res_path);
             loaded.push((id, path.clone(), src));
         }
     }
-    // Supply `project.godot` (if present at the root) so `[autoload]` singletons resolve (M4).
     if let Ok(cfg) = std::fs::read_to_string(root.join("project.godot")) {
         change.set_project_config(cfg.as_str());
     }
     host.apply_change(change);
     let analysis = host.analysis();
 
-    let (mut clean, mut with_diags, mut total_diags) = (0usize, 0usize, 0usize);
-    let mut panics = Vec::new();
+    let mut stats = ProjectStats {
+        files: loaded.len(),
+        ..ProjectStats::default()
+    };
     for (id, path, src) in &loaded {
         let id = *id;
         let snap = analysis.clone();
         let run = std::panic::AssertUnwindSafe(move || snap.diagnostics(id).unwrap());
         match std::panic::catch_unwind(run) {
-            Ok(d) if d.is_empty() => clean += 1,
+            Ok(d) if d.is_empty() => {}
             Ok(d) => {
-                with_diags += 1;
-                total_diags += d.len();
+                stats.total_diags += d.len();
+                stats.parse_errors += d.iter().filter(|x| x.code == "GDSCRIPT_SYNTAX").count();
                 if show {
                     let idx = LineIndex::new(src);
                     println!("\n{}  ({} diag)", path.display(), d.len());
@@ -88,16 +104,80 @@ fn run_project(dir: &str, files: &[PathBuf], show: bool) {
                     }
                 }
             }
-            Err(_) => panics.push(path.clone()),
+            Err(_) => stats.panics.push(path.clone()),
+        }
+    }
+    stats
+}
+
+/// `--project`: merge EVERYTHING under `dir` into one host (the cross-project robustness stress test).
+fn run_project(dir: &str, show: bool, ci: bool) {
+    let stats = analyze_project(Path::new(dir), show);
+    println!(
+        "\n=== corpus (PROJECT mode — merged, cross-file active): {dir} ===\n  files:       {}\n  diagnostics: {}\n  parse errors:{}\n  panics:      {}",
+        stats.files,
+        stats.total_diags,
+        stats.parse_errors,
+        stats.panics.len()
+    );
+    for p in &stats.panics {
+        println!("  PANIC: {}", p.display());
+    }
+    gate_or_exit(ci, stats.parse_errors, stats.panics.len());
+}
+
+/// `--per-project`: discover every `project.godot` under `root` and analyze each sub-project in its
+/// OWN host — the faithful single-namespace validation (no cross-project `class_name` collisions).
+fn run_per_project(root: &str, show: bool, ci: bool) {
+    let mut projects = Vec::new();
+    find_projects(Path::new(root), &mut projects);
+    projects.sort();
+
+    let (mut files, mut diags, mut parse_errors, mut panics) = (0usize, 0usize, 0usize, 0usize);
+    for proj in &projects {
+        let stats = analyze_project(proj, show);
+        files += stats.files;
+        diags += stats.total_diags;
+        parse_errors += stats.parse_errors;
+        panics += stats.panics.len();
+        for p in &stats.panics {
+            println!("  PANIC ({}): {}", proj.display(), p.display());
         }
     }
     println!(
-        "\n=== corpus (PROJECT mode — cross-file resolution active): {dir} ===\n  files:       {}\n  clean:       {clean}\n  with diags:  {with_diags} ({total_diags} diagnostics)\n  panics:      {}",
-        loaded.len(),
-        panics.len()
+        "\n=== corpus (PER-PROJECT — {} projects): {root} ===\n  files:       {files}\n  diagnostics: {diags}\n  parse errors:{parse_errors}\n  panics:      {panics}",
+        projects.len()
     );
-    for p in &panics {
-        println!("  PANIC: {}", p.display());
+    gate_or_exit(ci, parse_errors, panics);
+}
+
+/// Collect every directory under `dir` that holds a `project.godot` (a self-contained Godot project);
+/// a project's own subtree is not descended into (projects do not nest).
+fn find_projects(dir: &Path, out: &mut Vec<PathBuf>) {
+    if dir.join("project.godot").is_file() {
+        out.push(dir.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(name, ".godot" | ".git" | "node_modules" | "out" | "target") {
+                continue;
+            }
+            find_projects(&path, out);
+        }
+    }
+}
+
+/// In `--ci`, exit non-zero on any parse error or panic.
+fn gate_or_exit(ci: bool, parse_errors: usize, panics: usize) {
+    if ci && (parse_errors > 0 || panics > 0) {
+        eprintln!("CORPUS GATE FAILED: {parse_errors} parse errors, {panics} panics");
+        std::process::exit(1);
     }
 }
 
@@ -109,17 +189,26 @@ fn main() {
         .expect("usage: corpus <dir> [--show] [--project]");
     let show = args.iter().any(|a| a == "--show");
     let project = args.iter().any(|a| a == "--project");
+    let per_project = args.iter().any(|a| a == "--per-project");
+    // `--ci`: exit non-zero on any panic or any GDSCRIPT_SYNTAX parse error (type diagnostics —
+    // UNSAFE_*, etc. — are the intended value-prop warnings and never fail the gate).
+    let ci = args.iter().any(|a| a == "--ci");
+
+    if per_project {
+        run_per_project(&dir, show, ci);
+        return;
+    }
+    if project {
+        run_project(&dir, show, ci);
+        return;
+    }
 
     let mut files = Vec::new();
     collect_gd(Path::new(&dir), &mut files);
     files.sort();
 
-    if project {
-        run_project(&dir, &files, show);
-        return;
-    }
-
     let (mut total, mut clean, mut with_diags, mut total_diags) = (0usize, 0usize, 0usize, 0usize);
+    let mut parse_errors = 0usize;
     let mut panics = Vec::new();
 
     for path in &files {
@@ -140,6 +229,7 @@ fn main() {
             Ok(diags) => {
                 with_diags += 1;
                 total_diags += diags.len();
+                parse_errors += diags.iter().filter(|d| d.code == "GDSCRIPT_SYNTAX").count();
                 if show {
                     let idx = LineIndex::new(&src);
                     println!("\n{}  ({} diag)", path.display(), diags.len());
@@ -162,10 +252,18 @@ fn main() {
     }
 
     println!(
-        "\n=== corpus: {dir} ===\n  files:       {total}\n  clean:       {clean}\n  with diags:  {with_diags} ({total_diags} diagnostics)\n  panics:      {}",
+        "\n=== corpus: {dir} ===\n  files:       {total}\n  clean:       {clean}\n  with diags:  {with_diags} ({total_diags} diagnostics)\n  parse errors:{parse_errors}\n  panics:      {}",
         panics.len()
     );
     for p in &panics {
         println!("  PANIC: {}", p.display());
+    }
+    // The CI gate: any panic or any GDSCRIPT_SYNTAX parse error over real code is a regression.
+    if ci && (parse_errors > 0 || !panics.is_empty()) {
+        eprintln!(
+            "CORPUS GATE FAILED: {parse_errors} parse errors, {} panics",
+            panics.len()
+        );
+        std::process::exit(1);
     }
 }

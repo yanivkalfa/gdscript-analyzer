@@ -45,6 +45,19 @@ const VALID: &[&str] = &[
     // indentation case.
     "func s(arr):\n\treturn arr.map(func(x): return x * 2)\n",
     "func s(arr):\n\tarr.sort_custom(func(a, b):\n\t\treturn a < b\n\t)\n",
+    // Broader coverage (burndown Stage 3 — a wider error-agreement set).
+    "func f(a, b = 1, c := 2):\n\tpass\n",
+    "static func make() -> Node:\n\treturn null\n",
+    "func f():\n\tvar x = 1\n\tx += 1\n\tx -= 2\n\tx *= 3\n",
+    "func f():\n\tassert(true, \"never\")\n",
+    "func f():\n\tawait get_tree().process_frame\n",
+    "@export_range(0, 100) var hp = 50\n",
+    "var s = \"plain\"\nvar ml = \"\"\"multi\nline\"\"\"\n",
+    "const D = {\n\t\"a\": 1,\n\t\"b\": 2,\n}\n",
+    "func f():\n\tif true: pass\n\telse: return\n",
+    "@tool\nextends Node\nfunc _ready():\n\tpass\n",
+    "func f(v):\n\treturn v is Node and not v == null\n",
+    "func f():\n\tvar n := Vector2(1, 2)\n\treturn n.x + n.y\n",
 ];
 
 #[test]
@@ -69,12 +82,59 @@ fn both_parsers_accept_core_gdscript() {
 /// actually exercising error detection, not vacuously agreeing).
 #[test]
 fn both_parsers_reject_broken_gdscript() {
-    let broken = ["func f(:\n\tpass\n", "var = \n", "class\n", "func g() ->\n"];
+    // Only cases BOTH parsers reject. tree-sitter-gdscript is lenient on a missing block `:`
+    // (`func f()` / `if x` without a colon parse clean for it) — those are documented in
+    // tests/KNOWN_DIVERGENCES.md, not asserted here.
+    let broken = [
+        "func f(:\n\tpass\n",
+        "var = \n",
+        "class\n",
+        "func g() ->\n",
+        "var x = = 1\n",           // doubled `=`
+        "func f():\n\treturn )\n", // stray closing paren
+    ];
     for src in broken {
         assert!(
             !parse(src).errors().is_empty(),
             "our parser should flag {src:?}"
         );
         assert!(ts_has_error(src), "tree-sitter should flag {src:?}");
+    }
+}
+
+/// The count of top-level functions our parser sees (direct `FuncDecl` children of the file).
+fn our_top_level_funcs(src: &str) -> usize {
+    parse(src)
+        .syntax_node()
+        .children()
+        .filter(|n| n.kind() == gdscript_syntax::SyntaxKind::FuncDecl)
+        .count()
+}
+
+/// The count of top-level functions tree-sitter sees (`function_definition` named children).
+fn ts_top_level_funcs(src: &str) -> usize {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_gdscript::LANGUAGE.into())
+        .expect("load the tree-sitter-gdscript grammar");
+    let tree = parser.parse(src, None).expect("tree-sitter parse");
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|n| n.kind() == "function_definition")
+        .count()
+}
+
+/// A coarse **structural** cross-check (beyond pure error-agreement): both parsers must see the same
+/// number of top-level function declarations — a high-signal skeleton property both grammars expose
+/// unambiguously (catches a mis-nested / dropped / spuriously-split top-level `func`).
+#[test]
+fn top_level_function_count_agrees() {
+    for src in VALID {
+        assert_eq!(
+            our_top_level_funcs(src),
+            ts_top_level_funcs(src),
+            "top-level function-count skeleton mismatch: {src:?}",
+        );
     }
 }

@@ -411,11 +411,20 @@ impl WarningCode {
         }
     }
 
-    /// Whether this code is in the opt-in type-strictness group (the codes a standalone/`--strict`
-    /// run promotes from IGNORE to WARN). Currently exactly the IGNORE-default set.
+    /// Whether this code is in the opt-in type-strictness group (the IGNORE-default set).
     #[must_use]
     pub fn is_opt_in(self) -> bool {
         self.default_level() == WarnLevel::Ignore
+    }
+
+    /// Whether a strict / standalone run (`strict_opt_in`) auto-promotes this IGNORE-default code to
+    /// WARN. True for the `UNSAFE_*` safety group; **false** for the stylistic `UNTYPED_DECLARATION`
+    /// / `INFERRED_DECLARATION` — those fire on essentially *every* untyped / inferred declaration, so
+    /// they require an explicit per-code project setting to enable (never the blanket strict umbrella),
+    /// matching Godot's "most users never enable them" reality. Keeps the standalone default clean.
+    #[must_use]
+    pub fn promoted_by_strict(self) -> bool {
+        self.is_opt_in() && !matches!(self, Self::UntypedDeclaration | Self::InferredDeclaration)
     }
 
     /// The lowest engine version this code exists in (for version-gating master-only codes).
@@ -688,7 +697,7 @@ pub fn gate(
         .copied()
         .unwrap_or_else(|| {
             let d = raw.code.default_level();
-            if settings.strict_opt_in && d == WarnLevel::Ignore {
+            if settings.strict_opt_in && raw.code.promoted_by_strict() {
                 WarnLevel::Warn
             } else {
                 d
@@ -970,6 +979,24 @@ mod tests {
         let d = gate(&raw(WarningCode::UnsafeMethodAccess), &strict, &none, None).unwrap();
         assert_eq!(d.severity, Severity::Warning);
         assert_eq!(d.code, "UNSAFE_METHOD_ACCESS");
+    }
+
+    #[test]
+    fn untyped_inferred_are_not_promoted_by_strict_but_explicit_setting_warns() {
+        let none = SuppressionMap::default();
+        // The standalone / strict default does NOT auto-promote the stylistic declaration codes
+        // (they are too noisy — every untyped/inferred local would warn).
+        let strict = WarningSettings::analyzer_default(); // strict_opt_in = true
+        assert!(gate(&raw(WarningCode::UntypedDeclaration), &strict, &none, None).is_none());
+        assert!(gate(&raw(WarningCode::InferredDeclaration), &strict, &none, None).is_none());
+        // But the UNSAFE_* group still is promoted (the regression guard).
+        assert!(gate(&raw(WarningCode::UnsafeMethodAccess), &strict, &none, None).is_some());
+        // An explicit per-code project setting enables them regardless.
+        let mut s = WarningSettings::engine_default((4, 5));
+        s.per_code
+            .insert(WarningCode::UntypedDeclaration, WarnLevel::Warn);
+        let d = gate(&raw(WarningCode::UntypedDeclaration), &s, &none, None).unwrap();
+        assert_eq!(d.severity, Severity::Warning);
     }
 
     #[test]

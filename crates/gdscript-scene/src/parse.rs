@@ -11,11 +11,12 @@
 //! byte scan is safe and every slice boundary lands on a char boundary (it's an ASCII delimiter).
 
 use gdscript_base::TextRange;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use crate::model::{
-    ExtId, ExtResource, NodeIdx, SceneKind, SceneModel, SceneNode, SceneProblem, SubResource,
+    ExtId, ExtResource, NodeIdx, NodeProp, SceneConnection, SceneKind, SceneModel, SceneNode,
+    SceneProblem, SubResource,
 };
 
 /// Parse `.tscn`/`.tres` text into a [`SceneModel`]. Pure, never panics, never returns `Err`.
@@ -59,6 +60,10 @@ struct HeaderAttrs {
     script_class: Option<Span>,
     id: Option<Span>,
     path: Option<Span>,
+    signal: Option<Span>,
+    from: Option<Span>,
+    to: Option<Span>,
+    method: Option<Span>,
 }
 
 impl HeaderAttrs {
@@ -74,6 +79,10 @@ impl HeaderAttrs {
             "script_class" => &mut self.script_class,
             "id" => &mut self.id,
             "path" => &mut self.path,
+            "signal" => &mut self.signal,
+            "from" => &mut self.from,
+            "to" => &mut self.to,
+            "method" => &mut self.method,
             _ => return, // unknown attribute — ignored, never an error
         };
         *slot = Some(value);
@@ -286,19 +295,22 @@ impl<'a> Parser<'a> {
     /// Read the body property lines of the current section until the next header / EOF. When
     /// `is_node`, capture `script =` and `unique_name_in_owner =`; otherwise skip every value
     /// losslessly. Returns `(script, unique_name_in_owner)`.
-    fn consume_body(&mut self, is_node: bool) -> (Option<ExtId>, bool) {
+    fn consume_body(&mut self, is_node: bool) -> (Option<ExtId>, bool, Vec<NodeProp>) {
         let mut script = None;
         let mut unique = false;
+        let mut props = Vec::new();
         loop {
             self.skip_trivia();
             match self.peek() {
                 None | Some(b'[') => break, // EOF or next section
                 Some(_) => {}
             }
+            let key_start = self.pos;
             let Some(key) = self.read_ident() else {
                 self.skip_to_eol(); // not a key line — skip it
                 continue;
             };
+            let key_span = TextRange::new(to_u32(key_start), to_u32(self.pos));
             self.skip_inline_ws();
             if self.peek() != Some(b'=') {
                 self.skip_to_eol();
@@ -314,10 +326,11 @@ impl<'a> Parser<'a> {
                     }
                     _ => {}
                 }
+                props.push(NodeProp { key, key_span });
             }
             self.skip_to_eol();
         }
-        (script, unique)
+        (script, unique, props)
     }
 
     // ---- value extraction (interpret a recorded span) ----
@@ -404,8 +417,12 @@ impl<'a> Parser<'a> {
                 self.consume_body(false);
             }
             Some("node") => self.add_node(&attrs, header_span),
-            Some("connection" | "editable" | "resource") => {
-                self.consume_body(false); // recognized, structurally ignored in M0
+            Some("connection") => {
+                self.add_connection(&attrs, header_span);
+                self.consume_body(false); // a connection has no body, but stay robust
+            }
+            Some("editable" | "resource") => {
+                self.consume_body(false); // recognized, structurally ignored
             }
             Some(_) => {
                 self.model
@@ -481,18 +498,20 @@ impl<'a> Parser<'a> {
             .name
             .and_then(|s| self.extract_string(s))
             .unwrap_or_default();
-        let name_span = a
-            .name
-            .map_or(header_span, |(s, e)| TextRange::new(to_u32(s), to_u32(e)));
+        // The **inner** name span (quotes excluded) — a precise focus range for go-to-definition and
+        // the exact rewrite target for scene-aware rename (W8).
+        let name_span = a.name.map_or(header_span, |sp| self.inner_span(sp));
         let decl_type = a.typ.and_then(|s| self.extract_string(s));
         let parent_path = a.parent.and_then(|s| self.extract_string(s));
+        let parent_span = a.parent.map(|sp| self.inner_span(sp));
         let instance = a.instance.and_then(|(s, e)| self.extract_ext_id(s, e));
         let instance_placeholder = a.instance_placeholder.is_some();
-        let (script, unique_name_in_owner) = self.consume_body(true);
+        let (script, unique_name_in_owner, properties) = self.consume_body(true);
         self.model.nodes.push(SceneNode {
             name,
             decl_type,
             parent_path,
+            parent_span,
             parent_idx: None,
             script,
             instance,
@@ -501,7 +520,45 @@ impl<'a> Parser<'a> {
             unique_name_in_owner,
             header_span,
             name_span,
+            properties,
         });
+    }
+
+    fn add_connection(&mut self, a: &HeaderAttrs, header_span: TextRange) {
+        // A connection requires `signal`/`from`/`to`/`method`; a malformed one degrades to empty
+        // fields (rename simply finds no match). The spans are the inner identifier ranges so a
+        // rewrite replaces exactly the name, never the surrounding quotes.
+        let value = |s: Option<Span>| s.and_then(|sp| self.extract_string(sp)).unwrap_or_default();
+        let span = |s: Option<Span>| s.map_or(header_span, |sp| self.inner_span(sp));
+        self.model.connections.push(SceneConnection {
+            signal: value(a.signal),
+            signal_span: span(a.signal),
+            from: value(a.from),
+            from_span: span(a.from),
+            to: value(a.to),
+            to_span: span(a.to),
+            method: value(a.method),
+            method_span: span(a.method),
+            header_span,
+        });
+    }
+
+    /// The **inner** byte range of an attribute value `(start, end)`: leading/trailing whitespace
+    /// trimmed, and a single pair of surrounding `"` quotes excluded. (Identifier-valued attributes —
+    /// node names, signal/method names, node paths — carry no escapes, so this maps 1:1 to the
+    /// decoded value's bytes, which is what a rename rewrites.)
+    fn inner_span(&self, (s, e): Span) -> TextRange {
+        let raw = self.src.get(s..e).unwrap_or("");
+        let lead = raw.len() - raw.trim_start().len();
+        let trail = raw.len() - raw.trim_end().len();
+        let mut lo = s + lead;
+        let mut hi = e - trail;
+        let trimmed = &raw[lead..raw.len() - trail];
+        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+            lo += 1;
+            hi -= 1;
+        }
+        TextRange::new(to_u32(lo), to_u32(hi))
     }
 
     // ---- pass 2: build the tree ----
@@ -531,6 +588,10 @@ impl<'a> Parser<'a> {
         let mut child_index: FxHashMap<(NodeIdx, SmolStr), NodeIdx> = FxHashMap::default();
         let mut children: FxHashMap<NodeIdx, Vec<NodeIdx>> = FxHashMap::default();
         let mut full_paths: Vec<SmolStr> = vec![SmolStr::default(); n];
+        // The intended full paths of nodes whose parent did NOT resolve (a dangling node detaches its
+        // whole subtree). A later node parented *into* such a subtree misses only because its detached
+        // ancestor was never indexed — a cascade we suppress so only the root-cause node is flagged.
+        let mut dangling_subtrees: FxHashSet<SmolStr> = FxHashSet::default();
 
         for i in 0..n {
             let idx = NodeIdx(to_u32(i));
@@ -553,12 +614,18 @@ impl<'a> Parser<'a> {
                     // dangling parent (Playbook §5/§7 — M1 degrades it to `Node`).
                     Walk::Escaped => None,
                     Walk::Missed(deepest) => {
-                        // A genuine in-scene miss. If the deepest node reached — or any ancestor up
-                        // to the root — is an instance boundary, the missing tail lives in an
-                        // instanced/inherited sub-scene we don't recurse into (an override line) —
-                        // expected, NOT dangling (Playbook C12/C13/C20). The root being an inherited
-                        // scene makes every override child's missing segment a base-scene node.
-                        if !self.model.descends_from_instance(deepest) {
+                        // This node's parent didn't resolve, so it detaches its own subtree — record
+                        // its intended path so a *descendant*'s later miss is recognized as a cascade
+                        // (its detached ancestor was never indexed) rather than a separate root cause.
+                        let is_cascade = within_dangling_subtree(p, &dangling_subtrees);
+                        dangling_subtrees.insert(SmolStr::new(format!("{p}/{name}")));
+                        // Flag only a genuine, non-cascading miss into a non-instance subtree. If the
+                        // deepest node reached — or any ancestor up to the root — is an instance
+                        // boundary, the missing tail lives in an instanced/inherited sub-scene we don't
+                        // recurse into (an override line) — expected, NOT dangling (Playbook
+                        // C12/C13/C20). The root being an inherited scene makes every override child's
+                        // missing segment a base-scene node.
+                        if !is_cascade && !self.model.descends_from_instance(deepest) {
                             self.model.problems.push(SceneProblem::DanglingParent {
                                 node: idx,
                                 parent_path: SmolStr::new(p),
@@ -616,6 +683,17 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Whether the parent path `p` lies within a detached (dangling) node's subtree — `p` equals, or is
+/// a `/`-descendant of, some already-recorded dangling intended path. Such a miss is a cascade of the
+/// upstream dangling node, not a separate root cause, so it is not re-flagged.
+fn within_dangling_subtree(p: &str, dangling: &FxHashSet<SmolStr>) -> bool {
+    dangling.iter().any(|d| {
+        p == d.as_str()
+            || p.strip_prefix(d.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// The outcome of resolving a `parent=`/node path against the in-scene tree.
 enum Walk {
     /// Fully resolved to a node.
@@ -656,32 +734,149 @@ fn walk_path(
     Walk::Resolved(cur)
 }
 
-/// Resolve the C-style escapes a `.tscn` quoted string may carry. Unknown escapes pass through
-/// (the backslash is dropped, the next char kept) — a lossy-but-safe simplification for M0 (escapes
-/// in node names are vanishingly rare and resolved consistently for both `name=` and `parent=`).
+/// Resolve the C-style escapes a `.tscn` quoted string may carry, including `\uXXXX` / `\UXXXXXX`
+/// Unicode and the `\a \b \f \v` control escapes — mirroring Godot's `variant_parser.cpp` /
+/// tokenizer string decoding. Unknown escapes pass through (the backslash is dropped, the next char
+/// kept). Resolved consistently for both `name=` and `parent=`, so path matching is unaffected.
 fn unescape(s: &str) -> String {
     if !s.contains('\\') {
         return s.to_owned();
     }
+    // Index over a char vector so a `\u` surrogate pair can look ahead cheaply.
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         if c != '\\' {
             out.push(c);
+            i += 1;
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some(other) => out.push(other), // \" \\ and anything else → the literal char
-            None => out.push('\\'),
+        i += 1; // consume the backslash
+        let Some(&esc) = chars.get(i) else {
+            out.push('\\'); // a trailing lone backslash
+            break;
+        };
+        i += 1; // consume the escape selector
+        match esc {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'a' => out.push('\u{07}'),
+            'b' => out.push('\u{08}'),
+            'f' => out.push('\u{0C}'),
+            'v' => out.push('\u{0B}'),
+            // `\uXXXX` — a 4-hex-digit UTF-16 code unit (with surrogate-pair combining);
+            // `\UXXXXXX` — a 6-hex-digit code point.
+            'u' => i = push_unicode_escape(&mut out, &chars, i, 4),
+            'U' => i = push_unicode_escape(&mut out, &chars, i, 6),
+            other => out.push(other), // \" \\ \' and anything else → the literal char
         }
     }
     out
 }
 
+/// Decode up to `max_digits` hex digits at `chars[start..]` into a code point and push it, combining
+/// a UTF-16 surrogate pair for the `\u` form (a high surrogate followed by a `\uXXXX` low surrogate
+/// becomes one scalar). Returns the index past everything consumed. A run with no hex digit pushes
+/// nothing and leaves the index unchanged (Godot treats an escape with no digits as empty).
+fn push_unicode_escape(out: &mut String, chars: &[char], start: usize, max_digits: usize) -> usize {
+    let (code, i) = read_hex(chars, start, max_digits);
+    let Some(code) = code else { return start };
+    // A high surrogate (`\uD800`..=`\uDBFF`) combines with a following `\uXXXX` low surrogate.
+    if (0xD800..=0xDBFF).contains(&code)
+        && chars.get(i) == Some(&'\\')
+        && chars.get(i + 1) == Some(&'u')
+    {
+        let (low, j) = read_hex(chars, i + 2, 4);
+        if let Some(low) = low
+            && (0xDC00..=0xDFFF).contains(&low)
+        {
+            let combined = 0x1_0000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+            if let Some(c) = char::from_u32(combined) {
+                out.push(c);
+                return j;
+            }
+        }
+    }
+    out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+    i
+}
+
+/// Read up to `max_digits` hex digits at `chars[start..]`, returning `(value, next index)`. `value`
+/// is `None` (and the index unmoved) when no hex digit is present.
+fn read_hex(chars: &[char], start: usize, max_digits: usize) -> (Option<u32>, usize) {
+    let mut value: u32 = 0;
+    let mut count = 0;
+    let mut i = start;
+    while count < max_digits {
+        let Some(d) = chars.get(i).and_then(|c| c.to_digit(16)) else {
+            break;
+        };
+        value = value * 16 + d;
+        i += 1;
+        count += 1;
+    }
+    if count == 0 {
+        (None, start)
+    } else {
+        (Some(value), i)
+    }
+}
+
 /// `usize → u32`, saturating (a `.tscn` over 4 GiB / 4 G nodes is not a real input).
 fn to_u32(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod unescape_tests {
+    use super::unescape;
+
+    #[test]
+    fn passes_plain_strings_and_simple_escapes() {
+        assert_eq!(unescape("Node"), "Node");
+        assert_eq!(unescape("a\\nb"), "a\nb");
+        assert_eq!(unescape("tab\\there"), "tab\there");
+        assert_eq!(unescape("quote\\\"end"), "quote\"end");
+        assert_eq!(unescape("back\\\\slash"), "back\\slash");
+    }
+
+    #[test]
+    fn decodes_control_escapes() {
+        assert_eq!(unescape("\\b"), "\u{08}");
+        assert_eq!(unescape("\\f"), "\u{0C}");
+        assert_eq!(unescape("\\a"), "\u{07}");
+        assert_eq!(unescape("\\v"), "\u{0B}");
+    }
+
+    #[test]
+    fn decodes_lowercase_u_4_hex() {
+        // `A` is the letter `A` — the bug fixed here (it used to decode to `u0041`).
+        assert_eq!(unescape("\\u0041"), "A");
+        assert_eq!(unescape("X\\u00e9Y"), "XéY");
+    }
+
+    #[test]
+    fn decodes_uppercase_u_6_hex() {
+        // U+1F600 GRINNING FACE.
+        assert_eq!(unescape("\\U01F600"), "😀");
+    }
+
+    #[test]
+    fn combines_a_utf16_surrogate_pair() {
+        // The same emoji written as a `😀` surrogate pair.
+        assert_eq!(unescape("\\uD83D\\uDE00"), "😀");
+    }
+
+    #[test]
+    fn invalid_or_empty_escapes_are_safe() {
+        // A lone backslash at EOF is kept.
+        assert_eq!(unescape("ends\\"), "ends\\");
+        // `\u` with no hex digits emits nothing for the escape (the chars after are kept).
+        assert_eq!(unescape("\\uZ"), "Z");
+        // A lone high surrogate (no low surrogate) falls back to U+FFFD.
+        assert_eq!(unescape("\\uD83D!"), "\u{FFFD}!");
+    }
 }

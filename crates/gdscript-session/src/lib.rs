@@ -1,6 +1,9 @@
 //! `gdscript-session` — a URI-keyed session over [`gdscript_ide`] that returns structured
 //! [`serde_json::Value`]s.
 //!
+//! > **Internal layer (not a stable API).** Depend on [`gdscript-ide`](https://docs.rs/gdscript-ide) (the public surface); the items here
+//! > may change between releases.
+//!
 //! The shared, pure-Rust, **wasm-clean** core that the napi (`gdscript-ffi`) and wasm
 //! (`gdscript-wasm`) bindings wrap as thin, near-trivial delegators. A napi/wasm binding crate
 //! cannot be `cargo test`ed natively (no Node runtime / `libnode` at link time), so every piece of
@@ -28,6 +31,7 @@
 //! The bindings are single-threaded (one JS thread), so no `apply_change` ever races a query; the
 //! `Cancellable` results therefore never cancel and are unwrapped to their default here.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 
 use gdscript_base::{FileId, FilePosition};
 use gdscript_ide::{AnalysisHost, Change};

@@ -25,6 +25,11 @@ pub struct ItemTree {
     pub class_name: Option<SmolStr>,
     /// The `extends` target, if written.
     pub extends: Option<ExtendsRef>,
+    /// The class-level annotations (`@tool`, `@icon`, `@static_unload`, `@abstract`) — every
+    /// annotation that is a direct child of the file / inner-class body, in source order. Member
+    /// annotations live on the member; a class annotation that happens to also precede the first
+    /// member appears in both (the checks filter by name).
+    pub annotations: Vec<AnnotationItem>,
     /// The class members, in source order.
     pub members: Vec<Member>,
 }
@@ -97,6 +102,24 @@ pub struct ParamItem {
     pub has_default: bool,
 }
 
+/// A decorator annotation (`@export`, `@onready`, `@tool`, …) captured in the item tree. In the CST
+/// annotations are *sibling* nodes of the declaration they decorate (or, for class annotations like
+/// `@tool`, direct children of the file); the item tree lifts them onto the item so checks /
+/// accessors don't re-walk siblings ad hoc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnotationItem {
+    /// The annotation name without the leading `@` (e.g. `export`, `onready`, `export_range`).
+    pub name: SmolStr,
+    /// The annotation name token's range.
+    pub range: TextRange,
+}
+
+/// Whether `annotations` contains one named exactly `name`.
+#[must_use]
+pub fn has_annotation(annotations: &[AnnotationItem], name: &str) -> bool {
+    annotations.iter().any(|a| a.name == name)
+}
+
 /// A `func` member (signature only — the body is lowered lazily by [`crate::body`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncItem {
@@ -108,6 +131,8 @@ pub struct FuncItem {
     pub return_type: Option<SmolStr>,
     /// Whether this is a `static func`.
     pub is_static: bool,
+    /// The decorator annotations on this function (`@onready`, `@rpc`, …), in source order.
+    pub annotations: Vec<AnnotationItem>,
     /// Pointer to the `FuncDecl` node, for body lowering.
     pub ptr: AstPtr,
     /// The whole declaration's range.
@@ -118,6 +143,10 @@ pub struct FuncItem {
 
 /// A `var` member.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent declaration facts of a `var` (static / exported / has-init / inferred); not a state machine to encode as an enum"
+)]
 pub struct VarItem {
     /// The variable name.
     pub name: SmolStr,
@@ -125,6 +154,12 @@ pub struct VarItem {
     pub type_ref: Option<SmolStr>,
     /// Whether this is a `static var`.
     pub is_static: bool,
+    /// Whether it carries an `@export`/`@export_*` annotation — such a var is surfaced in the editor
+    /// inspector and stored as a `.tscn` node property (the basis for scene-aware rename, W8 A3).
+    /// Derived from [`annotations`](VarItem::annotations).
+    pub is_exported: bool,
+    /// The decorator annotations on this var (`@export`, `@onready`, `@export_range`, …), in order.
+    pub annotations: Vec<AnnotationItem>,
     /// Whether it has an initializer expression.
     pub has_init: bool,
     /// Whether the type was inferred with `:=`.
@@ -150,6 +185,8 @@ pub struct ConstItem {
     /// the offset-free `script_class` projection otherwise can't (it drops initializers). Firewall-safe:
     /// a `const` declaration is not a function body, so a body edit leaves it unchanged.
     pub preload_path: Option<SmolStr>,
+    /// The decorator annotations on this const, in source order.
+    pub annotations: Vec<AnnotationItem>,
     /// Pointer to the `ConstDecl` node, for value inference.
     pub ptr: AstPtr,
     /// The whole declaration's range.
@@ -165,6 +202,8 @@ pub struct SignalItem {
     pub name: SmolStr,
     /// The typed parameters, in order.
     pub params: Vec<ParamItem>,
+    /// The decorator annotations on this signal, in source order.
+    pub annotations: Vec<AnnotationItem>,
     /// The whole declaration's range.
     pub range: TextRange,
     /// The name token's range.
@@ -212,6 +251,7 @@ pub fn item_tree(root: &GdNode) -> Arc<ItemTree> {
 fn lower_class(container: &GdNode, decls: impl Iterator<Item = ast::Decl>) -> ItemTree {
     let mut tree = ItemTree {
         extends: find_extends(container),
+        annotations: container_annotations(container),
         ..ItemTree::default()
     };
     for decl in decls {
@@ -246,6 +286,7 @@ fn lower_func(d: &ast::FuncDecl) -> FuncItem {
             .unwrap_or_default(),
         return_type: d.return_type().and_then(|t| t.text()).map(SmolStr::new),
         is_static: d.is_static(),
+        annotations: preceding_annotations(node),
         ptr: AstPtr::of(node),
         range: cst::text_range_of(node),
         name_range: name_range(d.name(), node),
@@ -254,16 +295,68 @@ fn lower_func(d: &ast::FuncDecl) -> FuncItem {
 
 fn lower_var(d: &ast::VarDecl) -> VarItem {
     let node = d.syntax();
+    let annotations = preceding_annotations(node);
     VarItem {
         name: decl_name(d.name()).unwrap_or_default(),
         type_ref: d.type_ref().and_then(|t| t.text()).map(SmolStr::new),
         is_static: d.is_static(),
+        is_exported: is_exported(&annotations),
+        annotations,
         has_init: cst::first_child_expr(node).is_some(),
         is_inferred: cst::has_token(node, SyntaxKind::ColonEq),
         ptr: AstPtr::of(node),
         range: cst::text_range_of(node),
         name_range: name_range(d.name(), node),
     }
+}
+
+/// Whether `annotations` mark the declaration `@export`/`@export_*` (surfaced in the inspector +
+/// stored as a `.tscn` node property — the basis for scene-aware rename, W8 A3).
+fn is_exported(annotations: &[AnnotationItem]) -> bool {
+    annotations
+        .iter()
+        .any(|a| a.name == "export" || a.name.starts_with("export_"))
+}
+
+/// The decorator annotations immediately preceding `node` — a run of sibling `Annotation` nodes, in
+/// source order. A non-annotation sibling ends the run (annotations decorate the declaration that
+/// follows them: `@onready @export var x`).
+fn preceding_annotations(node: &GdNode) -> Vec<AnnotationItem> {
+    let mut out = Vec::new();
+    let mut sib = node.prev_sibling();
+    while let Some(s) = sib {
+        if s.kind() != SyntaxKind::Annotation {
+            break;
+        }
+        if let Some(item) = annotation_item(s) {
+            out.push(item);
+        }
+        sib = s.prev_sibling();
+    }
+    out.reverse(); // collected nearest-first → restore source order
+    out
+}
+
+/// Every `Annotation` that is a direct child of `container` (the file / inner-class body) — the
+/// class-level annotations (`@tool`, `@icon`, `@static_unload`, `@abstract`), in source order.
+fn container_annotations(container: &GdNode) -> Vec<AnnotationItem> {
+    container
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::Annotation)
+        .filter_map(annotation_item)
+        .collect()
+}
+
+/// Lift an `Annotation` CST node to its `(name, name-token range)`, or `None` if it has no name.
+fn annotation_item(ann: &GdNode) -> Option<AnnotationItem> {
+    use cstree::util::NodeOrToken;
+    ann.children_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .find(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| AnnotationItem {
+            name: SmolStr::new(t.text()),
+            range: cst::token_range(t),
+        })
 }
 
 fn lower_const(d: &ast::ConstDecl) -> ConstItem {
@@ -278,6 +371,7 @@ fn lower_const(d: &ast::ConstDecl) -> ConstItem {
         name: decl_name(d.name()).unwrap_or_default(),
         type_ref,
         preload_path: const_preload_path(node),
+        annotations: preceding_annotations(node),
         ptr: AstPtr::of(node),
         range: cst::text_range_of(node),
         name_range: name_range(d.name(), node),
@@ -307,6 +401,7 @@ fn lower_signal(d: &ast::SignalDecl) -> SignalItem {
             .param_list()
             .map(|pl| lower_params(&pl))
             .unwrap_or_default(),
+        annotations: preceding_annotations(node),
         range: cst::text_range_of(node),
         name_range: name_range(d.name(), node),
     }
@@ -557,6 +652,38 @@ mod tests {
             inner.tree.extends,
             Some(ExtendsRef::Name(SmolStr::new("RefCounted")))
         );
+    }
+
+    #[test]
+    fn annotations_are_captured_first_class() {
+        let tree = tree_of(
+            "@tool\nextends Node\n@export var speed = 5\n@onready var label = null\n@rpc(\"any_peer\")\nfunc ping():\n\tpass\n",
+        );
+        // Class-level `@tool`.
+        assert!(
+            has_annotation(&tree.annotations, "tool"),
+            "{:?}",
+            tree.annotations
+        );
+        let var = |name: &str| {
+            tree.members.iter().find_map(|m| match m {
+                Member::Var(v) if v.name == name => Some(v),
+                _ => None,
+            })
+        };
+        let speed = var("speed").unwrap();
+        assert!(has_annotation(&speed.annotations, "export"));
+        assert!(speed.is_exported, "@export derives is_exported");
+        assert!(has_annotation(
+            &var("label").unwrap().annotations,
+            "onready"
+        ));
+        // A function annotation (`@rpc`) with arguments is captured by name.
+        let ping = tree.members.iter().find_map(|m| match m {
+            Member::Func(f) if f.name == "ping" => Some(f),
+            _ => None,
+        });
+        assert!(has_annotation(&ping.unwrap().annotations, "rpc"));
     }
 
     #[test]

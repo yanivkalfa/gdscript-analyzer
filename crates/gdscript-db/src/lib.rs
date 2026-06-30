@@ -1,5 +1,8 @@
 //! `gdscript-db` — the input layer for the analyzer.
 //!
+//! > **Internal layer (not a stable API).** Depend on [`gdscript-ide`](https://docs.rs/gdscript-ide) (the public surface); the items here
+//! > may change between releases.
+//!
 //! Holds the virtual file system (`FileId` → text, always injected — never `std::fs`), the
 //! project model, and (from Phase 3) the **salsa** query graph: `#[salsa::input]`s set via
 //! `apply_change`, `#[salsa::tracked]` derived queries, durability tiers. The Phase-0/1/2

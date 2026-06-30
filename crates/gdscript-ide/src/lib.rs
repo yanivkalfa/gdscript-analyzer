@@ -14,7 +14,11 @@
 //! a concurrent `apply_change` cancels in-flight reads on outstanding handles, which unwind
 //! into `Err(Cancelled)` at the query boundary (see [`catch`]). The public API shape is
 //! unchanged. The crate stays `wasm32`-safe (CI guards this).
+//!
+//! This is the analyzer's **public Rust API**, so every public item is documented and
+//! `#![deny(missing_docs)]` keeps it that way.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 
 use std::sync::Arc;
 
@@ -219,6 +223,37 @@ impl Analysis {
         catch(|| {
             self.db.file_text(file).map(|ft| {
                 gdscript_fmt::format(ft.text(&self.db), &gdscript_fmt::FmtConfig::default())
+            })
+        })
+    }
+
+    /// Format only the lines overlapping the byte range `[start, end)` (editor "format selection").
+    /// Returns the byte range to replace and its replacement, or `None` if the selection's lines do
+    /// not change (or the file is unknown).
+    ///
+    /// # Errors
+    /// See [`Analysis::syntax_tree`].
+    pub fn format_range(
+        &self,
+        file: FileId,
+        start: u32,
+        end: u32,
+    ) -> Cancellable<Option<(u32, u32, String)>> {
+        catch(|| {
+            self.db.file_text(file).and_then(|ft| {
+                let sel = (start as usize)..(end as usize);
+                gdscript_fmt::format_range(
+                    ft.text(&self.db),
+                    &gdscript_fmt::FmtConfig::default(),
+                    sel,
+                )
+                .map(|e| {
+                    (
+                        u32::try_from(e.range.start).unwrap_or(u32::MAX),
+                        u32::try_from(e.range.end).unwrap_or(u32::MAX),
+                        e.new_text,
+                    )
+                })
             })
         })
     }
@@ -449,6 +484,71 @@ mod tests {
         assert!(
             hints.iter().any(|h| h.label.contains("int")),
             "expected an `: int` inlay on the autoload-resolved binding, got {hints:?}",
+        );
+    }
+
+    #[test]
+    fn multi_scene_node_path_unions_to_the_common_base() {
+        // main.gd attaches to a.tscn (`$Btn`: HBoxContainer) AND b.tscn (`$Btn`: VBoxContainer). The
+        // path unions to the common base BoxContainer (both extend it) — not the first scene's type.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Btn\" type=\"HBoxContainer\" parent=\".\"]\n",
+        );
+        change.set_file_path(FileId(0), "res://a.tscn");
+        change.change_file(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Btn\" type=\"VBoxContainer\" parent=\".\"]\n",
+        );
+        change.set_file_path(FileId(2), "res://b.tscn");
+        change.change_file(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar b := $Btn\n\tb.queue_free()\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("BoxContainer")),
+            "expected the common base `: BoxContainer` of HBox/VBoxContainer, got {hints:?}",
+        );
+    }
+
+    #[test]
+    fn non_singleton_autoload_resolves_via_root_path() {
+        // A non-`*` autoload is loaded-but-not-global: unreachable by bare name, but reachable via
+        // the absolute `get_node("/root/Name")` path. `.volume()` must resolve through its script.
+        let mut host = AnalysisHost::new();
+        let mut change = Change::new();
+        change.change_file(FileId(0), "func volume() -> int:\n\treturn 50\n");
+        change.set_file_path(FileId(0), "res://audio.gd");
+        change.change_file(
+            FileId(1),
+            "func go():\n\tvar v := get_node(\"/root/Audio\").volume()\n\treturn v\n",
+        );
+        change.set_file_path(FileId(1), "res://main.gd");
+        // No leading `*` → loaded-but-not-global. Bare `Audio` would NOT resolve; `/root/Audio` does.
+        change.set_project_config("[autoload]\nAudio=\"res://audio.gd\"\n");
+        host.apply_change(change);
+        let analysis = host.analysis();
+
+        assert!(analysis.diagnostics(FileId(1)).unwrap().is_empty());
+        let hints = analysis.inlay_hints(FileId(1)).unwrap();
+        assert!(
+            hints.iter().any(|h| h.label.contains("int")),
+            "expected an `: int` inlay on the /root/-autoload-resolved binding, got {hints:?}",
         );
     }
 

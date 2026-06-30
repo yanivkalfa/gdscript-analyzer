@@ -64,6 +64,9 @@ cstree = { version = "0.14", features = ["derive"] } # lossless CST (Send+Sync, 
 logos = "0.16" # DFA lexer; trivia kept as first-class tokens (never `skip`)
 text-size = "1.1" # TextSize/TextRange POD (also a cstree transitive dep)
 rustc-hash = "2.1" # deterministic FxHashMap — keeps `getrandom` out of the graph
+# Phase 6 — UTS #39 mixed-script / restriction-level detection for CONFUSABLE_IDENTIFIER (matches
+# Godot's TextServer confusable check). Pure-Rust + wasm-clean (no std clocks/threads/fs).
+unicode-security = "0.1"
 # Phase 2 — engine-API model (plans/PHASE-2-IMPLEMENTATION-PLAYBOOK.md §4). `gdscript-api`
 # normalizes `extension_api.json` into an `EngineApi`, serializes it to a binary blob at
 # codegen time (`xtask codegen-api`), and loads it via `from_bytes` — `rkyv` is that

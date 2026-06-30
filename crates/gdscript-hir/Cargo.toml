@@ -23,6 +23,7 @@ cstree = { workspace = true }
 text-size = { workspace = true }
 rustc-hash = { workspace = true }
 smol_str = { workspace = true }
+unicode-security = { workspace = true }
 
 [lints]
 workspace = true

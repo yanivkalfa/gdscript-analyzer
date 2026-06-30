@@ -61,6 +61,10 @@ pub struct SceneModel {
     /// `unique_name_in_owner` nodes: bare name → node (the `%Name` lookup; scene-wide in the slice).
     pub unique_nodes: FxHashMap<SmolStr, NodeIdx>,
 
+    /// Every `[connection …]` (a signal wired to a method), in file order. Drives scene-aware rename
+    /// of a script's connected methods/signals (W8); read-side typing ignores it.
+    pub connections: Vec<SceneConnection>,
+
     /// Non-fatal problems found while parsing (the parser never errors).
     pub problems: Vec<SceneProblem>,
 
@@ -79,6 +83,8 @@ pub struct SceneNode {
     pub decl_type: Option<SmolStr>,
     /// The raw `parent="…"` path (`"."` = child of root; relative, root-excluded). `None` ⇒ root.
     pub parent_path: Option<SmolStr>,
+    /// Byte span of the `parent=` value (quotes excluded), for scene-aware rename of a path segment.
+    pub parent_span: Option<TextRange>,
     /// The resolved parent (pass 2). `None` ⇒ root, or an unresolved/dangling parent.
     pub parent_idx: Option<NodeIdx>,
     /// Body `script = ExtResource("id")`.
@@ -95,6 +101,44 @@ pub struct SceneNode {
     pub header_span: TextRange,
     /// Byte span of the `name="…"` value (finer go-to-definition / highlight).
     pub name_span: TextRange,
+    /// The node's body property keys (`key = value`; values skipped). Drives renaming an `@export`
+    /// variable set as a scene property (W8 A3); read-side typing ignores them.
+    pub properties: Vec<NodeProp>,
+}
+
+/// One body property line of a `[node …]` — `key = value` (value skipped). The key may be a bare
+/// identifier (an `@export` var or an engine property) or a `group/sub` override path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeProp {
+    /// The property key.
+    pub key: SmolStr,
+    /// Byte span of the key.
+    pub key_span: TextRange,
+}
+
+/// One `[connection …]` section — a signal wired to a method in the editor. The four spans are the
+/// **inner identifier** byte ranges (surrounding quotes excluded), so a rename rewrites exactly the
+/// name. A connection has no body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneConnection {
+    /// `signal="…"` — the emitted signal name (a member of the `from` node's type).
+    pub signal: SmolStr,
+    /// Byte span of the `signal=` value (quotes excluded).
+    pub signal_span: TextRange,
+    /// `from="…"` — the emitter node path (root-relative; `"."` = root). Empty if absent.
+    pub from: SmolStr,
+    /// Byte span of the `from=` value (quotes excluded).
+    pub from_span: TextRange,
+    /// `to="…"` — the receiver node path (the node whose attached script declares `method`).
+    pub to: SmolStr,
+    /// Byte span of the `to=` value (quotes excluded).
+    pub to_span: TextRange,
+    /// `method="…"` — the receiving method name (a member of the `to` node's attached script).
+    pub method: SmolStr,
+    /// Byte span of the `method=` value (quotes excluded).
+    pub method_span: TextRange,
+    /// Byte span of the whole `[connection …]` header line.
+    pub header_span: TextRange,
 }
 
 /// An `[ext_resource …]` declaration.
@@ -179,6 +223,7 @@ impl SceneModel {
             root: None,
             by_path: FxHashMap::default(),
             unique_nodes: FxHashMap::default(),
+            connections: Vec::new(),
             problems: Vec::new(),
             child_index: FxHashMap::default(),
             children: FxHashMap::default(),
@@ -199,6 +244,36 @@ impl SceneModel {
     #[must_use]
     pub fn node(&self, idx: NodeIdx) -> Option<&SceneNode> {
         self.nodes.get(idx.0 as usize)
+    }
+
+    /// The node's full name-path from (and **including**) the scene root, e.g.
+    /// `"Main/Panel/StartButton"` — the stable cross-reference identity of a node (the same value
+    /// whether reached from a `$Path` in a script or the node's `name="…"` in the scene). Walks
+    /// `parent_idx` to the root (depth-bounded against a cycle). `None` for an out-of-range index.
+    #[must_use]
+    pub fn node_full_path(&self, idx: NodeIdx) -> Option<SmolStr> {
+        let mut names: Vec<&str> = Vec::new();
+        let mut cur = Some(idx);
+        for _ in 0..1024 {
+            let Some(i) = cur else {
+                names.reverse();
+                return Some(SmolStr::new(names.join("/")));
+            };
+            let n = self.node(i)?;
+            names.push(n.name.as_str());
+            cur = n.parent_idx;
+        }
+        None // cyclic parent chain (degrade rather than loop)
+    }
+
+    /// The node whose [`node_full_path`](Self::node_full_path) equals `path` (the inverse lookup —
+    /// the node identified by a [`GodotDef::SceneNode`]'s stable path). `None` if no node matches.
+    #[must_use]
+    pub fn node_by_full_path(&self, path: &str) -> Option<NodeIdx> {
+        (0..self.nodes.len())
+            .filter_map(|i| u32::try_from(i).ok())
+            .map(NodeIdx)
+            .find(|&idx| self.node_full_path(idx).as_deref() == Some(path))
     }
 
     /// Walk a name-path from the scene root. `""`/`"."` ⇒ the root. `None` ⇒ no such node (M1 reads

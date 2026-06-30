@@ -67,9 +67,235 @@ pub fn find_references(db: &dyn Db, pos: FilePosition) -> Vec<Reference> {
             }
         }
     }
+    // A connected method/signal is also referenced by `[connection]` sections in the project's
+    // scenes (resolve-confirmed: the connection's node must attach this exact script). These are real
+    // references — find-refs shows them and rename rewrites them (the `.tscn` was previously invisible,
+    // so a scene-only connection silently survived a method rename).
+    if let GodotDef::Member { owner_file, name } = &def {
+        match member_symbol_kind(db, *owner_file, name) {
+            Some(SymbolKind::Function | SymbolKind::Method) => {
+                out.extend(scene_connection_refs(db, *owner_file, name, false));
+            }
+            Some(SymbolKind::Signal) => {
+                out.extend(scene_connection_refs(db, *owner_file, name, true));
+            }
+            // An `@export` variable is set as a `[node]` property in scenes attaching this script
+            // (a non-exported var is never a node property, so a same-named property would be an
+            // engine property we must NOT rewrite — hence the `is_exported` gate).
+            Some(SymbolKind::Variable) if var_is_exported(db, *owner_file, name) => {
+                out.extend(scene_property_refs(db, *owner_file, name));
+            }
+            _ => {}
+        }
+    }
+
     out.sort_by_key(|r| (r.file.0, r.range.start));
     out.dedup();
     out
+}
+
+/// Every project scene (`.tscn`/`.tres`) as `(FileId, parsed model)`. The shared iteration for the
+/// scene-aware reference scans (connections, node paths).
+fn project_scenes(db: &dyn Db) -> Vec<(FileId, std::sync::Arc<gdscript_scene::SceneModel>)> {
+    let Some(root) = db.source_root() else {
+        return Vec::new();
+    };
+    root.files(db)
+        .iter()
+        .filter(|&&ft| {
+            ft.res_path(db)
+                .as_deref()
+                .is_some_and(queries::is_scene_path)
+        })
+        .map(|&ft| (ft.file_id(db), queries::scene_model(db, ft)))
+        .collect()
+}
+
+/// How a `[connection]` attributing to a node path relates to the script we are renaming a member of.
+#[derive(PartialEq, Eq)]
+enum Attr {
+    /// The connection's node attaches *this* script — a genuine reference (rewrite it).
+    Ours,
+    /// The connection's node attaches a *different* script — unrelated (ignore it).
+    Other,
+    /// The node can't be resolved / has no direct script (e.g. an instanced sub-scene) — we cannot
+    /// prove it is *not* ours, so a rename must refuse rather than risk a silent incomplete edit.
+    Unknown,
+}
+
+/// Attribute a connection (its `to`/`from` node path) to the renamed member's owning script.
+fn attribute_connection(model: &gdscript_scene::SceneModel, path: &str, script_res: &str) -> Attr {
+    let Some(idx) = model.resolve_path(path) else {
+        return Attr::Unknown;
+    };
+    let Some(node) = model.node(idx) else {
+        return Attr::Unknown;
+    };
+    match node
+        .script
+        .as_ref()
+        .and_then(|id| model.ext_resources.get(id))
+        .and_then(|e| e.path.as_deref())
+    {
+        Some(p) if p == script_res => Attr::Ours,
+        Some(_) => Attr::Other,
+        None => Attr::Unknown,
+    }
+}
+
+/// Visit every `[connection]` whose name matches `name` for the renamed member's owning `file`,
+/// passing each `(scene_file, attribution, span)` to `f`. A **method** matches `method=` (attributed
+/// via the `to` node); a **signal** matches `signal=` (attributed via the `from` node).
+fn for_each_named_connection(
+    db: &dyn Db,
+    file: FileId,
+    name: &str,
+    is_signal: bool,
+    mut f: impl FnMut(FileId, Attr, TextRange),
+) {
+    let Some(script_res) = db.file_text(file).and_then(|ft| ft.res_path(db)) else {
+        return; // single-file / no res path → no scenes attach it
+    };
+    for (scene_file, model) in project_scenes(db) {
+        db.unwind_if_revision_cancelled();
+        for c in &model.connections {
+            let (cname, cpath, span) = if is_signal {
+                (&c.signal, c.from.as_str(), c.signal_span)
+            } else {
+                (&c.method, c.to.as_str(), c.method_span)
+            };
+            if cname.as_str() == name {
+                f(
+                    scene_file,
+                    attribute_connection(&model, cpath, &script_res),
+                    span,
+                );
+            }
+        }
+    }
+}
+
+/// The `[connection]` references to a method/signal `name` of `file` that attribute to *this* script
+/// (`Attr::Ours`) — the spans a rename rewrites and find-refs shows.
+fn scene_connection_refs(db: &dyn Db, file: FileId, name: &str, is_signal: bool) -> Vec<Reference> {
+    let mut out = Vec::new();
+    for_each_named_connection(db, file, name, is_signal, |scene_file, attr, span| {
+        if attr == Attr::Ours {
+            out.push(Reference {
+                file: scene_file,
+                range: span,
+                kind: ReferenceKind::Read,
+            });
+        }
+    });
+    out
+}
+
+/// Whether `name` is an `@export` variable member of `file`.
+fn var_is_exported(db: &dyn Db, file: FileId, name: &str) -> bool {
+    db.file_text(file).is_some_and(|ft| {
+        matches!(
+            queries::item_tree(db, ft).member(name),
+            Some(Member::Var(v)) if v.is_exported
+        )
+    })
+}
+
+/// References to an `@export` variable `name` of `file` made by `[node]` property assignments
+/// (`name = …`) in scenes whose node attaches this exact script — the spans a rename rewrites and
+/// find-refs shows. Resolve-confirmed (the node's `script=` resolves to `file`).
+fn scene_property_refs(db: &dyn Db, file: FileId, name: &str) -> Vec<Reference> {
+    let Some(script_res) = db.file_text(file).and_then(|ft| ft.res_path(db)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (scene_file, model) in project_scenes(db) {
+        db.unwind_if_revision_cancelled();
+        for node in &model.nodes {
+            let attaches = node
+                .script
+                .as_ref()
+                .and_then(|id| model.ext_resources.get(id))
+                .and_then(|e| e.path.as_deref())
+                == Some(script_res.as_str());
+            if !attaches {
+                continue;
+            }
+            for prop in &node.properties {
+                if prop.key == name {
+                    out.push(Reference {
+                        file: scene_file,
+                        range: prop.key_span,
+                        kind: ReferenceKind::Write,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether any node in `scene` carries a script whose attachment is **ambiguous** (the script is
+/// attached to more than one scene). For such a script `classify` cannot say *which* scene a `$Path`
+/// targets, so it resolves none — meaning a node rename would silently miss those references. The
+/// rename must refuse.
+fn scene_has_ambiguous_script(db: &dyn Db, scene: FileId) -> bool {
+    let (Some(ft), Some(root)) = (db.file_text(scene), db.source_root()) else {
+        return false;
+    };
+    let model = queries::scene_model(db, ft);
+    let index = queries::script_scene_index(db, root);
+    model.nodes.iter().any(|n| {
+        n.script
+            .as_ref()
+            .and_then(|id| model.ext_resources.get(id))
+            .and_then(|e| e.path.as_deref())
+            .and_then(|p| index.get(p))
+            .is_some_and(|attach| attach.ambiguous)
+    })
+}
+
+/// Whether a `.gd` quotes `name` as a string literal at a position **not** already a found reference
+/// — a possible dynamic `get_node(var)` / `Callable` target a node rename cannot rewrite, so it must
+/// refuse. The handled `get_node("Name")` literal *is* a found reference, so it does not trigger this.
+fn gd_has_uncovered_name_string(db: &dyn Db, name: &str, refs: &[Reference]) -> bool {
+    let Some(root) = db.source_root() else {
+        return false;
+    };
+    let needles = [format!("\"{name}\""), format!("'{name}'")];
+    root.files(db).iter().any(|&ft| {
+        if ft
+            .res_path(db)
+            .as_deref()
+            .is_some_and(queries::is_scene_path)
+        {
+            return false; // scenes are handled by classification, not the string scan
+        }
+        let file = ft.file_id(db);
+        let text = ft.text(db);
+        // The inner-name byte offsets already covered by a found reference in this file.
+        let covered: Vec<u32> = refs
+            .iter()
+            .filter(|r| r.file == file)
+            .map(|r| r.range.start)
+            .collect();
+        needles.iter().any(|needle| {
+            text.match_indices(needle.as_str()).any(|(quote, _)| {
+                // the inner name starts one byte past the opening quote
+                u32::try_from(quote + 1).is_ok_and(|inner| !covered.contains(&inner))
+            })
+        })
+    })
+}
+
+/// Whether any same-named `[connection]` cannot be proven *not* to reference this member
+/// (`Attr::Unknown`) — a rename must then refuse (correct-or-refuse: never a silent incomplete edit).
+fn scene_connection_is_ambiguous(db: &dyn Db, file: FileId, name: &str, is_signal: bool) -> bool {
+    let mut ambiguous = false;
+    for_each_named_connection(db, file, name, is_signal, |_, attr, _| {
+        ambiguous |= attr == Attr::Unknown;
+    });
+    ambiguous
 }
 
 /// Whether the identifier token at `offset` is the **target of an assignment** (a write): a bare
@@ -162,6 +388,18 @@ pub fn rename(db: &dyn Db, pos: FilePosition, new_name: &str) -> Result<SourceCh
             reason: "no references found".to_owned(),
         });
     }
+    // A scene node's name appearing as a `.gd` string we did NOT resolve to a reference may be a
+    // dynamic `get_node(var)` / `Callable` target we can't rewrite — refuse rather than partial-edit.
+    if let GodotDef::SceneNode { path, .. } = &def {
+        let node_name = path.rsplit('/').next().unwrap_or(path);
+        if gd_has_uncovered_name_string(db, node_name, &refs) {
+            return Err(RenameError::CrossesUnsupportedBoundary {
+                what: format!(
+                    "`{node_name}` appears as a string the analyzer can't attribute (possibly a dynamic get_node / Callable) — rename refuses"
+                ),
+            });
+        }
+    }
     // Group edits per file, deterministically.
     let mut by_file: Vec<(FileId, Vec<TextEdit>)> = Vec::new();
     for r in refs {
@@ -197,6 +435,20 @@ fn refuse_if_crosses_boundary(db: &dyn Db, def: &GodotDef) -> Result<(), RenameE
         GodotDef::Autoload { .. } => Err(RenameError::CrossesUnsupportedBoundary {
             what: "autoload name is declared in project.godot (not rewritten by rename)".to_owned(),
         }),
+        // A scene-node rename rewrites its `name=` plus every `$Path`/`parent=`/`[connection]`/
+        // `get_node` segment referencing it. The remaining unsoundness risk here is an **ambiguous**
+        // script (attached to multiple scenes): its node paths can't be resolved to *this* scene, so
+        // they would be silently missed — refuse. (The dynamic-`get_node(var)` risk is gated after
+        // find-references, in `rename`.)
+        GodotDef::SceneNode { scene, .. } => {
+            if scene_has_ambiguous_script(db, *scene) {
+                Err(RenameError::CrossesUnsupportedBoundary {
+                    what: "a script in this scene is attached to multiple scenes, so its node-path references can't be resolved unambiguously — rename refuses".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        }
         // A member refuses when it has a reference surface we cannot rewrite: a type-only inner
         // class / named enum, or a method/var/const/signal that may be named by a project string.
         GodotDef::Member { owner_file, name } => match member_symbol_kind(db, *owner_file, name) {
@@ -211,11 +463,25 @@ fn refuse_if_crosses_boundary(db: &dyn Db, def: &GodotDef) -> Result<(), RenameE
                     ),
                 })
             }
-            // A method/var/const/signal can be referenced by a *string* name (`connect("m")`,
-            // `Callable(o, "m")`, a `.tscn` `[connection method="m"]`) we cannot prove denotes this
-            // symbol — and scenes are not ingested. If a same-named string literal exists anywhere
-            // in the project, refuse (we never edit a string literal).
+            // A method/signal can be wired in a scene `[connection]`. The ours are rewritten and the
+            // unrelated (a different script's) are ignored — but a connection we **cannot attribute**
+            // (an unresolved / scriptless `to`/`from` node, e.g. into an instanced sub-scene) might be
+            // ours, so refuse rather than risk a silent incomplete edit.
             kind => {
+                let is_signal = matches!(kind, Some(SymbolKind::Signal));
+                let is_method = matches!(kind, Some(SymbolKind::Function | SymbolKind::Method));
+                if (is_method || is_signal)
+                    && scene_connection_is_ambiguous(db, *owner_file, name, is_signal)
+                {
+                    return Err(RenameError::CrossesUnsupportedBoundary {
+                        what: format!(
+                            "`{name}` is wired to a scene node whose script can't be resolved (possibly an instanced sub-scene) — rename refuses rather than risk an incomplete edit"
+                        ),
+                    });
+                }
+                // A method/var/const/signal can also be referenced by a `.gd` *string* name
+                // (`connect("m")`, `Callable(o, "m")`) we cannot prove denotes this symbol. If a
+                // same-named string literal exists in any `.gd`, refuse (we never edit a string).
                 let string_referenceable = matches!(
                     kind,
                     Some(
@@ -228,9 +494,7 @@ fn refuse_if_crosses_boundary(db: &dyn Db, def: &GodotDef) -> Result<(), RenameE
                 );
                 if string_referenceable && project_has_string_literal(db, name) {
                     Err(RenameError::CrossesUnsupportedBoundary {
-                        what: format!(
-                            "`{name}` may be referenced by a string (connect/Callable/scene connection)"
-                        ),
+                        what: format!("`{name}` may be referenced by a string (connect/Callable)"),
                     })
                 } else {
                     Ok(())
@@ -313,6 +577,22 @@ fn collision_check(db: &dyn Db, def: &GodotDef, new_name: &str) -> Result<(), Re
             }
         }
         GodotDef::Autoload { .. } | GodotDef::Engine { .. } => {}
+        // A sibling node with the new name collides (Godot forbids duplicate sibling names, and a
+        // `$Parent/New` path would otherwise become ambiguous).
+        GodotDef::SceneNode { scene, path } => {
+            if let Some(ft) = db.file_text(*scene) {
+                let model = queries::scene_model(db, ft);
+                if let Some(idx) = model.node_by_full_path(path) {
+                    let parent = model.node(idx).and_then(|n| n.parent_idx);
+                    if let Some((_, sib)) = model
+                        .children_of(parent)
+                        .find(|&(i, n)| i != idx && n.name == new_name)
+                    {
+                        return Err(collide(*scene, sib.name_span));
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -508,6 +788,19 @@ fn nav_target_of_def(db: &dyn Db, def: &GodotDef) -> Option<NavTarget> {
             target_file: None, ..
         }
         | GodotDef::Engine { .. } => None,
+        // A scene node's declaration is its `[node …]` line in the owning `.tscn` (focus = `name=`).
+        GodotDef::SceneNode { scene, path } => {
+            let ft = db.file_text(*scene)?;
+            let model = queries::scene_model(db, ft);
+            let node = model.node(model.node_by_full_path(path)?)?;
+            Some(NavTarget {
+                file: *scene,
+                full_range: node.header_span,
+                focus_range: node.name_span,
+                name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+                kind: SymbolKind::Class,
+            })
+        }
     }
 }
 
@@ -585,10 +878,13 @@ fn anon_enum_variant_target(db: &dyn Db, file: FileId, name: &str) -> Option<Nav
     None
 }
 
-/// Whether any `.gd` in the project quotes `name` as a string literal (the refuse trigger for
-/// method/member rename — a possible `connect`/`Callable`/scene-connection reference). A
+/// Whether any **`.gd`** in the project quotes `name` as a string literal (the refuse trigger for
+/// method/member rename — a possible `connect`/`Callable` reference we cannot safely rewrite). A
 /// conservative text scan (refuse-when-unsure): it may match an unrelated string, but never edits
-/// one — erring toward refusal, never toward a partial edit.
+/// one — erring toward refusal, never toward a partial edit. Scenes are **excluded**: a `.tscn`'s
+/// `[connection]` strings are handled precisely by attribution ([`scene_connection_refs`] rewrites
+/// the ours; [`scene_connection_is_ambiguous`] refuses on an unprovable one), so the coarse string
+/// scan would only over-refuse on an unrelated same-named connection in another script's scene.
 fn project_has_string_literal(db: &dyn Db, name: &str) -> bool {
     let Some(root) = db.source_root() else {
         return false;
@@ -596,6 +892,13 @@ fn project_has_string_literal(db: &dyn Db, name: &str) -> bool {
     let dq = format!("\"{name}\"");
     let sq = format!("'{name}'");
     root.files(db).iter().any(|&file| {
+        if file
+            .res_path(db)
+            .as_deref()
+            .is_some_and(queries::is_scene_path)
+        {
+            return false; // a scene — handled by connection attribution, not the string scan
+        }
         let text = file.text(db);
         text.contains(&dq) || text.contains(&sq)
     })
@@ -906,6 +1209,81 @@ mod tests {
     }
 
     #[test]
+    fn classify_and_infer_agree_across_the_name_lookup_ladder() {
+        // The full guard for the def.rs/infer.rs name-lookup duplication: goto-definition (classify)
+        // and hover (infer) must resolve a bare name to the SAME declaration at EVERY rung of the
+        // shared precedence ladder — own member → inherited member → engine global → class_name
+        // global — so the two copies of the order can't drift silently. (The local/param shadowing
+        // rungs are covered by the two tests above.)
+        // `hp` is annotated so its type carries cross-file (an *inferred* `:=` member seams to
+        // `Variant` across the lossy `MemberSig` — that's the cross-file seam, not a lookup drift).
+        const BASE: &str = "class_name Base\nvar hp: int = 7\n";
+        const DERIVED: &str = "extends Base\nvar speed := 3\nfunc f():\n\tvar a := speed\n\tvar b := hp\n\tvar c := Node.new()\n\tvar d := Base.new()\n\treturn [a, b, c, d]\n";
+        let db = db_with(&[(0, BASE), (1, DERIVED)]);
+        let ft = db.file_text(FileId(1)).unwrap();
+        let probe = |needle: &str, nth: usize| {
+            let p = pos(1, needle, nth, DERIVED);
+            (
+                goto_definition(&db, p),
+                crate::semantic::hover(&db, ft, p.offset).and_then(|h| h.ty_label),
+            )
+        };
+
+        // Own member `speed`: goto → its decl in f1; hover → int.
+        let speed_decl = u32::try_from(DERIVED.match_indices("speed").next().unwrap().0).unwrap();
+        let (g, h) = probe("speed", 1); // the 2nd "speed" is the use
+        assert!(
+            g.iter()
+                .any(|t| t.file == FileId(1) && t.focus_range.start == speed_decl),
+            "own-member goto should reach its decl in f1: {g:?}",
+        );
+        assert_eq!(h.as_deref(), Some("int"), "own-member hover");
+
+        // Inherited member `hp`: goto → Base's decl (f0); hover → int.
+        let hp_decl = u32::try_from(BASE.match_indices("hp").next().unwrap().0).unwrap();
+        let (g, h) = probe("hp", 0);
+        assert!(
+            g.iter()
+                .any(|t| t.file == FileId(0) && t.focus_range.start == hp_decl),
+            "inherited-member goto should reach the base decl in f0: {g:?}",
+        );
+        assert_eq!(h.as_deref(), Some("int"), "inherited-member hover");
+
+        // Engine global `Node`: classify=Engine → no user-file target; hover shows the engine class.
+        let (g, h) = probe("Node", 0);
+        assert!(
+            !g.iter().any(|t| t.file == FileId(0) || t.file == FileId(1)),
+            "engine global is not a user symbol — goto must not reach a .gd file: {g:?}",
+        );
+        assert_eq!(h.as_deref(), Some("Node"), "engine-global hover");
+
+        // class_name global `Base` used as a value: goto → Base's decl (f0); hover → Base.
+        let (g, h) = probe("Base", 1); // the `Base.new()` receiver (skip `extends Base`)
+        assert!(
+            g.iter().any(|t| t.file == FileId(0)),
+            "class_name-global goto should reach its decl file: {g:?}",
+        );
+        assert_eq!(h.as_deref(), Some("Base"), "class_name-global hover");
+    }
+
+    #[test]
+    fn inner_class_body_refs_do_not_corrupt_a_top_level_same_named_member() {
+        // 4.24 inc.2 inferred inner-method bodies (units now exist at inner offsets); the inc.3 guard
+        // keeps navigation correct-or-refuse inside inner classes, so a bare inner-member ref is NOT
+        // mis-resolved to a top-level same-named member. `update` exists both top-level and in
+        // `class Inner` — find-refs on the TOP `update` must include only the top decl + `self.update()`,
+        // never the inner class's `func update` decl or its bare `update()` call (Inner.update).
+        let src = "func update():\n\tpass\nfunc go():\n\tself.update()\nclass Inner:\n\tfunc update():\n\t\tpass\n\tfunc run():\n\t\tupdate()\n";
+        let db = db_with(&[(0, src)]);
+        let refs = find_references(&db, pos(0, "update", 0, src)); // the top-level `func update` decl
+        assert_eq!(
+            refs.len(),
+            2,
+            "top `update` find-refs must be the decl + self.update() only, excluding inner refs: {refs:?}",
+        );
+    }
+
+    #[test]
     fn soft_keyword_named_member_is_navigable() {
         // A member named `match` (a Godot soft-keyword identifier) must be reachable by goto-def and
         // find-refs. It used to be dropped at the AST layer (`Name::text()` read only `Ident`), so
@@ -1152,5 +1530,303 @@ mod tests {
         let targets = goto_definition(&db, pos(0, "FIRE", 1, src)); // a `print(FIRE)` use
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].name, "FIRE");
+    }
+
+    /// A db with explicit per-file `res://` paths (mixing `.gd` and `.tscn`).
+    fn db_paths(files: &[(u32, &str, &str)]) -> RootDatabase {
+        let mut db = RootDatabase::default();
+        for (id, path, src) in files {
+            db.set_file_text(FileId(*id), src, Durability::LOW);
+            db.set_file_path(FileId(*id), path);
+        }
+        db.sync_source_root();
+        db
+    }
+
+    const PLAYER_GD: &str = "extends Control\nfunc _on_pressed():\n\tpass\nsignal hurt\n";
+    // Root carries the script; a Button child emits `pressed` into the root's method, and the root
+    // re-emits its own `hurt` signal to itself.
+    const PLAYER_TSCN: &str = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://player.gd\" id=\"1\"]\n\
+[node name=\"Root\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Button\" type=\"Button\" parent=\".\"]\n\
+[connection signal=\"pressed\" from=\"Button\" to=\".\" method=\"_on_pressed\"]\n\
+[connection signal=\"hurt\" from=\".\" to=\".\" method=\"_noop\"]\n";
+
+    #[test]
+    fn rename_method_rewrites_a_scene_connection() {
+        let db = db_paths(&[
+            (0, "res://player.gd", PLAYER_GD),
+            (1, "res://player.tscn", PLAYER_TSCN),
+        ]);
+        let change =
+            rename(&db, pos(0, "_on_pressed", 0, PLAYER_GD), "_on_start").expect("rename ok");
+        // The `.gd` decl AND the `.tscn` connection `method=` are both rewritten.
+        let gd = change
+            .edits
+            .iter()
+            .find(|e| e.file == FileId(0))
+            .expect("gd edit");
+        let tscn = change
+            .edits
+            .iter()
+            .find(|e| e.file == FileId(1))
+            .expect("tscn edit");
+        assert_eq!(gd.edits.len(), 1);
+        assert_eq!(
+            tscn.edits.len(),
+            1,
+            "exactly the one connection method= span"
+        );
+        // the tscn edit covers exactly the `_on_pressed` inside `method="_on_pressed"`.
+        let r = tscn.edits[0].range;
+        assert_eq!(
+            &PLAYER_TSCN[r.start as usize..r.end as usize],
+            "_on_pressed"
+        );
+        assert_eq!(tscn.edits[0].new_text, "_on_start");
+    }
+
+    #[test]
+    fn rename_signal_rewrites_a_scene_connection() {
+        let db = db_paths(&[
+            (0, "res://player.gd", PLAYER_GD),
+            (1, "res://player.tscn", PLAYER_TSCN),
+        ]);
+        let change = rename(&db, pos(0, "hurt", 0, PLAYER_GD), "wounded").expect("rename ok");
+        let tscn = change
+            .edits
+            .iter()
+            .find(|e| e.file == FileId(1))
+            .expect("tscn edit");
+        let r = tscn.edits[0].range;
+        assert_eq!(&PLAYER_TSCN[r.start as usize..r.end as usize], "hurt");
+    }
+
+    #[test]
+    fn rename_method_does_not_touch_a_connection_on_a_different_script() {
+        // Same method name, but the `to` node attaches a DIFFERENT script → not our reference.
+        let other_tscn = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://other.gd\" id=\"1\"]\n\
+[node name=\"Root\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[connection signal=\"pressed\" from=\".\" to=\".\" method=\"_on_pressed\"]\n";
+        let db = db_paths(&[
+            (0, "res://player.gd", PLAYER_GD),
+            (
+                1,
+                "res://other.gd",
+                "extends Control\nfunc _on_pressed():\n\tpass\n",
+            ),
+            (2, "res://other.tscn", other_tscn),
+        ]);
+        let change = rename(&db, pos(0, "_on_pressed", 0, PLAYER_GD), "_x").expect("rename ok");
+        // player.gd's method has no scene of its own here → only the `.gd` decl is rewritten,
+        // never other.tscn's connection (which belongs to other.gd).
+        assert!(
+            change.edits.iter().all(|e| e.file != FileId(2)),
+            "{:?}",
+            change.edits
+        );
+    }
+
+    const NODE_GD: &str = "extends Control\nfunc _ready():\n\tvar b = $Button\n";
+    const NODE_TSCN: &str = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://w.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Button\" type=\"Control\" parent=\".\"]\n";
+
+    #[test]
+    fn classify_agrees_from_a_node_path_and_the_scene_name() {
+        let db = db_paths(&[(0, "res://w.gd", NODE_GD), (1, "res://w.tscn", NODE_TSCN)]);
+        // The `$Button` in the script and the `name="Button"` in the scene resolve to the SAME node.
+        let from_gd = def::classify(&db, pos(0, "Button", 0, NODE_GD)).expect("gd classifies");
+        let from_tscn =
+            def::classify(&db, pos(1, "Button", 0, NODE_TSCN)).expect("tscn classifies");
+        assert_eq!(from_gd, from_tscn);
+        assert!(
+            matches!(&from_gd, GodotDef::SceneNode { path, .. } if path == "Main/Button"),
+            "{from_gd:?}"
+        );
+    }
+
+    #[test]
+    fn find_refs_on_a_node_path_spans_gd_and_tscn() {
+        let db = db_paths(&[(0, "res://w.gd", NODE_GD), (1, "res://w.tscn", NODE_TSCN)]);
+        let refs = find_references(&db, pos(0, "Button", 0, NODE_GD));
+        // The `$Button` use (gd) + the `name="Button"` declaration (tscn).
+        assert!(refs.iter().any(|r| r.file == FileId(0)), "gd ref: {refs:?}");
+        assert!(
+            refs.iter()
+                .any(|r| r.file == FileId(1) && r.kind == ReferenceKind::Declaration),
+            "tscn decl: {refs:?}"
+        );
+    }
+
+    const CASCADE_GD: &str =
+        "extends Control\nfunc _ready():\n\tvar p = $Panel\n\tvar b = get_node(\"Panel/Btn\")\n";
+    const CASCADE_TSCN: &str = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://c.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Panel\" type=\"Control\" parent=\".\"]\n\
+[node name=\"Btn\" type=\"Control\" parent=\"Panel\"]\n\
+[connection signal=\"pressed\" from=\"Panel\" to=\".\" method=\"_on\"]\n";
+
+    #[test]
+    fn find_refs_on_a_node_covers_the_full_cascade() {
+        let db = db_paths(&[
+            (0, "res://c.gd", CASCADE_GD),
+            (1, "res://c.tscn", CASCADE_TSCN),
+        ]);
+        // Renaming `Panel` must touch: its `name=`, the child's `parent="Panel"`, the connection
+        // `from="Panel"` (all .tscn), plus `$Panel` and the `get_node("Panel/Btn")` segment (.gd).
+        let refs = find_references(&db, pos(1, "Panel", 0, CASCADE_TSCN)); // from the scene name=
+        let in_gd = refs.iter().filter(|r| r.file == FileId(0)).count();
+        let in_tscn = refs.iter().filter(|r| r.file == FileId(1)).count();
+        assert_eq!(in_gd, 2, "$Panel + get_node segment: {refs:?}");
+        assert_eq!(in_tscn, 3, "name= + parent= + connection from=: {refs:?}");
+        // every reference covers exactly the text `Panel`.
+        for r in &refs {
+            let src = if r.file == FileId(0) {
+                CASCADE_GD
+            } else {
+                CASCADE_TSCN
+            };
+            assert_eq!(
+                &src[r.range.start as usize..r.range.end as usize],
+                "Panel",
+                "{r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_a_scene_node_rewrites_every_reference() {
+        let db = db_paths(&[
+            (0, "res://c.gd", CASCADE_GD),
+            (1, "res://c.tscn", CASCADE_TSCN),
+        ]);
+        // from the scene `name="Panel"`:
+        let change = rename(&db, pos(1, "Panel", 0, CASCADE_TSCN), "Sidebar").expect("rename ok");
+        let total: usize = change.edits.iter().map(|e| e.edits.len()).sum();
+        assert_eq!(
+            total, 5,
+            "name= + parent= + connection + $Panel + get_node: {:?}",
+            change.edits
+        );
+        for fe in &change.edits {
+            for e in &fe.edits {
+                assert_eq!(e.new_text, "Sidebar");
+            }
+        }
+    }
+
+    #[test]
+    fn rename_a_scene_node_from_a_script_path_works_too() {
+        let db = db_paths(&[
+            (0, "res://c.gd", CASCADE_GD),
+            (1, "res://c.tscn", CASCADE_TSCN),
+        ]);
+        // starting on the `$Panel` use in the script yields the same 5-edit change.
+        let change = rename(&db, pos(0, "Panel", 0, CASCADE_GD), "Sidebar").expect("rename ok");
+        let total: usize = change.edits.iter().map(|e| e.edits.len()).sum();
+        assert_eq!(total, 5, "{:?}", change.edits);
+    }
+
+    #[test]
+    fn rename_a_scene_node_to_a_sibling_name_collides() {
+        let tscn = "[gd_scene format=3]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+[node name=\"A\" type=\"Control\" parent=\".\"]\n\
+[node name=\"B\" type=\"Control\" parent=\".\"]\n";
+        let db = db_paths(&[(0, "res://s.tscn", tscn)]);
+        let err = rename(&db, pos(0, "A", 0, tscn), "B").unwrap_err();
+        assert!(matches!(err, RenameError::WouldCollide { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn rename_a_scene_node_refuses_on_an_unattributable_string() {
+        // A bare `"Panel"` string (not a node-path) could be a dynamic get_node(var) target — refuse.
+        let gd = "extends Control\nfunc _ready():\n\tvar p = $Panel\n\tvar s = \"Panel\"\n";
+        let tscn = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://d.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Panel\" type=\"Control\" parent=\".\"]\n";
+        let db = db_paths(&[(0, "res://d.gd", gd), (1, "res://d.tscn", tscn)]);
+        let err = rename(&db, pos(1, "Panel", 0, tscn), "Sidebar").unwrap_err();
+        assert!(
+            matches!(err, RenameError::CrossesUnsupportedBoundary { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rename_a_scene_node_refuses_on_an_ambiguous_multi_scene_script() {
+        let gd = "extends Control\nfunc _ready():\n\tpass\n";
+        let x = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://a.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n\
+[node name=\"Target\" type=\"Control\" parent=\".\"]\n";
+        let y = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://a.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+script = ExtResource(\"1\")\n";
+        // a.gd attaches to BOTH x.tscn and y.tscn → ambiguous.
+        let db = db_paths(&[
+            (0, "res://a.gd", gd),
+            (1, "res://x.tscn", x),
+            (2, "res://y.tscn", y),
+        ]);
+        let err = rename(&db, pos(1, "Target", 0, x), "Renamed").unwrap_err();
+        assert!(
+            matches!(err, RenameError::CrossesUnsupportedBoundary { .. }),
+            "{err:?}"
+        );
+    }
+
+    const EXPORT_GD: &str = "extends Node2D\n@export var speed := 1.0\n";
+    const EXPORT_TSCN: &str = "[gd_scene format=3]\n\
+[ext_resource type=\"Script\" path=\"res://e.gd\" id=\"1\"]\n\
+[node name=\"Main\" type=\"Node2D\"]\n\
+script = ExtResource(\"1\")\n\
+speed = 5.0\n";
+
+    #[test]
+    fn rename_an_export_var_rewrites_the_scene_property_key() {
+        let db = db_paths(&[
+            (0, "res://e.gd", EXPORT_GD),
+            (1, "res://e.tscn", EXPORT_TSCN),
+        ]);
+        let change = rename(&db, pos(0, "speed", 0, EXPORT_GD), "velocity").expect("rename ok");
+        // the `.gd` decl + the `.tscn` `speed =` property key.
+        let tscn = change
+            .edits
+            .iter()
+            .find(|e| e.file == FileId(1))
+            .expect("tscn edit");
+        assert_eq!(tscn.edits.len(), 1);
+        let r = tscn.edits[0].range;
+        assert_eq!(&EXPORT_TSCN[r.start as usize..r.end as usize], "speed");
+        assert_eq!(tscn.edits[0].new_text, "velocity");
+    }
+
+    #[test]
+    fn rename_a_non_export_var_does_not_touch_a_scene_property() {
+        // No `@export` → `speed` is never a node property; a same-named `.tscn` property is an engine
+        // property that must NOT be rewritten.
+        let gd = "extends Node2D\nvar speed := 1.0\n";
+        let db = db_paths(&[(0, "res://n.gd", gd), (1, "res://n.tscn", EXPORT_TSCN)]);
+        // (EXPORT_TSCN points at e.gd, but here file 0 is n.gd; the property won't attribute anyway.)
+        let change = rename(&db, pos(0, "speed", 0, gd), "velocity").expect("rename ok");
+        assert!(
+            change.edits.iter().all(|e| e.file != FileId(1)),
+            "{:?}",
+            change.edits
+        );
     }
 }

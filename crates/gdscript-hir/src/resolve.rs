@@ -80,10 +80,35 @@ fn resolve_autoload(db: &dyn Db, name: &str) -> Ty {
     else {
         return Ty::Unknown;
     };
-    if is_gdscript_path(&path) {
-        resolve_res_path(db, &path)
-    } else if is_scene_path(&path) {
-        resolve_scene_autoload(db, &path)
+    resolve_autoload_path_ty(db, &path)
+}
+
+/// Resolve **any** autoload's bare name (singleton OR loaded-but-not-global) to its type — the
+/// `/root/Name` node-path bridge (a non-`*` autoload is loaded at `/root/Name` but is not a global,
+/// so it is reachable only through that absolute path, never a bare name). Same path→type rules as
+/// [`resolve_autoload`]; the seam otherwise. Used by `infer::resolve_node_path` for `/root/Name`.
+#[must_use]
+pub fn resolve_autoload_any(db: &dyn Db, name: &str) -> Ty {
+    let Some(config) = db.project_config() else {
+        return Ty::Unknown;
+    };
+    let Some(path) = crate::queries::autoload_registry(db, config)
+        .resolve_any_path(name)
+        .cloned()
+    else {
+        return Ty::Unknown;
+    };
+    resolve_autoload_path_ty(db, &path)
+}
+
+/// Resolve an autoload's resource `path` to its type: a `.gd` → its declaring file's `ScriptRef`; a
+/// scene (`.tscn`/`.tres`) → its root's attached script (`resolve_scene_autoload`); anything else →
+/// the seam. Shared by [`resolve_autoload`] (singletons) and [`resolve_autoload_any`] (`/root/Name`).
+fn resolve_autoload_path_ty(db: &dyn Db, path: &str) -> Ty {
+    if is_gdscript_path(path) {
+        resolve_res_path(db, path)
+    } else if is_scene_path(path) {
+        resolve_scene_autoload(db, path)
     } else {
         Ty::Unknown
     }

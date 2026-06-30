@@ -7,7 +7,12 @@
 //!
 //! All offsets are **byte** offsets into a file's UTF-8 source. No logic beyond the
 //! conversions lives here. The crate is `wasm32`-safe (no `std::fs`, clocks, threads).
+//!
+//! These POD result structs are the analyzer's **public wire contract** (consumed via
+//! [`gdscript_ide`](https://docs.rs/gdscript-ide)), so every public item is documented and
+//! `#![deny(missing_docs)]` keeps it that way.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 
 use serde::{Deserialize, Serialize};
 
@@ -464,6 +469,18 @@ pub type Cancellable<T> = Result<T, Cancelled>;
 /// Lines and columns are 0-based. The core emits byte offsets; LSP/JS clients convert
 /// to UTF-16 via this (the documented position-encoding footgun —
 /// `plans/01-ARCHITECTURE.md` §4).
+///
+/// ```
+/// use gdscript_base::LineIndex;
+/// // Line 1 contains a 2-byte `é`, so the byte column and the UTF-16 column diverge
+/// // after it — the encoding footgun this type exists to handle.
+/// let src = "var x := 1\nvar é := 2\n";
+/// let idx = LineIndex::new(src);
+/// let colon = u32::try_from(src.rfind(":=").unwrap()).unwrap(); // the `:` on line 1
+/// let lc = idx.line_col(colon);
+/// assert_eq!((lc.line, lc.col), (1, 7)); // byte column 7 (`é` is 2 bytes)
+/// assert_eq!(idx.utf16_col(src, colon), 6); // UTF-16 column 6 (`é` is 1 code unit)
+/// ```
 #[derive(Debug, Clone)]
 pub struct LineIndex {
     /// Byte offset of the start of each line (line 0 starts at 0).

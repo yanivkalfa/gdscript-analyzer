@@ -1,5 +1,8 @@
 //! `gdscript-syntax` — lexer + indentation pre-pass + lossless parser for GDScript.
 //!
+//! > **Internal layer (not a stable API).** Depend on [`gdscript-ide`](https://docs.rs/gdscript-ide) (the public surface); the items here
+//! > may change between releases.
+//!
 //! Phase 1 fills this in: a `logos` lexer, a hand-written indentation pre-pass
 //! (INDENT/DEDENT/NEWLINE), and a hand-written recursive-descent parser producing a
 //! lossless [`cstree`] CST plus a typed AST, behind a `Parser` trait

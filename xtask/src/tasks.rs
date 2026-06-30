@@ -68,7 +68,10 @@ pub fn codegen_api() -> Result<()> {
 
     let json = std::fs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
-    let generated = crate::codegen::generate(&json)?;
+    // The hover-doc corpus is the vendored `doc/classes/*.xml` beside the API JSON (GODOT-SYNC §4).
+    let doc_dir = version_dir.join("doc").join("classes");
+    let docs = crate::docs::DocSet::load(&doc_dir)?;
+    let generated = crate::codegen::generate(&json, &docs)?;
 
     let api_dir = root.join("crates").join("gdscript-api").join("src");
 
@@ -76,11 +79,17 @@ pub fn codegen_api() -> Result<()> {
     std::fs::write(&blob_path, &generated.blob)
         .with_context(|| format!("writing {}", blob_path.display()))?;
 
+    let docs_path = api_dir.join("engine_docs.bin");
+    std::fs::write(&docs_path, &generated.docs_blob)
+        .with_context(|| format!("writing {}", docs_path.display()))?;
+
     let crate::codegen::Generated {
         version,
         class_count,
         builtin_count,
         blob,
+        docs_blob,
+        doc_count,
     } = &generated;
     let meta_path = api_dir.join("generated.rs");
     let contents = format!(
@@ -103,9 +112,11 @@ pub fn codegen_api() -> Result<()> {
         .with_context(|| format!("writing {}", meta_path.display()))?;
 
     println!(
-        "codegen-api: wrote {} ({} bytes) + {} (godot {version}, {class_count} classes, {builtin_count} builtin types)",
+        "codegen-api: wrote {} ({} bytes) + {} ({} bytes, {doc_count} doc entries) + {} (godot {version}, {class_count} classes, {builtin_count} builtin types)",
         blob_path.display(),
         blob.len(),
+        docs_path.display(),
+        docs_blob.len(),
         meta_path.display(),
     );
     Ok(())

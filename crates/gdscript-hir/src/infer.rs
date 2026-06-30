@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::body::{self, BinOp, Body, Expr, ExprId, Literal, ParamBinding, Stmt, UnOp};
 use crate::cst::{self, AstPtr};
 use crate::flow::{self, FlowAnalysis, NarrowedTy, Place};
-use crate::item_tree::{ItemTree, Member, item_tree};
+use crate::item_tree::{InnerClassItem, ItemTree, Member, has_annotation, item_tree};
 use crate::resolve::{self, ClassItem, ClassScope, GlobalDef};
 use crate::ty::{self, Assign, EnumRef, ScriptRefId, Ty};
 use crate::warnings::{RawWarning, WarningCode};
@@ -143,6 +143,10 @@ fn collect_assign_lhs(body: &Body) -> FxHashSet<ExprId> {
         .collect()
 }
 
+/// Infer one function/initializer body against a class scope: walks the lowered [`body::Body`],
+/// resolving each expression's [`Ty`] (engine + cross-file members, scene-node paths, flow
+/// narrowing) and recording the bindings, diagnostics, and severity-free gateable warnings.
+/// Returns the [`InferenceResult`] the IDE features and the warning gate read.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
@@ -238,6 +242,89 @@ pub fn infer(
         for (range, code, msg) in unused {
             cx.warn(range, code, msg);
         }
+    }
+
+    // SHADOWED_GLOBAL_IDENTIFIER — a parameter / local / `for` / pattern-bind whose name collides
+    // with a project/engine global (built-in type/function, native class, engine singleton, project
+    // `class_name`, or autoload). Godot's `is_shadowing` fires for every local-scope binding. A local
+    // `var`/`const` that *also* shadows a param/member emits THIS instead of `SHADOWED_VARIABLE` (the
+    // global check wins in `gdscript_analyzer.cpp`; `infer_local_var` suppresses the variable-shadow
+    // when a global one applies, so the two never double-fire on one declaration).
+    if is_func_body {
+        let global_shadows: Vec<(TextRange, String)> = cx
+            .bindings
+            .iter()
+            .filter_map(|b| {
+                let kind = shadowed_global_kind(db, api, &b.name)?;
+                let what = match b.kind {
+                    BindingKind::Param => "parameter",
+                    BindingKind::Var if b.is_const => "constant",
+                    BindingKind::Var => "variable",
+                    BindingKind::ForVar => "for loop variable",
+                    BindingKind::MatchBind => "pattern bind",
+                };
+                Some((
+                    b.name_range,
+                    format!("The {what} \"{}\" has the same name as a {kind}.", b.name),
+                ))
+            })
+            .collect();
+        for (range, msg) in global_shadows {
+            cx.warn(range, WarningCode::ShadowedGlobalIdentifier, msg);
+        }
+    }
+
+    // UNTYPED_DECLARATION / INFERRED_DECLARATION — the opt-in declaration-strictness codes (default
+    // IGNORE; promoted to WARN under a strict / standalone run). Driven directly by the binding flags:
+    // a `var` declared with `:=` is INFERRED_DECLARATION; a `var` / parameter with neither a `: T`
+    // annotation nor `:=` is UNTYPED_DECLARATION. `const` (its value type is always statically known),
+    // `for` vars, and pattern binds (fixed by the iterable / scrutinee, not user-typeable) are excluded
+    // — they can't carry the static type Godot's strict check expects.
+    if is_func_body {
+        let decl_strictness: Vec<(TextRange, WarningCode, String)> = cx
+            .bindings
+            .iter()
+            .filter_map(|b| match b.kind {
+                BindingKind::Param if !b.annotated => Some((
+                    b.name_range,
+                    WarningCode::UntypedDeclaration,
+                    format!("The parameter \"{}\" has no static type.", b.name),
+                )),
+                BindingKind::Var if !b.is_const && b.inferred_colon_eq => Some((
+                    b.name_range,
+                    WarningCode::InferredDeclaration,
+                    format!(
+                        "The variable \"{}\" uses inferred typing (`:=`); consider declaring its type explicitly.",
+                        b.name
+                    ),
+                )),
+                BindingKind::Var if !b.is_const && !b.annotated => Some((
+                    b.name_range,
+                    WarningCode::UntypedDeclaration,
+                    format!("The variable \"{}\" has no static type.", b.name),
+                )),
+                _ => None,
+            })
+            .collect();
+        for (range, code, msg) in decl_strictness {
+            cx.warn(range, code, msg);
+        }
+    }
+
+    // CONFUSABLE_IDENTIFIER — a parameter / local binding whose name mixes scripts in a spoofable
+    // way (the same UTS #39 check used for member names; ASCII names fast-path out).
+    let confusable_bindings: Vec<TextRange> = cx
+        .bindings
+        .iter()
+        .filter(|b| is_confusable_identifier(&b.name))
+        .map(|b| b.name_range)
+        .collect();
+    for range in confusable_bindings {
+        cx.warn(
+            range,
+            WarningCode::ConfusableIdentifier,
+            "This identifier uses confusable characters (mixed scripts).".to_owned(),
+        );
     }
 
     // UNREACHABLE_CODE — statements after a return/break/continue / exhaustive branch (Workstream 2).
@@ -377,6 +464,18 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
                 fixes: Vec::new(),
             });
         }
+        // CONFUSABLE_IDENTIFIER on the `class_name` itself (gated, unlike the hides-global check).
+        if is_confusable_identifier(&name)
+            && let Some(range) = class_name_decl_range(root)
+        {
+            raw_warnings.push(RawWarning {
+                range,
+                code: WarningCode::ConfusableIdentifier,
+                message: format!(
+                    "The identifier \"{name}\" uses confusable characters (mixed scripts)."
+                ),
+            });
+        }
     }
 
     // A genuine `extends` cycle (D7): walk THIS file's base chain by `FileId`; if it returns to the
@@ -483,6 +582,24 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         }
     }
 
+    // Pass 2b — inner-class method bodies. The top-level pass skips `Member::Class`, so inner `class
+    // Name:` methods were never inferred (no units / diagnostics / resolvable refs). Analyze them with
+    // `self` typed as the inner class, so `self.member` / bare member refs resolve against the inner
+    // item-tree + its `extends` chain; anything unresolved stays the seam (no false positive).
+    infer_inner_class_bodies(
+        db,
+        api,
+        root,
+        &tree,
+        file_id,
+        "",
+        res_path.as_deref(),
+        &mut units,
+        &mut diagnostics,
+        &mut raw_warnings,
+        0,
+    );
+
     FileInference {
         tree,
         units,
@@ -491,9 +608,125 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
     }
 }
 
+/// Infer the method bodies of every inner `class Name:` in `tree` (recursively), with `self` typed as
+/// the inner class. `path_prefix` is the dotted path to `tree`'s class (`""` at the top level), used
+/// to build each inner class's [`crate::ty::InnerClassRef`] path. Depth-bounded against pathological
+/// nesting. Inner-class *field* fixpoint pre-pass is intentionally skipped (an inner field types by
+/// annotation only — lossy, like the cross-file path).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads the same analyze_file accumulators a free helper can't capture from a closure"
+)]
+fn infer_inner_class_bodies(
+    db: &dyn Db,
+    api: &EngineApi,
+    root: &GdNode,
+    tree: &ItemTree,
+    file_id: FileId,
+    path_prefix: &str,
+    res_path: Option<&str>,
+    units: &mut Vec<Unit>,
+    diagnostics: &mut Vec<Diagnostic>,
+    raw_warnings: &mut Vec<RawWarning>,
+    depth: u32,
+) {
+    if depth > 16 {
+        return;
+    }
+    for m in &tree.members {
+        let Member::Class(c) = m else { continue };
+        let inner_path = if path_prefix.is_empty() {
+            c.name.to_string()
+        } else {
+            format!("{path_prefix}.{}", c.name)
+        };
+        let mut class = ClassScope::new(db, api, &c.tree, res_path);
+        class.self_ty = Ty::InnerClass(crate::ty::InnerClassRef {
+            file: file_id.0,
+            path: SmolStr::new(&inner_path),
+        });
+        for im in &c.tree.members {
+            let Member::Func(f) = im else { continue };
+            let Some(node) = f.ptr.to_node(root) else {
+                continue;
+            };
+            let body = body::body_of_func(&node);
+            let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
+                .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
+            let result = infer(db, api, root, &class, &body, return_ty, true);
+            diagnostics.extend(result.diagnostics.iter().cloned());
+            raw_warnings.extend(result.raw_warnings.iter().cloned());
+            units.push(Unit {
+                range: f.range,
+                body,
+                result,
+            });
+        }
+        infer_inner_class_bodies(
+            db,
+            api,
+            root,
+            &c.tree,
+            file_id,
+            &inner_path,
+            res_path,
+            units,
+            diagnostics,
+            raw_warnings,
+            depth + 1,
+        );
+    }
+}
+
+/// Class-level annotation checks (W1), unblocked by first-class item-tree annotations:
+/// `REDUNDANT_STATIC_UNLOAD` (`@static_unload` with no `static var`) and `MISSING_TOOL` (a non-`@tool`
+/// class extending a `@tool` user-script base).
+fn class_annotation_warnings(
+    db: &dyn Db,
+    api: &EngineApi,
+    root: &GdNode,
+    tree: &ItemTree,
+    res_path: Option<&str>,
+) -> Vec<RawWarning> {
+    let mut out = Vec::new();
+    // REDUNDANT_STATIC_UNLOAD — `@static_unload` on a class that declares no `static var`.
+    if let Some(unload) = tree.annotations.iter().find(|a| a.name == "static_unload")
+        && !tree
+            .members
+            .iter()
+            .any(|m| matches!(m, Member::Var(v) if v.is_static))
+    {
+        out.push(RawWarning {
+            range: unload.range,
+            code: WarningCode::RedundantStaticUnload,
+            message: "`@static_unload` is redundant on a class with no static variables."
+                .to_owned(),
+        });
+    }
+    // MISSING_TOOL — this class is not `@tool` but its (user-script) base is, so it will NOT run in
+    // the editor. Only the resolvable user-script base is checked (an engine base is never `@tool`).
+    if !has_annotation(&tree.annotations, "tool")
+        && user_base_is_tool(db, api, tree, res_path)
+        && let Some(range) = extends_decl_range(root)
+    {
+        out.push(RawWarning {
+            range,
+            code: WarningCode::MissingTool,
+            message: "This class extends a `@tool` script but is not itself `@tool` (it will not run in the editor)."
+                .to_owned(),
+        });
+    }
+    out
+}
+
 /// File-level (member) warnings that need the whole item-tree, not a single body (W1):
-/// `ENUM_VARIABLE_WITHOUT_DEFAULT` on an enum-typed field with no initializer, and `UNUSED_SIGNAL`
-/// on a signal never referenced anywhere in the file. Both are sound + conservative.
+/// `ENUM_VARIABLE_WITHOUT_DEFAULT`, `UNUSED_SIGNAL`, `UNUSED_PRIVATE_CLASS_VARIABLE`,
+/// `SHADOWED_GLOBAL_IDENTIFIER`, `CONFUSABLE_IDENTIFIER`, the annotation-lifecycle checks, and
+/// `NATIVE_METHOD_OVERRIDE` — each independent + conservative.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat sequence of independent per-member warning checks; reads best as one walk"
+)]
 fn member_level_warnings(
     db: &dyn Db,
     api: &EngineApi,
@@ -503,14 +736,77 @@ fn member_level_warnings(
 ) -> Vec<RawWarning> {
     let mut out = Vec::new();
     let has_signal = tree.members.iter().any(|m| matches!(m, Member::Signal(_)));
-    // Only pay for the whole-file name scan when there is a signal to judge.
-    let uses = has_signal.then(|| NameUses::collect(root));
+    // A `_`-prefixed, non-exported member var is an UNUSED_PRIVATE_CLASS_VARIABLE candidate.
+    let has_private_var = tree
+        .members
+        .iter()
+        .any(|m| matches!(m, Member::Var(v) if v.name.starts_with('_') && !v.is_exported));
+    // Only pay for the whole-file name scan when there is a signal or a private var to judge.
+    let uses = (has_signal || has_private_var).then(|| NameUses::collect(root));
     // The resolved ENGINE base, for NATIVE_METHOD_OVERRIDE (an unresolved/user base ⇒ no check).
     let engine_base = match resolve::resolve_base(db, api, tree, res_path) {
         Ty::Object(c) => Some(c),
         _ => None,
     };
+
+    out.extend(class_annotation_warnings(db, api, root, tree, res_path));
+
     for m in &tree.members {
+        // UNUSED_PRIVATE_CLASS_VARIABLE — a `_`-prefixed, non-exported member var never referenced
+        // anywhere in the file (same-file scan, like UNUSED_SIGNAL). Exported vars are set externally
+        // (inspector / scene), so they are excluded to keep the contract no-false-positive.
+        if let Member::Var(v) = m
+            && v.name.starts_with('_')
+            && !v.is_exported
+            && let Some(uses) = &uses
+            && !uses.is_referenced(&v.name)
+        {
+            out.push(RawWarning {
+                range: v.name_range,
+                code: WarningCode::UnusedPrivateClassVariable,
+                message: format!(
+                    "The class variable \"{}\" is never used in this file.",
+                    v.name
+                ),
+            });
+        }
+        // ONREADY_WITH_EXPORT — `@onready` and `@export` on the same member (Godot raises this).
+        if let Member::Var(v) = m
+            && has_annotation(&v.annotations, "onready")
+            && v.is_exported
+        {
+            out.push(RawWarning {
+                range: v.name_range,
+                code: WarningCode::OnreadyWithExport,
+                message: format!(
+                    "The member \"{}\" has both `@onready` and `@export`; they conflict.",
+                    v.name
+                ),
+            });
+        }
+        // SHADOWED_GLOBAL_IDENTIFIER — a value member (`var`/`const`/`signal`) whose name collides
+        // with a project/engine global. Godot's `is_shadowing` fires for member declarations too.
+        if let Some((name, range, what)) = member_value_decl(m)
+            && let Some(kind) = shadowed_global_kind(db, api, name)
+        {
+            out.push(RawWarning {
+                range,
+                code: WarningCode::ShadowedGlobalIdentifier,
+                message: format!("The {what} \"{name}\" has the same name as a {kind}."),
+            });
+        }
+        // CONFUSABLE_IDENTIFIER — any member name that mixes scripts in a spoofable way.
+        if let Some((name, range)) = member_decl_name(m)
+            && is_confusable_identifier(name)
+        {
+            out.push(RawWarning {
+                range,
+                code: WarningCode::ConfusableIdentifier,
+                message: format!(
+                    "The identifier \"{name}\" uses confusable characters (mixed scripts)."
+                ),
+            });
+        }
         match m {
             // An enum-typed field with no initializer (the local case is in `infer_local_var`).
             Member::Var(v) if !v.has_init => {
@@ -654,6 +950,101 @@ fn is_autoload_singleton(db: &dyn Db, name: &str) -> bool {
     })
 }
 
+/// Whether the file's resolved **user-script** base carries the `@tool` annotation (for
+/// `MISSING_TOOL`). An engine base or an unresolved base is never `@tool`. Firewall-safe: reads the
+/// base's `item_tree` (signature-level — a base *body* edit leaves the annotation set unchanged).
+fn user_base_is_tool(
+    db: &dyn Db,
+    api: &EngineApi,
+    tree: &ItemTree,
+    res_path: Option<&str>,
+) -> bool {
+    let Ty::ScriptRef(sref) = resolve::resolve_base(db, api, tree, res_path) else {
+        return false;
+    };
+    let Some(ft) = db.file_text(FileId(sref.0)) else {
+        return false;
+    };
+    has_annotation(&crate::queries::item_tree(db, ft).annotations, "tool")
+}
+
+/// Whether `name` is registered as a global `class_name` by some file in the project. `false` when
+/// no source root is set (single-file analysis can't observe the registry). Reads the firewalled
+/// [`crate::queries::global_registry`].
+fn is_registered_global_class(db: &dyn Db, name: &str) -> bool {
+    db.source_root().is_some_and(|root| {
+        crate::queries::global_registry(db, root)
+            .resolve(name)
+            .is_some()
+    })
+}
+
+/// Whether a declared identifier `name` shadows a project/engine **global**, returning Godot's
+/// category label for the `SHADOWED_GLOBAL_IDENTIFIER` message, else `None`. Mirrors
+/// `gdscript_analyzer.cpp`'s `is_shadowing` global checks: a built-in function, a built-in (Variant)
+/// type, a native class, an engine singleton, a project `class_name` global, or a `*`-autoload
+/// singleton. **Conservative:** bare global pseudo-constants (`PI`/`TAU`) and global enum namespaces
+/// (`Error`/`Key`) are deliberately excluded — they are rare as user identifiers (and the tokenizer
+/// treats the math constants as literals), so this only ever *under*-warns vs. Godot, never a false
+/// positive. With no source root / `project.godot`, the cross-file/autoload arms are silent (seam).
+fn shadowed_global_kind(db: &dyn Db, api: &EngineApi, name: &str) -> Option<&'static str> {
+    match resolve::resolve_global(api, name) {
+        Some(GlobalDef::Builtin | GlobalDef::Utility) => return Some("built-in function"),
+        Some(GlobalDef::BuiltinType(_)) => return Some("built-in type"),
+        Some(GlobalDef::ClassType(_)) => return Some("native class"),
+        Some(GlobalDef::Singleton(_)) => return Some("engine singleton"),
+        // Bare pseudo-constants / global enums: intentionally not flagged (see doc above).
+        Some(GlobalDef::Const(_) | GlobalDef::GlobalEnum) | None => {}
+    }
+    if is_registered_global_class(db, name) {
+        return Some("global class");
+    }
+    if is_autoload_singleton(db, name) {
+        return Some("autoload");
+    }
+    None
+}
+
+/// The `(name, name range, kind noun)` of a *value-declaring* member (`var`/`const`/`signal`) — the
+/// members that `SHADOWED_GLOBAL_IDENTIFIER` checks at the class level. `None` for funcs / enums /
+/// inner classes (where the "shadow" framing is weaker, matching Godot's `is_shadowing` callers).
+fn member_value_decl(m: &Member) -> Option<(&SmolStr, TextRange, &'static str)> {
+    match m {
+        Member::Var(v) => Some((&v.name, v.name_range, "variable")),
+        Member::Const(c) => Some((&c.name, c.name_range, "constant")),
+        Member::Signal(s) => Some((&s.name, s.name_range, "signal")),
+        _ => None,
+    }
+}
+
+/// The declared `(name, name range)` of any named member (`func`/`var`/`const`/`signal`/named
+/// `enum`/inner `class`), for the `CONFUSABLE_IDENTIFIER` scan. An anonymous `enum { … }` has no
+/// name → `None`.
+fn member_decl_name(m: &Member) -> Option<(&SmolStr, TextRange)> {
+    match m {
+        Member::Func(f) => Some((&f.name, f.name_range)),
+        Member::Var(v) => Some((&v.name, v.name_range)),
+        Member::Const(c) => Some((&c.name, c.name_range)),
+        Member::Signal(s) => Some((&s.name, s.name_range)),
+        Member::Class(c) => Some((&c.name, c.name_range)),
+        Member::Enum(e) => e.name.as_ref().map(|n| (n, e.name_range)),
+    }
+}
+
+/// Whether `name` is a `CONFUSABLE_IDENTIFIER` — a non-ASCII identifier that mixes scripts in a
+/// spoofable way (UTS #39 restriction level ≥ `MinimallyRestrictive`, e.g. a Latin identifier with a
+/// Cyrillic/Greek homoglyph like `pаypal`). Pure-ASCII (the overwhelming majority) and legitimate
+/// single-script / CJK-plus-Latin identifiers are never flagged. Mirrors the intent of Godot's
+/// `TextServer` confusable check with zero false positives on ordinary code.
+fn is_confusable_identifier(name: &str) -> bool {
+    use unicode_security::RestrictionLevel as RL;
+    use unicode_security::RestrictionLevelDetection;
+    if name.is_ascii() {
+        return false; // the fast path for ~all real identifiers
+    }
+    name.detect_restriction_level() >= RL::MinimallyRestrictive
+}
+
 /// The NAME range of the file's `class_name` declaration, trimmed to the bare identifier (the
 /// `Name` CST node absorbs leading inter-token trivia). `None` if the file declares no `class_name`
 /// or the decl has no name token. Mirrors `item_tree::trimmed_name_range` / navigation's
@@ -754,6 +1145,21 @@ enum Expectation {
     Has(Ty),
 }
 
+/// Navigate a dotted inner-class path (`Inner` / `Outer.Inner`) from a file's top item-tree to the
+/// target [`InnerClassItem`]. `None` if any segment isn't an inner class.
+fn find_inner_class<'a>(tree: &'a ItemTree, path: &str) -> Option<&'a InnerClassItem> {
+    let mut members: &'a [Member] = &tree.members;
+    let mut found: Option<&'a InnerClassItem> = None;
+    for seg in path.split('.') {
+        found = members.iter().find_map(|m| match m {
+            Member::Class(c) if c.name == seg => Some(c),
+            _ => None,
+        });
+        members = &found?.tree.members;
+    }
+    found
+}
+
 struct Cx<'a> {
     db: &'a dyn Db,
     api: &'a EngineApi,
@@ -769,9 +1175,10 @@ struct Cx<'a> {
     raw_warnings: Vec<RawWarning>,
     /// Function-scoped local bindings (GDScript locals are function-, not block-, scoped).
     locals: FxHashMap<SmolStr, Ty>,
-    /// The names of locals/params that were *read* during the walk — drives the `UNUSED_*` family
-    /// (a declared binding whose name never appears here is unused). Conservative: a write-only use
-    /// also records the name (no false positives, only the occasional missed warning).
+    /// The names of locals/params that were *read* during the walk — drives the `UNUSED_*` family (a
+    /// declared binding whose name never appears here is unused). A bare assignment LHS (`x = …`) is a
+    /// write, NOT a read, and is excluded (so an assigned-but-never-read local is correctly unused);
+    /// a compound `x += …` still reads via its RHS, and a receiver / index target reads the base.
     used_locals: FxHashSet<SmolStr>,
     /// The active narrowing env for the current statement, keyed by a dotted access path. Rebuilt
     /// per statement from [`Cx::flow`] (Workstream 2) — not mutated ad-hoc anymore.
@@ -1055,8 +1462,42 @@ impl Cx<'_> {
             Stmt::Assert(cond) => {
                 if let Some(cond) = cond {
                     self.infer_expr(cond, &Expectation::None);
+                    self.check_assert_constant(cond);
                 }
             }
+        }
+    }
+
+    /// `ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE` — fire when the assert condition is a constant
+    /// with a known boolean value (Godot `resolve_assert`: a constant condition is booleanized and
+    /// warned). Sound subset via [`Cx::const_bool_of`]: a literal `true`/`false`, or `null` (false).
+    fn check_assert_constant(&mut self, cond: ExprId) {
+        let Some(always) = self.const_bool_of(cond) else {
+            return;
+        };
+        let (code, msg) = if always {
+            (
+                WarningCode::AssertAlwaysTrue,
+                "The assert condition is always true, so this assert has no effect.",
+            )
+        } else {
+            (
+                WarningCode::AssertAlwaysFalse,
+                "The assert condition is always false, so this assert will always fail.",
+            )
+        };
+        self.warn(self.range_of(cond), code, msg.to_owned());
+    }
+
+    /// The constant boolean value of `expr`, when it is a literal whose booleanization is known — a
+    /// bool literal, or `null` (false). `None` for any other / non-constant expression (the sound
+    /// default: no false `ASSERT_ALWAYS_*`). Mirrors Godot's `reduced_value.booleanize()` restricted
+    /// to the literal forms (named-constant / arithmetic folding is deliberately not attempted).
+    fn const_bool_of(&self, expr: ExprId) -> Option<bool> {
+        match self.body.expr(expr) {
+            Expr::Literal(Literal::Bool(b)) => Some(*b),
+            Expr::Literal(Literal::Null) => Some(false),
+            _ => None,
         }
     }
 
@@ -1122,30 +1563,36 @@ impl Cx<'_> {
         };
         if self.is_func_body {
             let what = if v.is_const { "constant" } else { "variable" };
-            if shadows_param || shadows_member {
-                let outer = if shadows_param {
-                    "parameter"
-                } else {
-                    "class member"
-                };
-                self.warn(
-                    v.name_range,
-                    WarningCode::ShadowedVariable,
-                    format!(
-                        "The local {what} \"{}\" shadows a {outer} of the same name.",
-                        v.name
-                    ),
-                );
-            } else if self.engine_base_has_value_member(&v.name) {
-                // An own-member shadow already won above; only a *base*-member shadow reaches here.
-                self.warn(
-                    v.name_range,
-                    WarningCode::ShadowedVariableBaseClass,
-                    format!(
-                        "The local {what} \"{}\" shadows a member of a base class.",
-                        v.name
-                    ),
-                );
+            // A global-identifier shadow takes precedence over a variable/base-class shadow (Godot's
+            // `is_shadowing` checks globals first and returns), so the variable-shadow is emitted only
+            // when the name does NOT shadow a global — the global one is emitted by the binding
+            // post-pass in `infer`, keeping a single warning per declaration.
+            if shadowed_global_kind(self.db, self.api, &v.name).is_none() {
+                if shadows_param || shadows_member {
+                    let outer = if shadows_param {
+                        "parameter"
+                    } else {
+                        "class member"
+                    };
+                    self.warn(
+                        v.name_range,
+                        WarningCode::ShadowedVariable,
+                        format!(
+                            "The local {what} \"{}\" shadows a {outer} of the same name.",
+                            v.name
+                        ),
+                    );
+                } else if self.engine_base_has_value_member(&v.name) {
+                    // An own-member shadow already won above; only a *base*-member shadow reaches here.
+                    self.warn(
+                        v.name_range,
+                        WarningCode::ShadowedVariableBaseClass,
+                        format!(
+                            "The local {what} \"{}\" shadows a member of a base class.",
+                            v.name
+                        ),
+                    );
+                }
             }
             // ENUM_VARIABLE_WITHOUT_DEFAULT — a local typed as an enum with no initializer (the
             // implicit `0` may not name a valid enum value). Only an explicit `Ty::Enum` annotation.
@@ -1354,7 +1801,7 @@ impl Cx<'_> {
         match lit {
             Literal::Int => self.int_ty(),
             Literal::Float | Literal::MathConst => self.float_ty(),
-            Literal::Bool => self.bool_ty(),
+            Literal::Bool(_) => self.bool_ty(),
             Literal::Str => self.builtin("String"),
             Literal::StringName => self.builtin("StringName"),
             Literal::NodePath => self.builtin("NodePath"),
@@ -1382,9 +1829,22 @@ impl Cx<'_> {
         let Some(path) = path else {
             return fallback; // computed `get_node(var)` — stays `Node`
         };
+        // An absolute `/root/<Autoload>` access resolves to the autoload's type — singleton OR
+        // loaded-but-not-global (both live at `/root/Name`). Independent of any owning scene. A deeper
+        // tail (`/root/Name/Child`) would need to walk the autoload's own scene; left as the seam.
+        if !unique && let Some(ty) = self.resolve_root_autoload_path(path) {
+            return ty;
+        }
         let Some(ctx) = self.owning_scene() else {
             return fallback; // no scene attaches this script (dynamic UI / single-file)
         };
+        // Multi-scene attachment (M2 §6.3): a `$Path` may resolve to a different node type in each
+        // attaching scene, so type it as the COMMON BASE across all of them (never the first-scene
+        // type, which could be wrong for another scene). If any scene can't resolve it identically,
+        // degrade to `Node` — never a false positive and never a false `INVALID_NODE_PATH`.
+        if ctx.ambiguous {
+            return self.union_node_ty(path, unique).unwrap_or(fallback);
+        }
         let resolution = if unique {
             ctx.model.classify_unique(path)
         } else {
@@ -1396,7 +1856,7 @@ impl Cx<'_> {
                 .node(idx)
                 .and_then(|n| self.scene_node_ty(&ctx.model, n, 0))
                 .unwrap_or(fallback),
-            R::Missing if !ctx.ambiguous => {
+            R::Missing => {
                 let what = if unique { "unique name" } else { "node path" };
                 let sigil = if unique { "%" } else { "$" };
                 self.emit(
@@ -1422,9 +1882,77 @@ impl Cx<'_> {
                     })
                     .unwrap_or(fallback)
             }
-            // ambiguous miss / escape (`..`/absolute) → `Node`, never a false warning
-            _ => fallback,
+            // An `..`/absolute escape out of the slice → `Node`, never a false warning.
+            R::Escaped => fallback,
         }
+    }
+
+    /// Union-type a `$Path`/`%Unique` across **every** scene that attaches this script (the rare
+    /// multi-scene case): resolve the path in each scene, then take the COMMON BASE of the per-scene
+    /// node types. `None` (→ caller degrades to `Node`) if any scene fails to resolve the path the
+    /// same way — keeping the no-false-positive contract on an ambiguous attachment.
+    fn union_node_ty(&self, path: &str, unique: bool) -> Option<Ty> {
+        use gdscript_scene::NodePathResolution as R;
+        let res_path = self.self_res_path()?;
+        let root = self.db.source_root()?;
+        let attaches = crate::queries::script_scene_attachments(self.db, root)
+            .get(res_path.as_str())
+            .cloned()?;
+        let mut acc: Option<Ty> = None;
+        for (scene_file, attach) in &attaches {
+            let ft = self.db.file_text(*scene_file)?;
+            let model = crate::queries::scene_model(self.db, ft);
+            let resolution = if unique {
+                model.classify_unique(path)
+            } else {
+                model.classify_path_from(*attach, path)
+            };
+            let R::Resolved(idx) = resolution else {
+                return None; // a miss / escape / into-instance in some scene → bail to `Node`
+            };
+            let ty = model
+                .node(idx)
+                .and_then(|n| self.scene_node_ty(&model, n, 0))?;
+            acc = Some(match acc {
+                None => ty,
+                Some(prev) => self.common_base(&prev, &ty),
+            });
+        }
+        acc
+    }
+
+    /// The common base of two scene-node types — the lowest engine class both descend from (walk
+    /// `a`'s ancestor chain, return the first that `b` is a subclass of). Identical types collapse to
+    /// themselves; a `ScriptRef` or any mixed pair degrades to the `Node` floor (the engine base for
+    /// every scene node), which is always a sound supertype.
+    fn common_base(&self, a: &Ty, b: &Ty) -> Ty {
+        if a == b {
+            return a.clone();
+        }
+        if let (Ty::Object(ca), Ty::Object(cb)) = (a, b) {
+            let mut cur = Some(*ca);
+            while let Some(c) = cur {
+                if self.api.is_subclass(*cb, c) {
+                    return Ty::Object(c);
+                }
+                cur = self.api.class(c).base;
+            }
+        }
+        self.node_ty()
+    }
+
+    /// Resolve an absolute `/root/<Autoload>` node path to the autoload's type (singleton or
+    /// loaded-but-not-global — both are children of the scene-tree root). `None` for any other path,
+    /// including a deeper tail (`/root/Name/Child`, which would need the autoload's own scene) — those
+    /// degrade to the `Node` seam with no false positive.
+    fn resolve_root_autoload_path(&self, path: &str) -> Option<Ty> {
+        let name = path.strip_prefix("/root/")?;
+        // Only the autoload node itself (no trailing segment) for now.
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        let ty = resolve::resolve_autoload_any(self.db, name);
+        (!ty.is_uninformative()).then_some(ty)
     }
 
     /// The owning-scene context for the current file (scene + attach node + multi-scene ambiguity).
@@ -1462,6 +1990,37 @@ impl Cx<'_> {
             }
         }
         self.instance_root_ty(scene, node, depth)
+            .or_else(|| self.override_child_ty(scene, node, depth))
+    }
+
+    /// An **override child** *under* an instance: a node added/overridden in the outer scene beneath
+    /// an `instance=` boundary (`[node name="Sprite" parent="Enemy"]` over an instanced `enemy.tscn`),
+    /// carrying no own `type=`/`script`/`instance=` — so its real type lives in the instanced
+    /// sub-scene. Walk up to the nearest instance-boundary ancestor, then type the node by its same
+    /// path *inside* that sub-scene (so the outer override of `enemy.tscn`'s `Sprite` types as the
+    /// sub-scene's `Sprite`, not bare `Node`). `None` if the node is not under an instance (the
+    /// caller then floors to `Node`, unchanged). Depth-bounded against an instancing cycle.
+    fn override_child_ty(&self, scene: &SceneModel, node: &SceneNode, depth: u32) -> Option<Ty> {
+        if depth >= 16 {
+            return None;
+        }
+        let mut segs_rev: Vec<String> = vec![node.name.to_string()];
+        let mut parent_idx = node.parent_idx?;
+        let mut guard = 0u32;
+        loop {
+            let parent = scene.node(parent_idx)?;
+            if parent.instance.is_some() {
+                segs_rev.reverse();
+                let rel = segs_rev.join("/");
+                return self.resolve_into_instance_ty(scene, parent, &rel, depth + 1);
+            }
+            segs_rev.push(parent.name.to_string());
+            parent_idx = parent.parent_idx?;
+            guard += 1;
+            if guard > 4096 {
+                return None;
+            }
+        }
     }
 
     /// An instanced node (`instance=ExtResource(id)`) takes the type of the instanced sub-scene's
@@ -1818,12 +2377,100 @@ impl Cx<'_> {
             Ty::Builtin(_) | Ty::Array(_) | Ty::Dict(..) | Ty::Callable | Ty::Signal(_) => {
                 self.builtin_member_ty(&recv_ty, name, name_range, as_method)
             }
-            // Enum value access (`MyEnum.VALUE`) is an `int`.
-            Ty::Enum(_) => self.int_ty(),
+            // Accessing a member of an enum namespace (`State.IDLE`) yields the enum type itself —
+            // an enum value (freely int-assignable via `ty::is_assignable`). Was `int`, which lost
+            // the enum type and false-`INFERENCE_ON_VARIANT`'d a same-file `var x := State.IDLE`.
+            Ty::Enum(er) => Ty::Enum(er.clone()),
             // A cross-file script reference: resolve the member against its (own) member table.
             Ty::ScriptRef(sref) => self.script_member_ty(*sref, name, as_method),
+            // An inner-class value/instance: resolve against its own item-tree + `extends` chain.
+            Ty::InnerClass(iref) => self.inner_class_member_ty(iref, name, as_method),
             _ => Ty::Variant,
         }
+    }
+
+    /// Resolve `name` on an inner-class value/instance (`Ty::InnerClass`). `Inner.new()` constructs an
+    /// instance (the same `InnerClass`); otherwise the inner class's own members (typed by their
+    /// annotation — lossy, like the cross-file `ScriptRef` path: an inferred/unannotated member seams)
+    /// then its `extends` chain. The seam (`Unknown`) for an unresolved member — never a false
+    /// `UNSAFE_*`.
+    fn inner_class_member_ty(
+        &self,
+        iref: &crate::ty::InnerClassRef,
+        name: &str,
+        as_method: bool,
+    ) -> Ty {
+        if name == "new" && as_method {
+            return Ty::InnerClass(iref.clone());
+        }
+        self.inner_member_walk(iref, name, as_method, 0)
+            .unwrap_or(Ty::Unknown)
+    }
+
+    /// Walk an inner class's own members, then its `extends` base (an engine class, a `class_name`, or
+    /// another inner/script class), for `name`. Depth-bounded like [`script_member_walk`].
+    fn inner_member_walk(
+        &self,
+        iref: &crate::ty::InnerClassRef,
+        name: &str,
+        as_method: bool,
+        depth: u32,
+    ) -> Option<Ty> {
+        if depth > 32 {
+            return None;
+        }
+        let ft = self.db.file_text(FileId(iref.file))?;
+        let tree = crate::queries::item_tree(self.db, ft);
+        let inner = find_inner_class(&tree, &iref.path)?;
+        if let Some(m) = inner.tree.member(name) {
+            return self.inner_member_item_ty(m, as_method, iref);
+        }
+        // Not an own member — walk the inner class's `extends` base.
+        let res_path = self.self_res_path();
+        match resolve::resolve_base(self.db, self.api, &inner.tree, res_path.as_deref()) {
+            Ty::Object(class) => self
+                .api
+                .lookup_member(class, name)
+                .map(|m| self.member_ref_ty(&m, as_method)),
+            Ty::ScriptRef(base) => self.script_member_walk(base, name, as_method, depth + 1),
+            Ty::InnerClass(base) => self.inner_member_walk(&base, name, as_method, depth + 1),
+            _ => None,
+        }
+    }
+
+    /// Type an inner class's own member by its written **annotation** (the inner body isn't inferred
+    /// here — Increment 2 adds that). An unannotated `var`/`const` or an untyped `func` return seams.
+    fn inner_member_item_ty(
+        &self,
+        m: &Member,
+        as_method: bool,
+        iref: &crate::ty::InnerClassRef,
+    ) -> Option<Ty> {
+        Some(match m {
+            Member::Func(f) => {
+                if as_method {
+                    f.return_type.as_deref().map_or(Ty::Variant, |t| {
+                        resolve::resolve_type_name(self.db, self.api, t)
+                    })
+                } else {
+                    Ty::Callable
+                }
+            }
+            Member::Var(v) => resolve::resolve_type_name(self.db, self.api, v.type_ref.as_deref()?),
+            Member::Const(c) => {
+                resolve::resolve_type_name(self.db, self.api, c.type_ref.as_deref()?)
+            }
+            Member::Signal(_) => Ty::Signal(None),
+            Member::Enum(e) => Ty::Enum(EnumRef {
+                qualified: e.name.clone()?,
+                bitfield: false,
+            }),
+            // A nested inner class → `Ty::InnerClass` with the extended dotted path.
+            Member::Class(c) => Ty::InnerClass(crate::ty::InnerClassRef {
+                file: iref.file,
+                path: SmolStr::new(format!("{}.{}", iref.path, c.name)),
+            }),
+        })
     }
 
     /// A member of a cross-file script (`ScriptRef`): looked up in the script's own member table
@@ -2224,10 +2871,19 @@ impl Cx<'_> {
 
     // ---- name resolution (local → class member → inherited → global) ----
 
+    /// The `Ty`-producing half of the bare-name lookup. Its precedence is the **canonical order**
+    /// documented on [`crate::def::resolve_name_to_def`] (local → own member → inherited member →
+    /// engine global → `class_name` global → autoload) — kept in lockstep with that identity-producing
+    /// copy by the `classify_and_infer_agree_*` tests (gdscript-ide). Unlike that copy, this one is
+    /// woven with flow-narrowing and the `UNUSED`/`UNASSIGNED` side-effects (it runs mid-inference),
+    /// which is why the two are intentionally separate functions rather than one.
     fn resolve_name(&mut self, id: ExprId, name: &str) -> Ty {
-        // Record a read of a local/param for the `UNUSED_*` analysis (before the narrowing check,
-        // so a narrowed read still counts as used).
-        if self.locals.contains_key(name) {
+        // Record a *read* of a local/param for the `UNUSED_*` analysis (before the narrowing check,
+        // so a narrowed read still counts as used). The direct LHS of an assignment (`x = …`) is a
+        // WRITE, not a read — excluding it lets `UNUSED_VARIABLE` catch an assigned-but-never-read
+        // local (Godot's precise behaviour). A compound `x += …` still reads `x` via its RHS NameRef
+        // (a distinct expr), and a receiver / index target (`x.f()`, `x[i] = …`) is a read of `x`.
+        if self.locals.contains_key(name) && !self.assign_lhs.contains(&id) {
             self.used_locals.insert(SmolStr::new(name));
         }
         // UNASSIGNED_VARIABLE (Workstream 2) — a *read* of a typed-no-init local that is not
@@ -2307,8 +2963,28 @@ impl Cx<'_> {
                     }
                 }
                 Some(Member::Signal(_)) => Ty::Signal(None),
-                Some(Member::Class(_)) => Ty::Unknown,
-                Some(Member::Enum(_)) | None => Ty::Variant,
+                // An inner `class Name:` used as a value → `Ty::InnerClass` (was the `Unknown` seam),
+                // so `Inner.CONST` / `Inner.new()` / a typed instance's members resolve against its own
+                // item-tree. The path is the inner class's name (resolved from the top-level scope;
+                // nested inner classes get their dotted path once inner bodies are inferred).
+                Some(Member::Class(c)) => match &self.self_ty {
+                    Ty::ScriptRef(sref) => Ty::InnerClass(crate::ty::InnerClassRef {
+                        file: sref.0,
+                        path: c.name.clone(),
+                    }),
+                    _ => Ty::Unknown,
+                },
+                // A same-file named `enum State` used as a value/namespace → the enum type, so
+                // `State.IDLE` (member access below) types as `State`, not a false-`INFERENCE_ON_
+                // VARIANT` seam. An anonymous enum has no namespace name (its variants are direct
+                // class constants), so it stays the seam.
+                Some(Member::Enum(e)) => e.name.as_ref().map_or(Ty::Variant, |n| {
+                    Ty::Enum(EnumRef {
+                        qualified: n.clone(),
+                        bitfield: false,
+                    })
+                }),
+                None => Ty::Variant,
             },
         }
     }
@@ -2510,12 +3186,19 @@ mod tests {
     /// Every code inference produced — the ungated `diagnostics` plus the severity-free
     /// `raw_warnings` (the gateable Godot codes, post-W1-M0). Infer-level tests assert what the
     /// checker *records*; the gate-level resolution is tested in `crate::warnings`.
+    /// The opt-in declaration-strictness codes — filtered out of [`codes`] / [`file_codes`] so they
+    /// don't pollute the hundreds of focused fixtures (they fire on essentially every untyped /
+    /// inferred local). A test that targets them reads the raw warnings directly (see
+    /// `untyped_and_inferred_declarations_warn`).
+    const DECLARATION_STRICTNESS: &[&str] = &["UNTYPED_DECLARATION", "INFERRED_DECLARATION"];
+
     fn codes(h: &Harness) -> Vec<&str> {
         h.result
             .diagnostics
             .iter()
             .map(|d| d.code.as_str())
             .chain(h.result.raw_warnings.iter().map(|w| w.code.as_str()))
+            .filter(|c| !DECLARATION_STRICTNESS.contains(c))
             .collect()
     }
 
@@ -2531,6 +3214,7 @@ mod tests {
             .iter()
             .map(|d| d.code.clone())
             .chain(fi.raw_warnings.iter().map(|w| w.code.as_str().to_owned()))
+            .filter(|c| !DECLARATION_STRICTNESS.contains(&c.as_str()))
             .collect()
     }
 
@@ -2550,6 +3234,51 @@ mod tests {
     fn type_mismatch_on_hard_annotation() {
         let h = infer_first_func("func f():\n\tvar s: String = 5\n");
         assert!(codes(&h).contains(&TYPE_MISMATCH));
+    }
+
+    #[test]
+    fn vector_scalar_compound_assign_is_not_a_mismatch() {
+        // `v *= 0.5` desugars to `v = v * 0.5` : Vector2 — not the scalar float (the old collapse).
+        let h = infer_first_func(
+            "func f() -> Vector2:\n\tvar v := Vector2()\n\tv *= 0.5\n\treturn v\n",
+        );
+        assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn array_literal_to_packed_array_is_allowed() {
+        let h = infer_first_func("func f():\n\tvar p: PackedStringArray = [\"a\", \"b\"]\n");
+        assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn vector2i_to_vector2_is_allowed() {
+        let h = infer_first_func("func f():\n\tvar v: Vector2 = Vector2i(1, 2)\n");
+        assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn local_enum_member_access_types_as_the_enum_not_variant() {
+        // `var x := State.IDLE` (a same-file enum) infers the enum type, not a Variant seam — so no
+        // false INFERENCE_ON_VARIANT.
+        let h = infer_first_func(
+            "enum State { IDLE, RUN }\nfunc f():\n\tvar x := State.IDLE\n\treturn x\n",
+        );
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn lua_style_dict_key_is_not_an_assignment() {
+        // `{ pos = "x" }` is a dict entry (key `pos`), not the statement `pos = "x"` — so it must not
+        // check the value against the member `pos`'s type.
+        let h = infer_first_func(
+            "var pos: Vector2\nfunc f():\n\tvar d = { pos = \"x\" }\n\treturn d\n",
+        );
+        assert!(!codes(&h).contains(&TYPE_MISMATCH), "{:?}", codes(&h));
     }
 
     #[test]
@@ -2607,6 +3336,203 @@ mod tests {
             "{:?}",
             codes(&h)
         );
+    }
+
+    #[test]
+    fn local_named_after_a_native_class_warns_shadowed_global() {
+        let h = infer_first_func("func f():\n\tvar Node = 1\n\treturn Node\n");
+        assert!(
+            codes(&h).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn param_named_after_a_builtin_type_warns_shadowed_global() {
+        let h = infer_first_func("func f(Vector2):\n\treturn Vector2\n");
+        assert!(
+            codes(&h).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn member_named_after_a_native_class_warns_shadowed_global() {
+        let cs = file_codes("var Timer = null\n");
+        assert!(
+            cs.iter().any(|c| c == "SHADOWED_GLOBAL_IDENTIFIER"),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_local_does_not_warn_shadowed_global() {
+        // A no-false-positive guard: a normal identifier is not a global.
+        let h = infer_first_func("func f():\n\tvar count = 1\n\treturn count\n");
+        assert!(
+            !codes(&h).contains(&SHADOWED_GLOBAL_IDENTIFIER),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn global_shadow_takes_precedence_over_variable_shadow() {
+        // A member named after a built-in type (`Color`), shadowed by a local of the same name:
+        // Godot emits SHADOWED_GLOBAL_IDENTIFIER (global wins), NOT SHADOWED_VARIABLE on the local.
+        let cs = file_codes("var Color = null\nfunc f():\n\tvar Color = 1\n\treturn Color\n");
+        assert!(
+            cs.iter().any(|c| c == "SHADOWED_GLOBAL_IDENTIFIER"),
+            "{cs:?}"
+        );
+        assert!(
+            !cs.iter().any(|c| c == "SHADOWED_VARIABLE"),
+            "the local's variable-shadow must be suppressed in favor of the global one: {cs:?}"
+        );
+    }
+
+    #[test]
+    fn assert_true_warns_always_true() {
+        let h = infer_first_func("func f():\n\tassert(true)\n");
+        assert!(codes(&h).contains(&"ASSERT_ALWAYS_TRUE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn assert_false_warns_always_false() {
+        let h = infer_first_func("func f():\n\tassert(false, \"nope\")\n");
+        assert!(
+            codes(&h).contains(&"ASSERT_ALWAYS_FALSE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn assert_null_warns_always_false() {
+        let h = infer_first_func("func f():\n\tassert(null)\n");
+        assert!(
+            codes(&h).contains(&"ASSERT_ALWAYS_FALSE"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn assert_on_a_variable_is_silent() {
+        // No false positive: a runtime condition is not a constant.
+        let h = infer_first_func("func f(x):\n\tassert(x)\n");
+        assert!(
+            !codes(&h).iter().any(|c| c.starts_with("ASSERT_ALWAYS")),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn untyped_and_inferred_declarations_warn() {
+        // The opt-in (default IGNORE) declaration-strictness codes, read from the raw warnings —
+        // `codes()` filters them out so they don't pollute every other fixture.
+        let h = infer_first_func("func f(p):\n\tvar a = 1\n\tvar b := 2\n\tvar c: int = 3\n");
+        let raw: Vec<&str> = h
+            .result
+            .raw_warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect();
+        // The untyped param `p` and untyped `var a` — not the typed `var c` nor the inferred `var b`.
+        let untyped = raw.iter().filter(|c| **c == "UNTYPED_DECLARATION").count();
+        assert_eq!(untyped, 2, "only `p` and `a` are untyped: {raw:?}");
+        let inferred = raw.iter().filter(|c| **c == "INFERRED_DECLARATION").count();
+        assert_eq!(inferred, 1, "only `b` uses `:=`: {raw:?}");
+    }
+
+    #[test]
+    fn confusable_identifier_warns_on_a_mixed_script_local() {
+        // `p\u{0430}ypal` — Latin letters with a Cyrillic `а` (U+0430): a homoglyph of ASCII `paypal`.
+        let h = infer_first_func("func f():\n\tvar p\u{0430}ypal = 1\n\treturn p\u{0430}ypal\n");
+        assert!(
+            codes(&h).contains(&"CONFUSABLE_IDENTIFIER"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn an_ordinary_ascii_identifier_is_not_confusable() {
+        let h = infer_first_func("func f():\n\tvar paypal = 1\n\treturn paypal\n");
+        assert!(
+            !codes(&h).contains(&"CONFUSABLE_IDENTIFIER"),
+            "{:?}",
+            codes(&h)
+        );
+    }
+
+    #[test]
+    fn a_member_with_a_confusable_name_warns() {
+        // Cyrillic `а` inside `balance`.
+        let cs = file_codes("var b\u{0430}lance = 0\n");
+        assert!(cs.iter().any(|c| c == "CONFUSABLE_IDENTIFIER"), "{cs:?}");
+    }
+
+    #[test]
+    fn an_assigned_but_never_read_local_is_unused() {
+        // Precise read-vs-write: `x` is only assigned, never read → UNUSED_VARIABLE.
+        let h = infer_first_func("func f():\n\tvar x = 1\n\tx = 2\n");
+        assert!(codes(&h).contains(&"UNUSED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn a_read_local_is_not_unused() {
+        let h = infer_first_func("func f() -> int:\n\tvar x = 1\n\tx = 2\n\treturn x\n");
+        assert!(!codes(&h).contains(&"UNUSED_VARIABLE"), "{:?}", codes(&h));
+    }
+
+    #[test]
+    fn unused_private_class_variable_warns() {
+        let cs = file_codes("var _cache = 0\nfunc f():\n\tpass\n");
+        assert!(
+            cs.iter().any(|c| c == "UNUSED_PRIVATE_CLASS_VARIABLE"),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_private_class_variable_is_silent() {
+        let cs = file_codes("var _cache = 0\nfunc f() -> int:\n\treturn _cache\n");
+        assert!(
+            !cs.iter().any(|c| c == "UNUSED_PRIVATE_CLASS_VARIABLE"),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn an_exported_private_var_is_not_unused_private() {
+        // No false positive: an `@export`'d `_`-var is set externally (inspector / scene).
+        let cs = file_codes("@export var _hidden = 0\n");
+        assert!(
+            !cs.iter().any(|c| c == "UNUSED_PRIVATE_CLASS_VARIABLE"),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn onready_with_export_warns() {
+        let cs = file_codes("@onready @export var n = null\n");
+        assert!(cs.iter().any(|c| c == "ONREADY_WITH_EXPORT"), "{cs:?}");
+    }
+
+    #[test]
+    fn redundant_static_unload_warns_without_a_static_var() {
+        let cs = file_codes("@static_unload\nclass_name Foo\nvar x = 1\n");
+        assert!(cs.iter().any(|c| c == "REDUNDANT_STATIC_UNLOAD"), "{cs:?}");
+    }
+
+    #[test]
+    fn static_unload_with_a_static_var_is_silent() {
+        let cs = file_codes("@static_unload\nstatic var pool = []\n");
+        assert!(!cs.iter().any(|c| c == "REDUNDANT_STATIC_UNLOAD"), "{cs:?}");
     }
 
     #[test]
