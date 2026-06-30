@@ -206,6 +206,30 @@ impl Analyzer {
     pub fn syntax_tree(&self, uri: String) -> Option<String> {
         self.session.syntax_tree(&uri)
     }
+
+    /// Semantic-highlighting tokens for `uri`, as a JS array.
+    #[wasm_bindgen(js_name = semanticTokens)]
+    #[must_use]
+    pub fn semantic_tokens(&self, uri: String) -> JsValue {
+        to_js(&self.session.semantic_tokens(&uri))
+    }
+
+    /// Format `uri`'s whole document; the tidied text, or `null` for an unknown `uri`.
+    #[must_use]
+    pub fn format(&self, uri: String) -> Option<String> {
+        self.session.format(&uri)
+    }
+
+    /// Format only the lines overlapping the byte range `[start, end)`; a `{ range, new_text }` object,
+    /// or `null` when the selection's lines do not change / `uri` is unknown.
+    #[wasm_bindgen(js_name = formatRange)]
+    #[must_use]
+    pub fn format_range(&self, uri: String, start: u32, end: u32) -> JsValue {
+        match self.session.format_range(&uri, start, end) {
+            Some(v) => to_js(&v),
+            None => JsValue::NULL,
+        }
+    }
 }
 
 impl Default for Analyzer {

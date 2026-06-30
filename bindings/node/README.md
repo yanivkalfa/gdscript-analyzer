@@ -105,6 +105,9 @@ need no `FileId`→URI mapping of your own.
 | `rename(uri, offset, newName)` | object | `{ ok: SourceChange }` or `{ error: RenameError }` |
 | `workspaceSymbols(query)` | array | project-wide symbol search |
 | `syntaxTree(uri)` | string \| `null` | pretty-printed CST (debugging) |
+| `semanticTokens(uri)` | array | semantic-highlighting tokens (source order) |
+| `format(uri)` | string \| `null` | the whole document, reformatted (whitespace/indent only) |
+| `formatRange(uri, start, end)` | object \| `null` | `{ range, new_text }` for the selection's lines |
 
 ```js
 const offset = 38; // a UTF-8 byte offset into the document

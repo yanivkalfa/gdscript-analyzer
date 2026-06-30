@@ -180,6 +180,28 @@ impl AnalysisHandle {
     pub fn syntax_tree(&self, uri: String) -> Option<String> {
         self.session.syntax_tree(&uri)
     }
+
+    /// Semantic-highlighting tokens for `uri`, as a JS array.
+    #[napi]
+    #[must_use]
+    pub fn semantic_tokens(&self, uri: String) -> serde_json::Value {
+        self.session.semantic_tokens(&uri)
+    }
+
+    /// Format `uri`'s whole document; the tidied text, or JS `null` for an unknown `uri`.
+    #[napi]
+    #[must_use]
+    pub fn format(&self, uri: String) -> Option<String> {
+        self.session.format(&uri)
+    }
+
+    /// Format only the lines overlapping the byte range `[start, end)`; a `{ range, new_text }` object,
+    /// or JS `null` when the selection's lines do not change / `uri` is unknown.
+    #[napi]
+    #[must_use]
+    pub fn format_range(&self, uri: String, start: u32, end: u32) -> Option<serde_json::Value> {
+        self.session.format_range(&uri, start, end)
+    }
 }
 
 impl Default for AnalysisHandle {
