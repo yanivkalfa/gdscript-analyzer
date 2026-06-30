@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (under Cargo's 0.x reading: while `0.x`, a breaking change bumps the minor and a
 new feature is a patch).
+## [0.5.0] - 2026-06-30
+
+### Added
+
+- **api,ide:** Hover docs — vendor Godot doc XML, BBCode→Markdown, native-only blob
+
+### Documentation
+
+- Enforce missing_docs on 6 crates + internal-API banners (Stage 9b/9c)
+
+
+
 ## [0.4.0] - 2026-06-28
 
 

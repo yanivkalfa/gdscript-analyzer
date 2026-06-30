@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (under Cargo's 0.x reading: while `0.x`, a breaking change bumps the minor and a
 new feature is a patch).
+## [0.5.0] - 2026-06-30
+
+### Added
+
+- **ide:** Rename a connected method/signal rewrites its scene [connection]s
+- **ide:** Classify a scene node as a renameable symbol (GodotDef::SceneNode)
+- **ide:** Classify the full scene-node reference cascade (parent=, connection, get_node)
+- **ide:** Rename an @export var rewrites its scene property key (A3)
+- **hir:** SHADOWED_GLOBAL_IDENTIFIER for locals, params, and members
+- **hir:** ASSERT_ALWAYS_TRUE / ASSERT_ALWAYS_FALSE
+- **hir:** UNTYPED_DECLARATION / INFERRED_DECLARATION (opt-in)
+- **hir:** Resolve a non-* autoload via get_node("/root/Name")
+- CONFUSABLE_IDENTIFIER + Unicode (UAX #31) identifier lexing
+- **hir:** First-class item-tree annotations + annotation lifecycle checks
+- **hir:** Precise read-vs-write UNUSED + UNUSED_PRIVATE_CLASS_VARIABLE
+- **hir:** Union-type a node path across multi-scene attachments
+- **hir:** Type override-children under an instanced sub-scene (Stage 4.23)
+- **hir:** Type inner-class values + member access (Stage 4.24 inc.1)
+- **hir:** Infer inner-class method bodies (Stage 4.24 inc.2)
+
+### Changed
+
+- **hir:** Single-source + CI-lock the classify/infer name-lookup order (Stage 4.20)
+
+### Documentation
+
+- Enforce missing_docs on 6 crates + internal-API banners (Stage 9b/9c)
+
+### Fixed
+
+- **hir:** Eliminate 3 TYPE_MISMATCH false-positive classes (corpus 55->1)
+- **hir:** Type same-file enums (INFERENCE_ON_VARIANT corpus 33->11)
+- **hir:** Keep inner-class navigation correct-or-refuse (Stage 4.24 inc.2 guard)
+
+
+
 ## [0.4.0] - 2026-06-28
 
 ### Added
