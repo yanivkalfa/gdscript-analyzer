@@ -214,6 +214,47 @@ impl Session {
         }
     }
 
+    /// Semantic-highlighting tokens for `uri` (a JSON array of
+    /// [`SemanticToken`](gdscript_base::SemanticToken)s in source order). Empty for an unknown `uri`.
+    #[must_use]
+    pub fn semantic_tokens(&self, uri: &str) -> Value {
+        match self.file_id(uri) {
+            Some(file) => self.enriched(
+                &self
+                    .host
+                    .analysis()
+                    .semantic_tokens(file)
+                    .unwrap_or_default(),
+            ),
+            None => empty_array(),
+        }
+    }
+
+    /// Format `uri`'s whole document; the tidied text, or `None` (→ JS `null`) for an unknown `uri`.
+    /// Whitespace + indentation only — it never changes meaning (it falls back to the original on
+    /// anything it cannot safely reformat).
+    #[must_use]
+    pub fn format(&self, uri: &str) -> Option<String> {
+        let file = self.file_id(uri)?;
+        self.host.analysis().format(file).ok().flatten()
+    }
+
+    /// Format only the lines overlapping the byte range `[start, end)` (editor "format selection").
+    /// A JSON object `{ "range": { "start", "end" }, "new_text" }`, or `None` (→ JS `null`) when the
+    /// selection's lines do not change or `uri` is unknown.
+    #[must_use]
+    pub fn format_range(&self, uri: &str, start: u32, end: u32) -> Option<Value> {
+        let file = self.file_id(uri)?;
+        self.host
+            .analysis()
+            .format_range(file, start, end)
+            .ok()
+            .flatten()
+            .map(|(s, e, new_text)| {
+                serde_json::json!({ "range": { "start": s, "end": e }, "new_text": new_text })
+            })
+    }
+
     /// Completions at a byte `offset` in `uri` (a JSON array).
     #[must_use]
     pub fn completions(&self, uri: &str, offset: u32) -> Value {
@@ -390,6 +431,26 @@ mod tests {
         assert_eq!(diags[0]["code"], "INTEGER_DIVISION");
         let syms = s.document_symbols("file:///main.gd");
         assert_eq!(syms[0]["name"], "f");
+    }
+
+    #[test]
+    fn format_and_semantic_tokens_shapes() {
+        let mut s = Session::new();
+        s.open("file:///a.gd", "func  f( ):\n\tvar x := 1\n", None);
+        // A known file: `format` returns the tidied text; `semantic_tokens` is a non-empty array.
+        assert!(
+            s.format("file:///a.gd").is_some(),
+            "format returns text for a known file"
+        );
+        let toks = s.semantic_tokens("file:///a.gd");
+        assert!(
+            toks.as_array().is_some_and(|a| !a.is_empty()),
+            "semantic_tokens is a non-empty array for real code: {toks}"
+        );
+        // An unknown uri: `null` / empty, never a panic.
+        assert_eq!(s.format("nope"), None);
+        assert_eq!(s.format_range("nope", 0, 1), None);
+        assert_eq!(s.semantic_tokens("nope"), json!([]));
     }
 
     #[test]
