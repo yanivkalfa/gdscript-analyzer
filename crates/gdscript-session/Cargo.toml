@@ -1,8 +1,9 @@
 [package]
 name = "gdscript-session"
-description = "URI-keyed, JSON-returning session over gdscript-ide — the shared, pure-Rust core wrapped by the napi (gdscript-ffi) and wasm (gdscript-wasm) bindings."
+description = "URI-keyed session over gdscript-ide returning structured serde_json::Value results — the shared, pure-Rust core wrapped by the napi (gdscript-ffi) and wasm (gdscript-wasm) bindings."
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -120,5 +120,90 @@ fn bench_keystroke(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench, bench_keystroke);
+/// Project-wide find-references cost (`TECH_DEBT` Stage 4.21 measurement): a `class_name` + a method
+/// referenced in EVERY file of a 150-file project — the worst case a precise referrer reverse-index
+/// would optimize. find-refs word-boundary pre-filters then re-classifies each hit; this measures
+/// whether that re-classify cost is a real regression (→ build the index) or negligible (→ the
+/// pre-filter already suffices). Native-only (the engine model is required for cross-file resolve).
+fn bench_find_references(c: &mut Criterion) {
+    const N: u32 = 150;
+    const BODY: &str =
+        "extends Node\nfunc use_it() -> int:\n\tvar s := Shared.new()\n\treturn s.ping()\n";
+    let base = "class_name Shared\nfunc ping() -> int:\n\treturn 1\n";
+
+    let mut host = AnalysisHost::new();
+    let mut change = Change::new();
+    change.change_file(FileId(0), base);
+    change.set_file_path(FileId(0), "res://shared.gd");
+    for i in 1..=N {
+        change.change_file(FileId(i), BODY);
+        change.set_file_path(FileId(i), format!("res://f{i}.gd"));
+    }
+    host.apply_change(change);
+    let analysis = host.analysis();
+    let _ = analysis.diagnostics(FileId(0)).unwrap(); // warm the engine model + first analyses
+
+    // Member (`ping`) referenced in all 150 files via `s.ping()` — the Member find-refs path.
+    let ping = FilePosition {
+        file: FileId(0),
+        offset: u32::try_from(base.find("ping").unwrap()).unwrap(),
+    };
+    c.bench_function("find_references_member_150files", |b| {
+        b.iter(|| black_box(analysis.find_references(black_box(ping)).unwrap()));
+    });
+
+    // Global (`class_name Shared`) referenced in all 150 files — the Global find-refs path.
+    let shared = FilePosition {
+        file: FileId(0),
+        offset: u32::try_from(base.find("Shared").unwrap()).unwrap(),
+    };
+    c.bench_function("find_references_global_150files", |b| {
+        b.iter(|| black_box(analysis.find_references(black_box(shared)).unwrap()));
+    });
+}
+
+/// Project-scale **cold** analysis (Phase-6 W4 / burndown Stage 7.30): the time to diagnose every
+/// file of a freshly-loaded multi-file project from a cold `AnalysisHost` (no salsa cache warmed) —
+/// the realistic CLI `check`/LSP-startup cost the warm single-file benches don't capture. Each file is
+/// ~300 loc of typed GDScript; the engine model deserialize is amortized across the project (it is a
+/// one-time, project-independent cost, so it is warmed out first). This is also the measurement that
+/// informs the salsa-LRU decision (Stage 7.33): a cold full-project pass is what an LRU would trade
+/// recompute against.
+fn bench_cold_project(c: &mut Criterion) {
+    const N: u32 = 50; // ~50 × ~300 loc ≈ a 15k-loc project
+    let src = sample_script();
+
+    // Warm the engine model once (project-independent; excluded from the cold project cost).
+    {
+        let (a, f) = analysis_for(&src);
+        let _ = a.diagnostics(f).unwrap();
+    }
+
+    c.bench_function("cold_project_diagnostics_50x300loc", |b| {
+        b.iter(|| {
+            // A fresh host each iteration = a genuinely cold project (cold salsa cache).
+            let mut host = AnalysisHost::new();
+            let mut change = Change::new();
+            for i in 0..N {
+                change.change_file(FileId(i), src.as_str());
+                change.set_file_path(FileId(i), format!("res://f{i}.gd"));
+            }
+            host.apply_change(change);
+            let analysis = host.analysis();
+            let mut total = 0usize;
+            for i in 0..N {
+                total += black_box(analysis.diagnostics(black_box(FileId(i))).unwrap()).len();
+            }
+            black_box(total)
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench,
+    bench_keystroke,
+    bench_find_references,
+    bench_cold_project
+);
 criterion_main!(benches);

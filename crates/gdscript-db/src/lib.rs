@@ -1,5 +1,8 @@
 //! `gdscript-db` — the input layer for the analyzer.
 //!
+//! > **Internal layer (not a stable API).** Depend on [`gdscript-ide`](https://docs.rs/gdscript-ide) (the public surface); the items here
+//! > may change between releases.
+//!
 //! Holds the virtual file system (`FileId` → text, always injected — never `std::fs`), the
 //! project model, and (from Phase 3) the **salsa** query graph: `#[salsa::input]`s set via
 //! `apply_change`, `#[salsa::tracked]` derived queries, durability tiers. The Phase-0/1/2
@@ -32,6 +35,21 @@ use salsa::{Durability, Setter};
 /// The database trait `gdscript-hir` / `gdscript-ide` depend on. `#[salsa::db]` on the *trait*
 /// makes it a salsa supertrait, so any `&dyn Db` upcasts to `&dyn salsa::Database` and every
 /// `#[salsa::tracked]` free function downstream can take `db: &dyn Db`.
+/// A host/CLI-level override of the warning-strictness baseline `type_diagnostics` resolves against
+/// (regardless of `project.godot` presence). A plain (non-salsa) per-session policy knob: it is read
+/// **only** inside the non-tracked `type_diagnostics`, so it never enters the salsa query graph and
+/// cannot break the W1 firewall (a warning-level change must never re-run inference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WarningOverride {
+    /// Auto-select by project presence (the default): standalone ⇒ strict, project ⇒ engine defaults.
+    #[default]
+    None,
+    /// Force the strict baseline (the opt-in group promoted to WARN) even with a `project.godot`.
+    Strict,
+    /// Force Godot's engine defaults (the opt-in group stays IGNORE) even in standalone mode.
+    EngineDefaults,
+}
+
 #[salsa::db]
 pub trait Db: salsa::Database {
     /// The text input for `file`, or `None` if no text has been set for it.
@@ -45,6 +63,9 @@ pub trait Db: salsa::Database {
     /// The project's `project.godot` config, or `None` in single-file mode. The autoload registry
     /// (M4) takes this as its salsa-tracked input.
     fn project_config(&self) -> Option<ProjectConfig>;
+    /// The host-level warning-strictness override (default [`WarningOverride::None`]). A plain
+    /// field, NOT a salsa input — read only by the downstream gate, so it never re-runs inference.
+    fn warning_override(&self) -> WarningOverride;
 }
 
 /// The VFS leaf: one file's UTF-8 text, as a salsa input, plus its [`FileId`] (so a query
@@ -191,6 +212,9 @@ pub struct RootDatabase {
     /// installs it here via [`RootDatabase::set_engine_api`] (Playbook §4.4). Held outside salsa (a
     /// process-lifetime `&'static`, leaked once).
     engine: Option<&'static EngineApi>,
+    /// The host-level warning-strictness override (CLI `--strict`/`--engine-defaults`). A plain
+    /// field — read only by the non-tracked `type_diagnostics`, never a salsa input.
+    warning_override: WarningOverride,
     /// `wasm32`-only: the [`EngineGeneration`] input that makes a *later* `set_engine_api` invalidate
     /// queries memoized while the model was still absent (so the order "query, then load the engine"
     /// is correct, not just "load, then query"). Lazily created on the first structural change.
@@ -225,6 +249,13 @@ impl RootDatabase {
     /// Remove `file`'s entry from the side table.
     pub fn remove_file(&mut self, file: FileId) {
         self.files.remove(file);
+    }
+
+    /// Set the host-level warning-strictness override (a CLI `--strict`/`--engine-defaults`
+    /// policy). A plain field — changing it does not touch salsa, so it never re-runs inference;
+    /// `type_diagnostics` re-reads it on the next snapshot.
+    pub fn set_warning_override(&mut self, ov: WarningOverride) {
+        self.warning_override = ov;
     }
 
     /// Set the project's `project.godot` text (the loader supplies it on project open / when it
@@ -352,6 +383,10 @@ impl Db for RootDatabase {
 
     fn project_config(&self) -> Option<ProjectConfig> {
         self.config
+    }
+
+    fn warning_override(&self) -> WarningOverride {
+        self.warning_override
     }
 }
 

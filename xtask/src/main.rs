@@ -4,6 +4,7 @@
 //! Rust binary so the automation is cross-platform with no `make`/`bash`/`python` dependency.
 
 mod codegen;
+mod docs;
 mod tasks;
 
 fn main() -> anyhow::Result<()> {

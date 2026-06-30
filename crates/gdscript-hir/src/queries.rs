@@ -144,14 +144,27 @@ pub fn res_path_registry(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolStr
 /// (it iterates only the config text), so it backdates across every `.gd` keystroke.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AutoloadRegistry {
+    /// `*`-flagged autoloads — the bare names that resolve as globals in code.
     singletons: FxHashMap<SmolStr, SmolStr>,
+    /// Non-`*` autoloads — loaded at `/root/Name` but NOT global identifiers. Tracked so a
+    /// `get_node("/root/Name")` access can still resolve them (a singleton lives there too).
+    loaded: FxHashMap<SmolStr, SmolStr>,
 }
 
 impl AutoloadRegistry {
-    /// The resource path of the singleton autoload named `name`, if any.
+    /// The resource path of the **singleton** (`*`-flagged) autoload named `name`, if any — the only
+    /// autoloads exposed as bare-name globals. A non-singleton name returns `None` here (it is not a
+    /// global); use [`resolve_any_path`](AutoloadRegistry::resolve_any_path) for `/root/Name`.
     #[must_use]
     pub fn resolve_path(&self, name: &str) -> Option<&SmolStr> {
         self.singletons.get(name)
+    }
+
+    /// The resource path of **any** autoload named `name` — singleton or loaded-but-not-global. Both
+    /// live at `/root/Name`, so this is what a `get_node("/root/Name")` access resolves through.
+    #[must_use]
+    pub fn resolve_any_path(&self, name: &str) -> Option<&SmolStr> {
+        self.singletons.get(name).or_else(|| self.loaded.get(name))
     }
 
     /// The number of registered singleton autoloads.
@@ -172,12 +185,15 @@ impl AutoloadRegistry {
 #[salsa::tracked]
 pub fn autoload_registry(db: &dyn Db, config: ProjectConfig) -> Arc<AutoloadRegistry> {
     let mut singletons = FxHashMap::default();
+    let mut loaded = FxHashMap::default();
     for e in crate::project::parse_autoloads(config.project_godot_text(db)) {
         if e.is_singleton {
             singletons.entry(e.name).or_insert(e.path);
+        } else {
+            loaded.entry(e.name).or_insert(e.path);
         }
     }
-    Arc::new(AutoloadRegistry { singletons })
+    Arc::new(AutoloadRegistry { singletons, loaded })
 }
 
 /// The Godot engine `(major, minor)` declared by `project.godot`'s `[application]`
@@ -332,7 +348,8 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
 
 /// Whether a `res://` path is a *text* scene/resource we parse (`.tscn`/`.tres`). Binary
 /// `.scn`/`.res` are detected-and-degraded by the parser, but we don't waste a parse on a `.gd`.
-fn is_scene_path(path: &str) -> bool {
+#[must_use]
+pub fn is_scene_path(path: &str) -> bool {
     let ext = path.rsplit('.').next().unwrap_or("");
     ext.eq_ignore_ascii_case("tscn") || ext.eq_ignore_ascii_case("tres")
 }
@@ -404,6 +421,39 @@ pub fn script_scene_index(db: &dyn Db, root: SourceRoot) -> Arc<FxHashMap<SmolSt
                     );
                 }
             }
+        }
+    }
+    Arc::new(map)
+}
+
+/// **Every** scene that attaches the script at `res_path` — `(scene file, attach node)` pairs in
+/// scan order. Single-scene scripts have one entry; the rare multi-scene script has several (the
+/// basis for `$Path` **union typing**, M2 §6.3 — type a path as the common base across all scenes).
+/// Same firewall as [`script_scene_index`] (keyed on the scene texts, backdates across `.gd` edits).
+#[salsa::tracked]
+pub fn script_scene_attachments(
+    db: &dyn Db,
+    root: SourceRoot,
+) -> Arc<FxHashMap<SmolStr, Vec<(FileId, NodeIdx)>>> {
+    let mut map: FxHashMap<SmolStr, Vec<(FileId, NodeIdx)>> = FxHashMap::default();
+    for &file in root.files(db) {
+        if !file.res_path(db).as_deref().is_some_and(is_scene_path) {
+            continue;
+        }
+        let model = scene_model(db, file);
+        let scene = file.file_id(db);
+        for (i, node) in model.nodes.iter().enumerate() {
+            let Some(path) = node
+                .script
+                .as_ref()
+                .and_then(|id| model.ext_resources.get(id))
+                .and_then(|e| e.path.clone())
+            else {
+                continue;
+            };
+            map.entry(path)
+                .or_default()
+                .push((scene, NodeIdx(u32::try_from(i).unwrap_or(u32::MAX))));
         }
     }
     Arc::new(map)
@@ -658,6 +708,54 @@ mod tests {
             "a singly-declared class_name is not a collision",
         );
         assert_eq!(cols.len(), 1);
+    }
+
+    #[test]
+    fn missing_tool_warns_when_extending_a_tool_base_without_tool() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "@tool\nclass_name ToolBase\n", Durability::LOW);
+        db.set_file_text(
+            FileId(1),
+            "extends ToolBase\nfunc f():\n\tpass\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let derived = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            derived
+                .raw_warnings
+                .iter()
+                .any(|w| w.code.as_str() == "MISSING_TOOL"),
+            "{:?}",
+            derived
+                .raw_warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>()
+        );
+        // The base itself IS `@tool` → no warning.
+        let base = analyze_file(&db, db.file_text(FileId(0)).unwrap());
+        assert!(
+            !base
+                .raw_warnings
+                .iter()
+                .any(|w| w.code.as_str() == "MISSING_TOOL")
+        );
+    }
+
+    #[test]
+    fn a_tool_class_extending_a_tool_base_is_silent() {
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), "@tool\nclass_name ToolBase\n", Durability::LOW);
+        db.set_file_text(FileId(1), "@tool\nextends ToolBase\n", Durability::LOW);
+        db.sync_source_root();
+        let derived = analyze_file(&db, db.file_text(FileId(1)).unwrap());
+        assert!(
+            !derived
+                .raw_warnings
+                .iter()
+                .any(|w| w.code.as_str() == "MISSING_TOOL")
+        );
     }
 
     #[test]
@@ -1597,8 +1695,9 @@ mod tests {
         let file = db.file_text(FileId(0)).unwrap();
         let config = db.project_config().unwrap();
 
-        // Prime: analyze_file runs once and records the gateable INTEGER_DIVISION raw warning.
-        assert_eq!(observe_analyze_file(&db, file), 1);
+        // Prime: analyze_file runs once and records the gateable raw warnings — INTEGER_DIVISION
+        // plus UNTYPED_DECLARATION (the untyped `var x`).
+        assert_eq!(observe_analyze_file(&db, file), 2);
         let runs = ANALYZE_OBSERVED.load(Ordering::SeqCst);
         assert_eq!(
             warning_settings(&db, config)
@@ -1613,7 +1712,7 @@ mod tests {
         db.set_project_config(
             "[autoload]\nGame=\"*res://game.gd\"\n[debug]\ngdscript/warnings/integer_division=1\n",
         );
-        assert_eq!(observe_analyze_file(&db, file), 1);
+        assert_eq!(observe_analyze_file(&db, file), 2);
         assert_eq!(
             ANALYZE_OBSERVED.load(Ordering::SeqCst),
             runs,
@@ -2026,6 +2125,98 @@ mod tests {
         assert!(
             binding_labels(&db).iter().any(|l| l == "Sprite2D"),
             "$Enemy/Sprite should type as the sub-scene's Sprite (Sprite2D)",
+        );
+    }
+
+    #[test]
+    fn override_child_under_an_instance_types_from_the_subscene() {
+        // The "hard tail" (burndown Stage 4.23): main.tscn instances enemy.tscn at `Enemy` AND adds
+        // an OVERRIDE child `[node name="Sprite" parent="Enemy"]` — a node with no own
+        // `type=`/script/instance (it only carries property overrides). It RESOLVES to that outer
+        // node (not IntoInstance), which used to floor to bare `Node`; now its type is taken from the
+        // same-pathed node inside the instanced sub-scene → `Sprite2D`.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://main.gd\" id=\"1\"]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://enemy.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Control\"]\n\
+             script = ExtResource(\"1\")\n\
+             [node name=\"Enemy\" parent=\".\" instance=ExtResource(\"2\")]\n\
+             [node name=\"Sprite\" parent=\"Enemy\"]\n\
+             modulate = Color(1, 0, 0, 1)\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(0), "res://main.tscn");
+        db.set_file_text(
+            FileId(1),
+            "extends Control\nfunc _ready():\n\tvar s := $Enemy/Sprite\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(1), "res://main.gd");
+        db.set_file_text(
+            FileId(2),
+            "[gd_scene format=3]\n\
+             [node name=\"Enemy\" type=\"Node2D\"]\n\
+             [node name=\"Sprite\" type=\"Sprite2D\" parent=\".\"]\n",
+            Durability::LOW,
+        );
+        db.set_file_path(FileId(2), "res://enemy.tscn");
+        db.sync_source_root();
+        assert!(
+            binding_labels(&db).iter().any(|l| l == "Sprite2D"),
+            "an override child under an instance types from the sub-scene (Sprite2D), got: {:?}",
+            binding_labels(&db),
+        );
+    }
+
+    #[test]
+    fn inner_class_value_and_members_type_via_its_item_tree() {
+        // Burndown Stage 4.24 inc.1: an inner `class Inner:` value/instance types instead of seaming
+        // (`Ty::InnerClass`, was `Ty::Unknown`). `Inner.new()` constructs an instance; member access
+        // resolves against the inner class's own item-tree (by annotation) + its `extends` chain — so
+        // `x.hp`/`x.ping()` type as `int` (no false `INFERENCE_ON_VARIANT`), and a member inherited
+        // from the inner class's engine base (`extends Node` → `Object.get_class`) resolves to `String`.
+        let mut db = RootDatabase::default();
+        db.set_file_text(
+            FileId(0),
+            "class Inner extends Node:\n\
+             \tvar hp: int = 5\n\
+             \tfunc ping() -> int:\n\
+             \t\treturn 1\n\
+             \tfunc combo() -> int:\n\
+             \t\tvar s := self.get_class()\n\
+             \t\treturn hp + ping()\n\
+             func f():\n\
+             \tvar x := Inner.new()\n\
+             \tvar a := x.hp\n\
+             \tvar b := x.ping()\n\
+             \tvar c := x.get_class()\n",
+            Durability::LOW,
+        );
+        db.sync_source_root();
+        let ft = db.file_text(FileId(0)).unwrap();
+        let fi = analyze_file(&db, ft);
+        assert!(
+            fi.diagnostics.is_empty(),
+            "no hard diagnostics expected: {:?}",
+            fi.diagnostics
+        );
+        let api = db.engine().unwrap();
+        let labels: Vec<String> = fi
+            .units
+            .iter()
+            .flat_map(|u| &u.result.bindings)
+            .filter_map(|b| b.ty.label(api))
+            .collect();
+        assert!(
+            labels.iter().filter(|l| *l == "int").count() >= 2,
+            "x.hp and x.ping() should both type as int: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "String"),
+            "x.get_class() should resolve via the inner class's `extends Node` chain to String: {labels:?}"
         );
     }
 

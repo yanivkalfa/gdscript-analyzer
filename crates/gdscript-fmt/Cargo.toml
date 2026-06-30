@@ -15,6 +15,7 @@ keywords.workspace = true
 [dependencies]
 gdscript-base = { workspace = true }
 gdscript-syntax = { workspace = true }
+cstree = { workspace = true } # CST walk for the meaning-equivalence net (redundant-paren unwrap)
 
 [lints]
 workspace = true

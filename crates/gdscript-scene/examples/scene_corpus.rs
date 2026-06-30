@@ -35,6 +35,9 @@ fn main() {
         .cloned()
         .expect("usage: scene_corpus <dir> [--show]");
     let show = args.iter().any(|a| a == "--show");
+    // `--ci`: exit non-zero on any panic (the scene parser never errors — only `problems` — so a
+    // panic is the only hard failure for the robustness gate).
+    let ci = args.iter().any(|a| a == "--ci");
 
     let mut files = Vec::new();
     collect(Path::new(&dir), &mut files);
@@ -73,5 +76,9 @@ fn main() {
     );
     for p in &panics {
         println!("  PANIC: {}", p.display());
+    }
+    if ci && !panics.is_empty() {
+        eprintln!("SCENE CORPUS GATE FAILED: {} panics", panics.len());
+        std::process::exit(1);
     }
 }

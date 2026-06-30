@@ -1,18 +1,20 @@
 //! `gdscript-ffi` — the napi-rs v3 Node binding (ADR-0003), a **thin wrapper** over
 //! [`gdscript_session::Session`].
 //!
-//! All real logic — the URI→`FileId` interner, the document lifecycle, the JSON serialization of
-//! query results — lives in the pure-Rust, fully unit-tested `gdscript-session` core. This crate is
-//! a near-trivial `#[napi]` delegator, because a napi `cdylib` cannot be `cargo test`ed natively
+//! All real logic — the URI→`FileId` interner, the document lifecycle, the serialization of query
+//! results — lives in the pure-Rust, fully unit-tested `gdscript-session` core. This crate is a
+//! near-trivial `#[napi]` delegator, because a napi `cdylib` cannot be `cargo test`ed natively
 //! (no Node runtime / `libnode` at link time), so the testable logic must live elsewhere
 //! (`gdscript-session` is in `default-members`; `xtask ci` tests it). Mirrors the wasm binding
 //! (`gdscript-wasm`), which wraps the same `Session`.
 //!
 //! The JS side holds one [`AnalysisHandle`], pushes documents by **URI string**, and queries by
-//! URI + **byte offset**; every query returns a **JSON string** of the engine-neutral
-//! `gdscript-base` POD results (the client `JSON.parse`s it and maps byte offsets to its own
-//! position encoding — UTF-16 in a JS editor). `null`-returning queries (`hover`, `signatureHelp`,
-//! `syntaxTree`) map a Rust `None` to JS `null`.
+//! URI + **byte offset**; every query returns a **native JS object** — a [`serde_json::Value`] that
+//! napi's `serde-json` feature converts directly (no `JSON.parse` on the client). Navigation/edit
+//! results carry a `uri` per `file` id (the session enriches them), so the client needs no
+//! `FileId`→URI mirror. The client still maps byte offsets to its own position encoding (UTF-16 in a
+//! JS editor). `null`-returning queries (`hover`, `signatureHelp`, `syntaxTree`) map a Rust `None`
+//! to JS `null`.
 //!
 //! This crate is the Node path only (native + `wasm32-wasip1-threads`); the browser binding is the
 //! separate `bindings/wasm` crate. Build: `napi build --platform --release`.
@@ -84,90 +86,91 @@ impl AnalysisHandle {
         self.session.is_open(&uri)
     }
 
-    // ---- queries (JSON strings of `gdscript-base` POD) ----
+    // ---- queries (native JS objects: `serde_json::Value` of `gdscript-base` POD) ----
 
-    /// Parse + type diagnostics for `uri`, as a JSON array string.
+    /// Parse + type diagnostics for `uri`, as a JS array.
     #[napi]
     #[must_use]
-    pub fn diagnostics(&self, uri: String) -> String {
+    pub fn diagnostics(&self, uri: String) -> serde_json::Value {
         self.session.diagnostics(&uri)
     }
 
-    /// The document outline for `uri`, as a JSON array string.
+    /// The document outline for `uri`, as a JS array.
     #[napi]
     #[must_use]
-    pub fn document_symbols(&self, uri: String) -> String {
+    pub fn document_symbols(&self, uri: String) -> serde_json::Value {
         self.session.document_symbols(&uri)
     }
 
-    /// Foldable ranges for `uri`, as a JSON array string.
+    /// Foldable ranges for `uri`, as a JS array.
     #[napi]
     #[must_use]
-    pub fn folding_ranges(&self, uri: String) -> String {
+    pub fn folding_ranges(&self, uri: String) -> serde_json::Value {
         self.session.folding_ranges(&uri)
     }
 
-    /// Inlay hints for `uri`, as a JSON array string.
+    /// Inlay hints for `uri`, as a JS array.
     #[napi]
     #[must_use]
-    pub fn inlay_hints(&self, uri: String) -> String {
+    pub fn inlay_hints(&self, uri: String) -> serde_json::Value {
         self.session.inlay_hints(&uri)
     }
 
-    /// Completions at a byte `offset` in `uri`, as a JSON array string.
+    /// Completions at a byte `offset` in `uri`, as a JS array.
     #[napi]
     #[must_use]
-    pub fn completions(&self, uri: String, offset: u32) -> String {
+    pub fn completions(&self, uri: String, offset: u32) -> serde_json::Value {
         self.session.completions(&uri, offset)
     }
 
     /// Hover at a byte `offset` in `uri`; JS `null` when there is nothing typed there.
     #[napi]
     #[must_use]
-    pub fn hover(&self, uri: String, offset: u32) -> Option<String> {
+    pub fn hover(&self, uri: String, offset: u32) -> Option<serde_json::Value> {
         self.session.hover(&uri, offset)
     }
 
     /// Signature help at a byte `offset` in `uri`; JS `null` when not at a call site.
     #[napi]
     #[must_use]
-    pub fn signature_help(&self, uri: String, offset: u32) -> Option<String> {
+    pub fn signature_help(&self, uri: String, offset: u32) -> Option<serde_json::Value> {
         self.session.signature_help(&uri, offset)
     }
 
-    /// Code actions at a byte `offset` in `uri`, as a JSON array string.
+    /// Code actions at a byte `offset` in `uri`, as a JS array.
     #[napi]
     #[must_use]
-    pub fn code_actions(&self, uri: String, offset: u32) -> String {
+    pub fn code_actions(&self, uri: String, offset: u32) -> serde_json::Value {
         self.session.code_actions(&uri, offset)
     }
 
-    /// Go-to-definition target(s) for the symbol at a byte `offset` in `uri`, as a JSON array string.
+    /// Go-to-definition target(s) for the symbol at a byte `offset` in `uri`, as a JS array (each
+    /// target carries a `uri`).
     #[napi]
     #[must_use]
-    pub fn goto_definition(&self, uri: String, offset: u32) -> String {
+    pub fn goto_definition(&self, uri: String, offset: u32) -> serde_json::Value {
         self.session.goto_definition(&uri, offset)
     }
 
-    /// Every reference to the symbol at a byte `offset` in `uri`, as a JSON array string.
+    /// Every reference to the symbol at a byte `offset` in `uri`, as a JS array (each carries a `uri`).
     #[napi]
     #[must_use]
-    pub fn find_references(&self, uri: String, offset: u32) -> String {
+    pub fn find_references(&self, uri: String, offset: u32) -> serde_json::Value {
         self.session.find_references(&uri, offset)
     }
 
-    /// Rename the symbol at a byte `offset` in `uri` to `newName`. JSON object string:
-    /// `{"ok": <SourceChange>}` or `{"error": <RenameError>}`.
+    /// Rename the symbol at a byte `offset` in `uri` to `newName`. A JS object:
+    /// `{ ok: <SourceChange> }` or `{ error: <RenameError> }` (edits carry a `uri`).
     #[napi]
     #[must_use]
-    pub fn rename(&self, uri: String, offset: u32, new_name: String) -> String {
+    pub fn rename(&self, uri: String, offset: u32, new_name: String) -> serde_json::Value {
         self.session.rename(&uri, offset, &new_name)
     }
 
-    /// Project-wide symbols matching `query`, as a JSON array string.
+    /// Project-wide symbols matching `query`, as a JS array.
     #[napi]
     #[must_use]
-    pub fn workspace_symbols(&self, query: String) -> String {
+    pub fn workspace_symbols(&self, query: String) -> serde_json::Value {
         self.session.workspace_symbols(&query)
     }
 

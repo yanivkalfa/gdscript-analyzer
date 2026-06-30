@@ -25,7 +25,7 @@ default-members = [
 
 # Shared metadata inherited by every crate via `*.workspace = true`.
 [workspace.package]
-version = "0.2.1"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.88.0" # MSRV = napi-rs v3 floor (asserted by the `msrv` CI job)
 license = "MIT OR Apache-2.0"
@@ -38,14 +38,14 @@ keywords = ["gdscript", "godot", "analyzer", "lsp", "language-server"]
 # Single source of truth for dependency versions; crates opt in with `{ workspace = true }`.
 [workspace.dependencies]
 # Internal crates (path + version so they publish correctly).
-gdscript-base = { path = "crates/gdscript-base", version = "0.2.1" }
-gdscript-syntax = { path = "crates/gdscript-syntax", version = "0.2.1" }
-gdscript-api = { path = "crates/gdscript-api", version = "0.2.1" }
-gdscript-db = { path = "crates/gdscript-db", version = "0.2.1" }
-gdscript-hir = { path = "crates/gdscript-hir", version = "0.2.1" }
-gdscript-ide = { path = "crates/gdscript-ide", version = "0.2.1" }
-gdscript-fmt = { path = "crates/gdscript-fmt", version = "0.2.1" }
-gdscript-scene = { path = "crates/gdscript-scene", version = "0.2.1" }
+gdscript-base = { path = "crates/gdscript-base", version = "0.5.1" }
+gdscript-syntax = { path = "crates/gdscript-syntax", version = "0.5.1" }
+gdscript-api = { path = "crates/gdscript-api", version = "0.5.1" }
+gdscript-db = { path = "crates/gdscript-db", version = "0.5.1" }
+gdscript-hir = { path = "crates/gdscript-hir", version = "0.5.1" }
+gdscript-ide = { path = "crates/gdscript-ide", version = "0.5.1" }
+gdscript-fmt = { path = "crates/gdscript-fmt", version = "0.5.1" }
+gdscript-scene = { path = "crates/gdscript-scene", version = "0.5.1" }
 # `gdscript-session` is internal-only (`publish = false`) — bundled into the napi/wasm bindings, never
 # sent to crates.io. It is therefore PATH-ONLY (no version requirement): release-plz bumps its package
 # version (via `version.workspace = true`) but does NOT rewrite the version requirement of a
@@ -64,6 +64,9 @@ cstree = { version = "0.14", features = ["derive"] } # lossless CST (Send+Sync, 
 logos = "0.16" # DFA lexer; trivia kept as first-class tokens (never `skip`)
 text-size = "1.1" # TextSize/TextRange POD (also a cstree transitive dep)
 rustc-hash = "2.1" # deterministic FxHashMap — keeps `getrandom` out of the graph
+# Phase 6 — UTS #39 mixed-script / restriction-level detection for CONFUSABLE_IDENTIFIER (matches
+# Godot's TextServer confusable check). Pure-Rust + wasm-clean (no std clocks/threads/fs).
+unicode-security = "0.1"
 # Phase 2 — engine-API model (plans/PHASE-2-IMPLEMENTATION-PLAYBOOK.md §4). `gdscript-api`
 # normalizes `extension_api.json` into an `EngineApi`, serializes it to a binary blob at
 # codegen time (`xtask codegen-api`), and loads it via `from_bytes` — `rkyv` is that
@@ -82,7 +85,7 @@ smol_str = "0.3"
 # and the core is single-writer/multi-reader anyway). `inventory` does the ingredient
 # registration (dropping it panics "ingredient … was not registered" at runtime); `macros`,
 # `accumulator`, `salsa_unstable` are the API surface M0+ uses.
-salsa = { version = "=0.27.1", default-features = false, features = [
+salsa = { version = "=0.27.2", default-features = false, features = [
     "macros",
     "inventory",
     "accumulator",
@@ -97,6 +100,9 @@ napi-build = "2"
 # FFI — browser (wasm-bindgen + wasm-pack --target web). The static-page path.
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
+# Converts a `serde_json::Value` query result into a native JS object. MUST be driven via
+# `Serializer::json_compatible()` so `Value::Object` becomes a plain JS object, not a JS `Map`.
+serde-wasm-bindgen = "0.6"
 # Differential oracle — native-only, opt-in via the `tree-sitter-oracle` feature.
 # MSRV 1.90 > the workspace's 1.88, so it MUST stay optional + off by default (the
 # MSRV/wasm CI lanes use default features and never build it). Compiles a C parser via
@@ -125,7 +131,7 @@ crossbeam-channel = "0.5"
 # dev/test
 expect-test = "1.5" # rust-analyzer's golden mechanism (UPDATE_EXPECT=1 to bless)
 proptest = "1.11" # local panic-free robustness harness (in-process; gnu-clean)
-criterion = "0.5" # Phase-2 perf benches (cold <50ms / warm <5ms single-file); native-only, no getrandom
+criterion = "0.8" # Phase-2 perf benches (cold <50ms / warm <5ms single-file); native-only, no getrandom
 
 # Lints applied workspace-wide; each crate opts in with `[lints] workspace = true`.
 [workspace.lints.rust]

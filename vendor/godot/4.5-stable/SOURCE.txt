@@ -6,14 +6,25 @@ precision:      single (float_32 / float_64 build configs present)
 size:           6,581,513 bytes
 fetched:        2026-06-22
 
+doc XML (hover source — GODOT-SYNC.md §4):
+  source:   godotengine/godot @ tag `4.5-stable`
+  paths:    doc/classes/*.xml (892, core engine classes + builtins + @GlobalScope)
+            + modules/*/doc_classes/*.xml + platform/*/doc_classes/*.xml (120, module/platform
+              classes — CSG, GridMap, RegEx, GDScript, …; flattened into doc/classes/ here since
+              class names are globally unique)
+            + modules/gdscript/doc_classes/@GDScript.xml (the GDScript-layer pseudo-class)
+  total:    1013 files
+  fetched:  2026-06-30 (blobless sparse checkout of the doc_classes subtrees at the tag)
+
 notes:
   - godot-cpp's latest *stable tag* is 4.5 at fetch time, while the engine's latest
     stable release is 4.7. This lag is expected; per GODOT-SYNC.md the binary
     `godot --headless --dump-extension-api` fallback covers engine releases newer than
     godot-cpp's tagged JSON until godot-cpp catches up.
-  - doc/classes/*.xml (the BBCode hover source) is intentionally NOT vendored in Phase 0.
-    Hover is a Phase 2 feature; vendoring ~1000 XML files now would bloat the repo with
-    data nothing yet consumes. The empty doc/classes/ dir marks where it will land.
+  - doc/classes/*.xml is now VENDORED (burndown Stage 2 hover-docs). `cargo xtask codegen-api`
+    lowers it (BBCode → Markdown) into the separate, native-only `engine_docs.bin` hover blob —
+    a *distinct* artifact from `engine_api.bin`, so the wasm-fetched API blob never carries the
+    doc prose. The doc-XML tag must match the API JSON's version (both 4.5-stable).
   - This is the FIRST bundled Godot API version. Multi-version bundling + the automated
     sync pipeline that adds future versions are specified in GODOT-SYNC.md.
-  - License: Godot is MIT/Expat; this file is MIT-derived Godot output. See THIRD-PARTY-NOTICES.md.
+  - License: Godot is MIT/Expat; these files are MIT-licensed Godot source. See THIRD-PARTY-NOTICES.md.

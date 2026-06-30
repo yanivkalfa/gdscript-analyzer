@@ -56,10 +56,20 @@ pub fn type_diagnostics(db: &dyn Db, file: FileText) -> Vec<Diagnostic> {
     // `analyze_file` already yields an empty result with no engine model (wasm32), so the
     // diagnostics are naturally empty there — no separate guard needed.
     let inf = queries::analyze_file(db, file);
-    let settings = db.project_config().map_or_else(
+    let base = db.project_config().map_or_else(
         || Arc::new(WarningSettings::analyzer_default()),
         |c| queries::warning_settings(db, c),
     );
+    // A host-level `--strict`/`--engine-defaults` override flips only the opt-in-group promotion on
+    // the resolved settings (preserving the project's explicit per-code levels). Read from a plain,
+    // non-salsa `Db` field, so it never enters the tracked query graph — the W1 firewall holds.
+    let settings = match db.warning_override() {
+        gdscript_db::WarningOverride::None => base,
+        gdscript_db::WarningOverride::Strict => Arc::new((*base).clone().with_strict_opt_in(true)),
+        gdscript_db::WarningOverride::EngineDefaults => {
+            Arc::new((*base).clone().with_strict_opt_in(false))
+        }
+    };
     let ignores = queries::suppression_map(db, file);
     let path = file.res_path(db);
     let mut out: Vec<Diagnostic> = inf.diagnostics.clone();
@@ -73,12 +83,21 @@ pub fn type_diagnostics(db: &dyn Db, file: FileText) -> Vec<Diagnostic> {
 
 // ---- hover -------------------------------------------------------------------------------
 
-/// Hover: the inferred type of the expression / binding under the cursor. `Unknown` (the
-/// Phase-3 seam) is elided — its label is `None`, so no placeholder is shown.
+/// Hover: the inferred type of the expression / binding under the cursor, plus engine
+/// documentation (Markdown) when the cursor resolves to a documented engine symbol. `Unknown`
+/// (the Phase-3 seam) is elided — its label is `None`, so no placeholder is shown.
 #[must_use]
 pub fn hover(db: &dyn Db, file: FileText, offset: u32) -> Option<HoverResult> {
     let api = db.engine()?;
     let fi = queries::analyze_file(db, file);
+
+    // A documented engine symbol (member of a typed receiver, or a class / builtin / utility /
+    // singleton) wins: it carries the type label *and* the hover doc. Resolved scope-aware (member
+    // via the receiver type; bare names via `classify`), so a shadowing local never false-resolves.
+    if let Some(h) = engine_symbol_hover(db, api, file, &fi, offset) {
+        return Some(h);
+    }
+
     let unit = fi.unit_at(offset)?;
 
     // An expression under the cursor wins (most specific).
@@ -99,6 +118,255 @@ pub fn hover(db: &dyn Db, file: FileText, offset: u32) -> Option<HoverResult> {
         doc: String::new(),
         range: b.name_range,
     })
+}
+
+/// Resolve the identifier under the cursor to a documented engine symbol, returning its type label
+/// together with its Markdown doc. `None` when the cursor isn't on an engine symbol (the caller
+/// then falls back to the plain type/binding hover).
+fn engine_symbol_hover(
+    db: &dyn Db,
+    api: &EngineApi,
+    file: FileText,
+    fi: &FileInference,
+    offset: u32,
+) -> Option<HoverResult> {
+    let root = parse(db, file).syntax_node();
+    // The identifier under the cursor (try the offset, then one byte back for an end-of-word cursor).
+    let tok = ast::token_at(&root, offset.into())
+        .filter(|t| t.kind() == SyntaxKind::Ident)
+        .or_else(|| {
+            ast::token_at(&root, offset.saturating_sub(1).into())
+                .filter(|t| t.kind() == SyntaxKind::Ident)
+        })?;
+    let range = to_base_range(tok.text_range());
+
+    // Member access `recv.member`: resolve the member against the receiver's inferred type.
+    if let Some(field) = field_for_member_token(&tok) {
+        let receiver = field.children().next()?;
+        let recv_ty = receiver_ty(fi, receiver)?;
+        return member_doc_hover(db, api, recv_ty, tok.text(), range);
+    }
+
+    // A bare name: confirm — scope-aware — that it resolves to an engine symbol, then look it up by
+    // name across the engine tables. `classify` handles local/member shadowing for us.
+    let pos = gdscript_base::FilePosition {
+        file: file.file_id(db),
+        offset,
+    };
+    if let Some(gdscript_hir::def::GodotDef::Engine { name }) = gdscript_hir::def::classify(db, pos)
+    {
+        return engine_name_hover(api, &name, range);
+    }
+    None
+}
+
+/// If `tok` is the **member** name of a `FieldExpr` (`recv.member`, the `NameRef` after the `.`),
+/// the enclosing `FieldExpr`. `None` for the receiver side or a non-member token.
+fn field_for_member_token(tok: &gdscript_syntax::GdToken) -> Option<GdNode> {
+    let nr = tok.parent(); // a token always has a parent node
+    if nr.kind() != SyntaxKind::NameRef {
+        return None;
+    }
+    let field = nr.parent()?;
+    if field.kind() != SyntaxKind::FieldExpr {
+        return None;
+    }
+    // The member is the LAST `NameRef` child; the first is the receiver (for `a.b`, both are
+    // `NameRef`s). Compare by range — distinct nodes have distinct ranges.
+    let member = field
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::NameRef)
+        .last()?;
+    (member.text_range() == nr.text_range()).then(|| field.clone())
+}
+
+/// The inferred type of a receiver expression (for member-doc lookup).
+fn receiver_ty<'a>(fi: &'a FileInference, receiver: &GdNode) -> Option<&'a Ty> {
+    let recv_range = to_base_range(receiver.text_range());
+    let unit = fi.unit_at(recv_range.start)?;
+    let eid = unit.body.source_map.expr_for_range(recv_range)?;
+    unit.result.type_of(eid)
+}
+
+/// Build a hover for `recv.member` given the receiver's type: the member's signature/type label +
+/// its engine doc.
+fn member_doc_hover(
+    db: &dyn Db,
+    api: &EngineApi,
+    recv_ty: &Ty,
+    name: &str,
+    range: TextRange,
+) -> Option<HoverResult> {
+    match recv_ty {
+        Ty::Object(c) => {
+            let m = api.lookup_member(*c, name)?;
+            Some(HoverResult {
+                ty_label: member_ref_label(api, &m),
+                doc: member_ref_doc(api, &m).unwrap_or_default(),
+                range,
+            })
+        }
+        // `self` / an aliased self / any script value: a member reached through the `extends`
+        // chain. If a *user* script in the chain declares the name it's a user member (no engine
+        // doc — the user may have overridden an engine method); otherwise resolve against the
+        // engine base and show that doc.
+        Ty::ScriptRef(sref) => script_ref_member_doc(db, api, *sref, name, range),
+        Ty::Builtin(b) => builtin_member_doc_hover(api, *b, name, range),
+        Ty::Array(_) => api
+            .builtin_by_name("Array")
+            .and_then(|b| builtin_member_doc_hover(api, b, name, range)),
+        Ty::Dict(..) => api
+            .builtin_by_name("Dictionary")
+            .and_then(|b| builtin_member_doc_hover(api, b, name, range)),
+        _ => None,
+    }
+}
+
+/// A hover for a builtin-type member (`Vector2.length`, `String.to_int`, …).
+fn builtin_member_doc_hover(
+    api: &EngineApi,
+    b: BuiltinId,
+    name: &str,
+    range: TextRange,
+) -> Option<HoverResult> {
+    let data = api.builtin(b);
+    if let Some(m) = data.methods.iter().find(|m| m.name == name) {
+        return Some(HoverResult {
+            ty_label: Some(method_signature(api, name, m).label),
+            doc: m
+                .doc
+                .and_then(|id| api.doc(id))
+                .unwrap_or_default()
+                .to_owned(),
+            range,
+        });
+    }
+    if let Some(c) = data.constants.iter().find(|c| c.name == name) {
+        return Some(HoverResult {
+            ty_label: ty::resolve_tyref(api, &c.ty).label(api),
+            doc: c
+                .doc
+                .and_then(|id| api.doc(id))
+                .unwrap_or_default()
+                .to_owned(),
+            range,
+        });
+    }
+    None
+}
+
+/// A hover for a bare engine symbol — an engine class, a builtin type, a `@GlobalScope` utility
+/// function, or a singleton.
+fn engine_name_hover(api: &EngineApi, name: &str, range: TextRange) -> Option<HoverResult> {
+    if let Some(cid) = api.class_by_name(name) {
+        let c = api.class(cid);
+        return Some(HoverResult {
+            ty_label: Some(name.to_owned()),
+            doc: c
+                .doc
+                .and_then(|id| api.doc(id))
+                .unwrap_or_default()
+                .to_owned(),
+            range,
+        });
+    }
+    if let Some(bid) = api.builtin_by_name(name) {
+        let b = api.builtin(bid);
+        return Some(HoverResult {
+            ty_label: Some(name.to_owned()),
+            doc: b
+                .doc
+                .and_then(|id| api.doc(id))
+                .unwrap_or_default()
+                .to_owned(),
+            range,
+        });
+    }
+    if let Some(u) = api.utility(name) {
+        return Some(HoverResult {
+            ty_label: Some(util_signature(api, name, u).label),
+            doc: u
+                .doc
+                .and_then(|id| api.doc(id))
+                .unwrap_or_default()
+                .to_owned(),
+            range,
+        });
+    }
+    if let Some(cid) = api.singleton(name) {
+        let c = api.class(cid);
+        return Some(HoverResult {
+            ty_label: Some(c.name.clone()),
+            doc: c
+                .doc
+                .and_then(|id| api.doc(id))
+                .unwrap_or_default()
+                .to_owned(),
+            range,
+        });
+    }
+    None
+}
+
+/// The display label for a resolved engine member (a method signature, or a property/const type).
+fn member_ref_label(api: &EngineApi, m: &MemberRef) -> Option<String> {
+    match m {
+        MemberRef::Method(sig) => Some(method_signature(api, &sig.name, sig).label),
+        MemberRef::Property(p) => ty::resolve_tyref(api, &p.ty).label(api),
+        MemberRef::Const(c) => ty::resolve_tyref(api, &c.ty).label(api),
+        MemberRef::Signal(s) => Some(format!("signal {}", s.name)),
+        MemberRef::Enum(e) => Some(format!("enum {}", e.name)),
+    }
+}
+
+/// Resolve `name` reached through a script's `extends` chain to an engine-base member's doc.
+/// Returns `None` when a *user* script in the chain declares the name (a user member has no engine
+/// doc, and may shadow/override an engine one), or the name isn't an engine member. Depth-bounded
+/// against a cyclic `extends`.
+fn script_ref_member_doc(
+    db: &dyn Db,
+    api: &EngineApi,
+    sref: ty::ScriptRefId,
+    name: &str,
+    range: TextRange,
+) -> Option<HoverResult> {
+    let mut cur = Some(sref);
+    for _ in 0..=32 {
+        let s = cur?;
+        let ft = db.file_text(FileId(s.0))?;
+        if queries::item_tree(db, ft)
+            .members
+            .iter()
+            .any(|m| m.name() == Some(name))
+        {
+            return None; // user-declared (possibly an override) — no engine doc
+        }
+        match queries::script_class(db, ft).base() {
+            Ty::ScriptRef(base) => cur = Some(*base),
+            Ty::Object(class) => {
+                let m = api.lookup_member(*class, name)?;
+                return Some(HoverResult {
+                    ty_label: member_ref_label(api, &m),
+                    doc: member_ref_doc(api, &m).unwrap_or_default(),
+                    range,
+                });
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The engine doc Markdown for a resolved member, if any.
+fn member_ref_doc(api: &EngineApi, m: &MemberRef) -> Option<String> {
+    let id = match m {
+        MemberRef::Method(s) => s.doc,
+        MemberRef::Property(p) => p.doc,
+        MemberRef::Signal(s) => s.doc,
+        MemberRef::Const(c) => c.doc,
+        MemberRef::Enum(e) => e.doc,
+    }?;
+    api.doc(id).map(str::to_owned)
 }
 
 // ---- inlay hints -------------------------------------------------------------------------
@@ -735,6 +1003,54 @@ mod tests {
     }
 
     #[test]
+    fn hover_on_self_engine_method_shows_doc() {
+        // `self.add_child` resolves through `extends Node` to the engine member + its hover doc.
+        let src = "extends Node\nfunc f():\n\tself.add_child(null)\n";
+        let offset = u32::try_from(src.find("add_child").unwrap()).unwrap() + 1;
+        let (db, ft) = db_ft(src);
+        let h = hover(&db, ft, offset).expect("hover");
+        assert!(
+            h.ty_label
+                .as_deref()
+                .is_some_and(|l| l.starts_with("add_child(")),
+            "method signature label: {:?}",
+            h.ty_label
+        );
+        assert!(!h.doc.is_empty(), "engine method should carry a hover doc");
+        assert!(
+            !h.doc.contains("[/"),
+            "no unconverted BBCode leaks: {:?}",
+            h.doc
+        );
+    }
+
+    #[test]
+    fn hover_on_engine_class_shows_doc() {
+        // The class name in a type annotation shows the class's hover doc.
+        let src = "func f():\n\tvar n: Node\n";
+        let offset = u32::try_from(src.find("Node").unwrap()).unwrap() + 1;
+        let (db, ft) = db_ft(src);
+        let h = hover(&db, ft, offset).expect("hover");
+        assert_eq!(h.ty_label.as_deref(), Some("Node"));
+        assert!(!h.doc.is_empty(), "engine class should carry a hover doc");
+    }
+
+    #[test]
+    fn hover_on_overridden_method_prefers_no_engine_doc() {
+        // A user method overriding an engine one is a user member — no engine doc is shown.
+        let src = "extends Node\nfunc add_child(x):\n\tpass\nfunc g():\n\tself.add_child(null)\n";
+        let off = src.find("self.add_child").unwrap() + "self.".len() + 1;
+        let (db, ft) = db_ft(src);
+        let h = hover(&db, ft, u32::try_from(off).unwrap());
+        // Either no engine-symbol hover (falls back) or an empty doc — never Node.add_child's doc.
+        assert!(
+            h.as_ref().is_none_or(|h| h.doc.is_empty()),
+            "an overriding user method must not show the engine doc: {:?}",
+            h.map(|h| h.doc)
+        );
+    }
+
+    #[test]
     fn inlay_hint_on_inferred_var() {
         let (db, ft) = db_ft("func f():\n\tvar n := 42\n");
         let hints = inlay_hints(&db, ft);
@@ -811,6 +1127,46 @@ mod tests {
                 .iter()
                 .all(|d| d.code != "INTEGER_DIVISION"),
             "enable=false must suppress gateable warnings",
+        );
+    }
+
+    #[test]
+    fn warning_override_engine_defaults_silences_the_opt_in_group() {
+        let src = "extends Node\nfunc f(n: Node):\n\tn.not_a_real_method()\n";
+        // Standalone (no project.godot) defaults to strict → the opt-in UNSAFE_* group fires.
+        let (db, ft) = db_ft(src);
+        assert!(
+            type_diagnostics(&db, ft)
+                .iter()
+                .any(|d| d.code == "UNSAFE_METHOD_ACCESS")
+        );
+        // `--engine-defaults` forces the opt-in group back to IGNORE even in standalone mode.
+        let (mut db2, ft2) = db_ft(src);
+        db2.set_warning_override(crate::WarningOverride::EngineDefaults);
+        assert!(
+            type_diagnostics(&db2, ft2)
+                .iter()
+                .all(|d| d.code != "UNSAFE_METHOD_ACCESS"),
+            "--engine-defaults must silence the opt-in group",
+        );
+    }
+
+    #[test]
+    fn warning_override_strict_respects_an_explicit_project_ignore() {
+        let src = "extends Node\nfunc f(n: Node):\n\tn.not_a_real_method()\n";
+        let mut db = RootDatabase::default();
+        db.set_file_text(FileId(0), src, Durability::LOW);
+        // The project explicitly ignores unsafe_method_access.
+        db.set_project_config("[debug]\ngdscript/warnings/unsafe_method_access=0\n");
+        db.sync_source_root();
+        db.set_warning_override(crate::WarningOverride::Strict);
+        let ft = db.file_text(FileId(0)).unwrap();
+        // `--strict` promotes the opt-in group, but an explicit per-code Ignore still wins.
+        assert!(
+            type_diagnostics(&db, ft)
+                .iter()
+                .all(|d| d.code != "UNSAFE_METHOD_ACCESS"),
+            "an explicit per-code ignore must beat --strict",
         );
     }
 

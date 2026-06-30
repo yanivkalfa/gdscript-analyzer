@@ -33,8 +33,8 @@ pub enum Literal {
     Int,
     /// A float literal.
     Float,
-    /// `true` / `false`.
-    Bool,
+    /// `true` / `false` (carries the value, for constant checks like `ASSERT_ALWAYS_*`).
+    Bool(bool),
     /// A `String` literal.
     Str,
     /// A `&"…"` `StringName` literal.
@@ -365,6 +365,49 @@ pub struct MatchArm {
     pub guard: Option<ExprId>,
     /// The arm body.
     pub body: Block,
+    /// The arm's byte range (the `UNREACHABLE_PATTERN` anchor).
+    pub range: TextRange,
+    /// Whether this arm is an **unconditional catch-all** — its sole top-level pattern is `_` or a
+    /// `var x` bind, with no `when` guard. Every arm *after* a catch-all is `UNREACHABLE_PATTERN`.
+    pub is_catch_all: bool,
+}
+
+/// Whether a `match` arm is an UNCONDITIONAL catch-all — its **sole top-level** pattern is `_` (a
+/// `PatternLiteral`/`PatternWildcard` whose only token is `_`) or a `var x` bind (`PatternBind`),
+/// and it has no `when` guard. Conservative: a multi-pattern arm (`1, _:`), a `_`/`var` nested in an
+/// array/dict pattern, or a guarded arm is NOT a catch-all — we under-warn `UNREACHABLE_PATTERN`
+/// rather than risk flagging a reachable arm (a false positive on valid code).
+fn arm_is_unconditional_catch_all(arm: &GdNode) -> bool {
+    use SyntaxKind as K;
+    if cst::first_child(arm, |k| k == K::PatternGuard).is_some() {
+        return false;
+    }
+    let patterns: Vec<&GdNode> = arm
+        .children()
+        .filter(|c| {
+            matches!(
+                c.kind(),
+                K::PatternBind
+                    | K::PatternLiteral
+                    | K::PatternWildcard
+                    | K::PatternArray
+                    | K::PatternDict
+                    | K::PatternRest
+            )
+        })
+        .collect();
+    let [only] = patterns.as_slice() else {
+        return false;
+    };
+    match only.kind() {
+        K::PatternBind | K::PatternWildcard => true,
+        // `_` parses as a `PatternLiteral` wrapping the identifier expr `_` (a `NameRef` node), so
+        // the `_` token is nested one level down — check the inner expr's first token.
+        K::PatternLiteral => cst::first_child_expr(only)
+            .and_then(|e| cst::first_token(&e))
+            .is_some_and(|t| t.text() == "_"),
+        _ => false,
+    }
 }
 
 /// A lowered statement.
@@ -590,9 +633,35 @@ impl Lowerer {
             K::BinExpr => {
                 let exprs = cst::child_exprs(node);
                 let op = bin_op(node).unwrap_or(BinOp::Add);
-                let lhs = self.lower_or_missing(exprs.first(), range);
-                let rhs = self.lower_or_missing(exprs.get(1), range);
-                Expr::Bin { op, lhs, rhs }
+                // A compound assignment `x op= y` desugars to `x = (x op y)`. Typing then checks the
+                // REAL result against the slot (`velocity *= 0.5` is `velocity = velocity * 0.5` :
+                // Vector2 — not the scalar `0.5`, which would false-`TYPE_MISMATCH`), and the LHS is
+                // a READ of `x` (so `x += 1` is not falsely `UNUSED`). Lowering the LHS twice is safe
+                // for analysis (the Body IR is never executed, so re-evaluation has no side effect).
+                if op == BinOp::Assign
+                    && let Some(under) = compound_assign_op(node)
+                {
+                    let lhs = self.lower_or_missing(exprs.first(), range);
+                    let lhs_read = self.lower_or_missing(exprs.first(), range);
+                    let rhs = self.lower_or_missing(exprs.get(1), range);
+                    let value = self.alloc_expr(
+                        Expr::Bin {
+                            op: under,
+                            lhs: lhs_read,
+                            rhs,
+                        },
+                        range,
+                    );
+                    Expr::Bin {
+                        op: BinOp::Assign,
+                        lhs,
+                        rhs: value,
+                    }
+                } else {
+                    let lhs = self.lower_or_missing(exprs.first(), range);
+                    let rhs = self.lower_or_missing(exprs.get(1), range);
+                    Expr::Bin { op, lhs, rhs }
+                }
             }
             K::UnaryExpr => {
                 let op = un_op(node).unwrap_or(UnOp::Pos);
@@ -864,7 +933,13 @@ impl Lowerer {
                     .and_then(|g| cst::first_child_expr(&g))
                     .map(|e| self.lower_expr(&e));
                 let body = self.lower_child_block(arm);
-                MatchArm { binds, guard, body }
+                MatchArm {
+                    binds,
+                    guard,
+                    body,
+                    range: cst::text_range_of(arm),
+                    is_catch_all: arm_is_unconditional_catch_all(arm),
+                }
             })
             .collect();
         Stmt::Match { scrutinee, arms }
@@ -892,7 +967,8 @@ fn literal_kind(node: &GdNode) -> Literal {
         Some(K::String) => Literal::Str,
         Some(K::StringName) => Literal::StringName,
         Some(K::NodePath) => Literal::NodePath,
-        Some(K::True | K::False) => Literal::Bool,
+        Some(K::True) => Literal::Bool(true),
+        Some(K::False) => Literal::Bool(false),
         Some(K::ConstPi | K::ConstTau | K::ConstInf | K::ConstNan) => Literal::MathConst,
         _ => Literal::Null,
     }
@@ -903,6 +979,30 @@ fn bin_op(node: &GdNode) -> Option<BinOp> {
     node.children_with_tokens()
         .filter_map(cstree::util::NodeOrToken::into_token)
         .find_map(|t| BinOp::from_token(t.kind()))
+}
+
+/// The *underlying* operator of a **compound** assignment `BinExpr` (`*=` → `Mul`, `+=` → `Add`, …),
+/// or `None` for a plain `=` / a non-assignment. Used to desugar `x op= y` into `x = (x op y)`.
+fn compound_assign_op(node: &GdNode) -> Option<BinOp> {
+    use SyntaxKind as K;
+    node.children_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .find_map(|t| {
+            Some(match t.kind() {
+                K::PlusEq => BinOp::Add,
+                K::MinusEq => BinOp::Sub,
+                K::StarEq => BinOp::Mul,
+                K::SlashEq => BinOp::Div,
+                K::PercentEq => BinOp::Mod,
+                K::StarStarEq => BinOp::Pow,
+                K::AmpEq => BinOp::BitAnd,
+                K::PipeEq => BinOp::BitOr,
+                K::CaretEq => BinOp::BitXor,
+                K::ShlEq => BinOp::Shl,
+                K::ShrEq => BinOp::Shr,
+                _ => return None,
+            })
+        })
 }
 
 /// The prefix operator token of a `UnaryExpr`.

@@ -188,6 +188,62 @@ impl<'s> Parser<'s> {
         self.nth(0) == kind
     }
 
+    /// Whether a statement-initial `match` begins a `match` STATEMENT (vs. `match` used as an
+    /// *identifier* expression — the soft-keyword extension). It is an identifier use when the next
+    /// token is a member access (`.`), an assignment operator, or a call/index (`(` / `[`) whose
+    /// bracket group is **not** followed by `:` — a parenthesised / array match *subject* is
+    /// `match (x):` / `match [a]:` (colon-terminated), whereas `match(x)` / `match[i]` is a call /
+    /// index on a variable named `match`. Reads the raw non-trivia buffer directly (no `nth`, so it
+    /// is fuel-free and safe over an arbitrarily long subject); the keyword reading is the safe
+    /// default for any ambiguity.
+    fn match_begins_statement(&self) -> bool {
+        use SyntaxKind as K;
+        let kind_at = |off: usize| {
+            self.nontrivia
+                .get(self.pos + off)
+                .map_or(K::Eof, |&i| self.tokens[i].kind)
+        };
+        match kind_at(1) {
+            // A member access (`.`) or an assignment operator is an unambiguous identifier use.
+            K::Dot
+            | K::Eq
+            | K::ColonEq
+            | K::PlusEq
+            | K::MinusEq
+            | K::StarEq
+            | K::SlashEq
+            | K::StarStarEq
+            | K::PercentEq
+            | K::AmpEq
+            | K::PipeEq
+            | K::CaretEq
+            | K::ShlEq
+            | K::ShrEq => false,
+            K::LParen | K::LBrack => {
+                // Scan the balanced bracket group; an identifier use iff no `:` follows its close.
+                let mut depth = 0usize;
+                let mut off = 1;
+                loop {
+                    match kind_at(off) {
+                        K::Eof => return true, // unterminated → treat as the keyword (safe)
+                        K::LParen | K::LBrack | K::LBrace => depth += 1,
+                        K::RParen | K::RBrack | K::RBrace => {
+                            depth -= 1;
+                            if depth == 0 {
+                                // A colon right after the close ⇒ a parenthesised/array match SUBJECT
+                                // (`match (x):`); anything else ⇒ a call/index on the identifier.
+                                return kind_at(off + 1) == K::Colon;
+                            }
+                        }
+                        _ => {}
+                    }
+                    off += 1;
+                }
+            }
+            _ => true,
+        }
+    }
+
     fn at_any(&self, kinds: &[SyntaxKind]) -> bool {
         kinds.contains(&self.nth(0))
     }
@@ -404,6 +460,76 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::FuncDecl)
             .expect("a FuncDecl child");
         assert!(func.children().any(|n| n.kind() == SyntaxKind::Block));
+    }
+
+    fn contains_node(node: &ResolvedNode<SyntaxKind>, kind: SyntaxKind) -> bool {
+        node.kind() == kind || node.children().any(|c| contains_node(c, kind))
+    }
+
+    #[test]
+    fn property_accessors_parse_cleanly() {
+        let indented = "var x: int:\n\tget:\n\t\treturn 1\n\tset(v):\n\t\tx = v\n";
+        round_trips(indented);
+        assert!(
+            parse(indented).errors().is_empty(),
+            "valid get/set accessors must not error: {:?}",
+            parse(indented).errors()
+        );
+        let inline = "var y: int : get = _get_y, set = _set_y\n";
+        round_trips(inline);
+        assert!(
+            parse(inline).errors().is_empty(),
+            "{:?}",
+            parse(inline).errors()
+        );
+    }
+
+    #[test]
+    fn a_non_get_set_accessor_keyword_is_a_parse_error() {
+        // Tightened: a property accessor keyword must be exactly `get` or `set` — `foo` is an error,
+        // not a silently-accepted setter.
+        let src = "var x: int:\n\tfoo:\n\t\treturn 1\n";
+        assert!(
+            !parse(src).errors().is_empty(),
+            "a non-get/set accessor must be a parse error"
+        );
+    }
+
+    fn has_match_stmt(src: &str) -> bool {
+        contains_node(&parse(src).syntax_node(), SyntaxKind::MatchStmt)
+    }
+
+    #[test]
+    fn a_real_match_statement_still_parses() {
+        let src = "func f():\n\tmatch x:\n\t\t1:\n\t\t\tpass\n";
+        round_trips(src);
+        assert!(has_match_stmt(src));
+    }
+
+    #[test]
+    fn a_parenthesised_match_subject_is_still_a_statement() {
+        let src = "func f():\n\tmatch (x):\n\t\t_:\n\t\t\tpass\n";
+        round_trips(src);
+        assert!(has_match_stmt(src), "`match (x):` is a match statement");
+    }
+
+    #[test]
+    fn match_used_as_an_identifier_is_an_expression_not_a_statement() {
+        // `match` as a soft-keyword identifier: member access, assignment, and a call/index whose
+        // bracket group is not colon-terminated. None is the match statement.
+        for src in [
+            "func f():\n\tmatch.foo()\n",
+            "func f():\n\tmatch = 5\n",
+            "func f():\n\tmatch += 1\n",
+            "func f():\n\tmatch(x)\n",
+            "func f():\n\tmatch[0] = 1\n",
+        ] {
+            round_trips(src);
+            assert!(
+                !has_match_stmt(src),
+                "should be an expression, not a match statement: {src:?}"
+            );
+        }
     }
 
     /// A node-only S-expression (no tokens, no trivia) — the structural shape, used to

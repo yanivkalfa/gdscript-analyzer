@@ -49,6 +49,29 @@ pub struct GlobalArgs {
     /// Disable colored output (also honors `NO_COLOR` / non-tty).
     #[arg(long, global = true)]
     pub no_color: bool,
+    /// Force the strict warning set (promote the opt-in `UNSAFE_*` group to warnings) even when a
+    /// `project.godot` is present. Mutually exclusive with `--engine-defaults`.
+    #[arg(long, global = true, conflicts_with = "engine_defaults")]
+    pub strict: bool,
+    /// Force Godot's engine-default warning levels (the opt-in group stays ignored) even in a
+    /// standalone (no-`project.godot`) run.
+    #[arg(long, global = true)]
+    pub engine_defaults: bool,
+}
+
+impl GlobalArgs {
+    /// The host-level warning-strictness override these flags select (clap guarantees the two
+    /// flags are mutually exclusive).
+    #[must_use]
+    pub fn warning_override(&self) -> gdscript_ide::WarningOverride {
+        if self.strict {
+            gdscript_ide::WarningOverride::Strict
+        } else if self.engine_defaults {
+            gdscript_ide::WarningOverride::EngineDefaults
+        } else {
+            gdscript_ide::WarningOverride::None
+        }
+    }
 }
 
 /// The output format for diagnostics.

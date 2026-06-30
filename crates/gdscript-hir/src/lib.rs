@@ -1,5 +1,8 @@
 //! `gdscript-hir` — the semantic / type layer.
 //!
+//! > **Internal layer (not a stable API).** Depend on [`gdscript-ide`](https://docs.rs/gdscript-ide) (the public surface); the items here
+//! > may change between releases.
+//!
 //! Lowers the AST to a HIR (an `ItemTree` of signatures + per-function `Body`), runs name resolution
 //! (local → class member → inherited → global), gradual type inference (Variant by default,
 //! `:=`/annotations, member lookup over the engine inheritance table, `is`/`as` narrowing), and the
@@ -8,6 +11,7 @@
 //! Phase 2 builds this out bottom-up: the type model ([`ty`]), then the item tree, body, name
 //! resolution, and inference. Must build for `wasm32`.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 
 pub mod body;
 mod cst;

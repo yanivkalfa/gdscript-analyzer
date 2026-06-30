@@ -1,0 +1,39 @@
+name: Corpus
+
+# The broad robustness gate (burndown Stage 3): parse every `.gd` and `.tscn` in the real
+# godot-demo-projects corpus and fail on ANY parse error (GDSCRIPT_SYNTAX) or panic. The corpus is
+# cloned in CI rather than vendored (it carries large binary assets — vendoring would bloat the repo).
+# Type diagnostics (UNSAFE_*, etc.) are the intended value-prop warnings and do NOT fail the gate.
+on:
+  pull_request:
+  push:
+    branches: [master, dev]
+
+concurrency:
+  group: corpus-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  corpus:
+    name: corpus (godot-demo-projects)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Clone godot-demo-projects (shallow)
+        run: git clone --depth 1 https://github.com/godotengine/godot-demo-projects.git "${{ runner.temp }}/godot-demo-projects"
+      - name: Parse-check every .gd (0 GDSCRIPT_SYNTAX errors, 0 panics)
+        run: cargo run --release -p gdscript-ide --example corpus -- "${{ runner.temp }}/godot-demo-projects" --ci
+      - name: Faithful per-project check (one host per project.godot, cross-file resolution)
+        run: cargo run --release -p gdscript-ide --example corpus -- "${{ runner.temp }}/godot-demo-projects" --per-project --ci
+      - name: Parse-check every .tscn (0 panics)
+        run: cargo run --release -p gdscript-scene --example scene_corpus -- "${{ runner.temp }}/godot-demo-projects" --ci

@@ -20,6 +20,27 @@ pub struct ScriptRefId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SignalSigId(pub u32);
 
+/// A reference to an **inner** `class Name:` declared inside a script file. Identity = the declaring
+/// file (a `FileId.0`) + the dotted path to the inner class within it (`Inner`, or `Outer.Inner`
+/// when nested). The analyzer collapses the meta-vs-instance distinction (like a `class_name`/
+/// `ScriptRef`): the same `Ty::InnerClass` is the class value (`Inner.CONST`, `Inner.new()`) and an
+/// instance of it (`Inner.new().method()`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InnerClassRef {
+    /// The declaring file (`FileId.0`).
+    pub file: u32,
+    /// The dotted path to the inner class within the file (`Inner` / `Outer.Inner`).
+    pub path: SmolStr,
+}
+
+impl InnerClassRef {
+    /// The inner class's own (last-segment) name — the hover/inlay label.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.path.rsplit('.').next().unwrap_or(&self.path)
+    }
+}
+
 /// A reference to an enum type, kept as the qualified name it was written with. Phase 2 does not
 /// resolve it to a concrete enum table — `is_assignable` only needs the *kind* (enum values are
 /// assignable to `int`), and hover shows the qualified name.
@@ -40,6 +61,10 @@ pub enum Ty {
     Object(ClassId),
     /// Another script, opaque in Phase 2 (the seam yields `Unknown` instead).
     ScriptRef(ScriptRefId),
+    /// An inner `class Name:` declared in this (or another) script file — both the class value and
+    /// an instance of it (collapsed, like `ScriptRef`). Members resolve against the inner class's
+    /// own item-tree + its `extends` chain.
+    InnerClass(InnerClassRef),
     /// `Array[T]`; a bare `Array` is `Array(Box::new(Ty::Variant))`.
     Array(Box<Ty>),
     /// `Dictionary[K, V]`; a bare `Dictionary` is `Dict(Variant, Variant)`.
@@ -121,6 +146,8 @@ impl Ty {
             Self::Callable => "Callable".to_owned(),
             Self::Void => "void".to_owned(),
             Self::Variant => "Variant".to_owned(),
+            // An inner class shows its own (last-segment) name.
+            Self::InnerClass(r) => r.name().to_owned(),
             // `ScriptRef` (opaque) and the seam/error markers carry no display label.
             Self::ScriptRef(_) | Self::Unknown | Self::Error => return None,
         })
@@ -176,6 +203,46 @@ pub enum Assign {
     No,
 }
 
+/// Whether `name` is a `Packed*Array` builtin (`PackedStringArray`, `PackedVector2Array`, …).
+fn is_packed_array(name: &str) -> bool {
+    name.starts_with("Packed") && name.ends_with("Array")
+}
+
+/// Godot's implicit conversions between two **builtin** types (the engine's `Variant::can_convert`
+/// for the value-prop slots GDScript accepts silently). Covers the numeric / vector widening +
+/// narrowing, `bool`↔`int`, the `String`/`StringName`/`NodePath` family, and `Array`↔`Packed*Array`.
+#[allow(
+    clippy::unnested_or_patterns,
+    reason = "a flat (from, to) conversion table reads more clearly than maximally-nested patterns"
+)]
+fn builtin_conversion(from: &str, to: &str) -> Assign {
+    match (from, to) {
+        // Narrowing (NARROWING_CONVERSION, not a hard mismatch): float→int, float-vec→int-vec.
+        ("float", "int")
+        | ("Vector2", "Vector2i")
+        | ("Vector3", "Vector3i")
+        | ("Vector4", "Vector4i")
+        | ("Rect2", "Rect2i") => Assign::Narrowing,
+        // Widening / interchangeable value types Godot converts silently.
+        ("int", "float")
+        | ("bool", "int")
+        | ("bool", "float")
+        | ("int", "bool")
+        | ("Vector2i", "Vector2")
+        | ("Vector3i", "Vector3")
+        | ("Vector4i", "Vector4")
+        | ("Rect2i", "Rect2")
+        | ("String", "StringName")
+        | ("String", "NodePath")
+        | ("StringName", "String")
+        | ("NodePath", "String") => Assign::Ok,
+        // A bare `Array` ↔ a `Packed*Array` is a runtime element-checked conversion Godot allows.
+        ("Array", t) if is_packed_array(t) => Assign::Ok,
+        (f, "Array") if is_packed_array(f) => Assign::Ok,
+        _ => Assign::No,
+    }
+}
+
 /// Whether a value of type `from` may be assigned to a slot of type `to` (the engine's
 /// `check_type_compatibility`, ported — Playbook §3.5). **Order matters.**
 #[must_use]
@@ -194,24 +261,21 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
     }
 
     match to {
-        Ty::Builtin(to_id) => match from {
-            Ty::Builtin(from_id) if from_id == to_id => Assign::Ok,
-            Ty::Builtin(from_id) => {
-                let from_name = api.builtin(*from_id).name.as_str();
-                let to_name = api.builtin(*to_id).name.as_str();
-                match (from_name, to_name) {
-                    ("float", "int") => Assign::Narrowing, // NARROWING_CONVERSION
-                    // `int`→`float` widening (silent) + Godot's string-ish auto-conversions.
-                    ("int", "float")
-                    | ("String", "StringName" | "NodePath")
-                    | ("StringName" | "NodePath", "String") => Assign::Ok,
-                    _ => Assign::No,
+        Ty::Builtin(to_id) => {
+            let to_name = api.builtin(*to_id).name.as_str();
+            match from {
+                Ty::Builtin(from_id) if from_id == to_id => Assign::Ok,
+                Ty::Builtin(from_id) => {
+                    builtin_conversion(api.builtin(*from_id).name.as_str(), to_name)
                 }
+                // An enum value is assignable to `int`.
+                Ty::Enum(_) if to_name == "int" => Assign::Ok,
+                // A bare/typed `Array` (a `[…]` literal) assigns to any `Packed*Array`: Godot
+                // runtime-converts + validates the elements at runtime — never a static mismatch.
+                Ty::Array(_) if is_packed_array(to_name) => Assign::Ok,
+                _ => Assign::No,
             }
-            // An enum value is assignable to `int`.
-            Ty::Enum(_) if api.builtin(*to_id).name == "int" => Assign::Ok,
-            _ => Assign::No,
-        },
+        }
         Ty::Enum(to_enum) => match from {
             Ty::Enum(from_enum) if from_enum == to_enum => Assign::Ok,
             // A *different* enum's value is an `int` at runtime: Godot wants a cast
@@ -226,8 +290,9 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
             // Downcast (a base value into a derived slot): permitted with a runtime check —
             // unsafe, but not a hard error. Real code relies on `var c: Control = get_child(0)`.
             Ty::Object(from_class) if api.is_subclass(*to_class, *from_class) => Assign::OkUnsafe,
-            // A script reference is opaque — treat like the seam, never a mismatch.
-            Ty::ScriptRef(_) => Assign::Ok,
+            // A script reference / inner-class value is opaque — treat like the seam (an inner class
+            // IS-A its base, and we don't resolve the base chain here), never a hard mismatch.
+            Ty::ScriptRef(_) | Ty::InnerClass(_) => Assign::Ok,
             _ => Assign::No,
         },
         // Typed arrays are invariant — but only between two *informative* element types
@@ -274,9 +339,9 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
                 Assign::No
             }
         }
-        // An opaque script-ref target, and the `Variant`/`Unknown`/`Error` targets already
-        // handled above, all accept anything.
-        Ty::ScriptRef(_) | Ty::Variant | Ty::Unknown | Ty::Error => Assign::Ok,
+        // An opaque script-ref / inner-class target, and the `Variant`/`Unknown`/`Error` targets
+        // already handled above, all accept anything.
+        Ty::ScriptRef(_) | Ty::InnerClass(_) | Ty::Variant | Ty::Unknown | Ty::Error => Assign::Ok,
     }
 }
 

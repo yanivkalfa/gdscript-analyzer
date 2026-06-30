@@ -16,6 +16,7 @@
 
 use gdscript_base::{FileId, FilePosition, TextRange};
 use gdscript_db::{Db, FileText, parse};
+use gdscript_scene::NodeIdx;
 use gdscript_syntax::{GdNode, GdToken, SyntaxKind, ast};
 use smol_str::SmolStr;
 
@@ -66,6 +67,16 @@ pub enum GodotDef {
         /// The engine symbol name.
         name: SmolStr,
     },
+    /// A node declared in a scene (`.tscn`), referenced by `$Path` / `%Unique` / `get_node("…")` in
+    /// scripts and by its `name="…"` in the scene. Identity = the owning scene + the node's full
+    /// name-path from (and including) the scene root — unique within a scene, stable across an edit.
+    /// The node's renamed name is the path's **last** segment.
+    SceneNode {
+        /// The owning `.tscn`.
+        scene: FileId,
+        /// The node's full path from (and including) the scene root (e.g. `"Main/Panel/StartButton"`).
+        path: SmolStr,
+    },
 }
 
 impl GodotDef {
@@ -77,6 +88,8 @@ impl GodotDef {
             | Self::Member { name, .. }
             | Self::Autoload { name, .. }
             | Self::Engine { name } => name,
+            // A node's own name is the last segment of its full path (e.g. `StartButton`).
+            Self::SceneNode { path, .. } => path.rsplit('/').next().unwrap_or(path),
             Self::Local { .. } => "", // filled by the caller from the decl range
         }
     }
@@ -94,8 +107,26 @@ impl GodotDef {
 #[must_use]
 pub fn classify(db: &dyn Db, pos: FilePosition) -> Option<GodotDef> {
     let ft = db.file_text(pos.file)?;
+    // A scene file (`.tscn`/`.tres`) is not GDScript: the only classifiable position is a node's
+    // `name="…"` value, which identifies that scene node (the rename target for `$Path` references).
+    if ft
+        .res_path(db)
+        .as_deref()
+        .is_some_and(crate::queries::is_scene_path)
+    {
+        return classify_scene_name(db, ft, pos.file, pos.offset);
+    }
     let root = parse(db, ft).syntax_node();
     let tok = ast::token_at(&root, pos.offset.into())?;
+    // The cursor inside a `$Path`/`%Unique` expression identifies the scene node at the segment under
+    // it (a mid-path segment resolves the path *up to* there) — so a node can be renamed from a script.
+    if let Some(def) = classify_node_path_at(db, ft, pos.file, &tok, pos.offset) {
+        return Some(def);
+    }
+    // The same, for the call form `get_node("Panel/Btn")` (a `CallExpr`, not a `GetNodeExpr`).
+    if let Some(def) = classify_get_node_call_at(db, ft, &tok, pos.offset) {
+        return Some(def);
+    }
     let parent = tok.parent();
     // Identifiers are symbols. The soft keywords `match`/`when` are too — but ONLY in a name
     // position (a `Name` decl, or a `NameRef`/`FieldExpr` member). A bare `match` *statement* keyword
@@ -141,6 +172,16 @@ pub fn classify(db: &dyn Db, pos: FilePosition) -> Option<GodotDef> {
     //     Resolve the type name to a class_name global or an engine class.
     if has_ancestor(&tok, SyntaxKind::TypeRef) {
         return classify_type_name(db, &name);
+    }
+    // (C-guard) A *reference* inside an inner `class Name:` body (a `self.member` / bare member ref in
+    // an inner method, now that inner bodies are inferred — burndown 4.24 inc.2) resolves against the
+    // INNER scope, which `resolve_name_to_def` doesn't model yet: it would mis-resolve a bare inner
+    // member to a top-level same-named one, corrupting that top member's rename. So navigation stays
+    // **correct-or-refuse** inside inner-class bodies until the inner-scope-aware resolution lands
+    // (4.24 inc.3). The inner class's own *name* and its member *declarations* are handled by
+    // `classify_decl` above (an inner decl already refuses there) — this guards only the body refs.
+    if has_ancestor(&tok, SyntaxKind::InnerClassDecl) {
+        return None;
     }
     // (C) A reference inside a function body / field initializer (a `NameRef`, or the member token
     //     of a `FieldExpr`). Resolve through the inference units.
@@ -290,9 +331,20 @@ fn classify_body_ref(
     }
 }
 
-/// Replicate [`crate::infer`]'s bare-name lookup order, returning the *declaration identity*:
-/// local → own/inherited member → engine global → `class_name` global → autoload. `offset` is the
-/// reference site, used to pick the correct binding when a name is shadowed (lexical scoping).
+/// The **canonical bare-name lookup order** (Godot `reduce_identifier`), shared with
+/// [`crate::infer::resolve_name`]'s type-producing copy:
+///
+/// 1. a **local** binding (var / param / `for`-var / `match`-capture; nearest-preceding on a shadow),
+/// 2. an **own** class member,
+/// 3. an **inherited** member (walk the user `extends` chain),
+/// 4. an **engine global** (builtin / native class / singleton / utility / enum),
+/// 5. a **`class_name` global**,
+/// 6. an **autoload** singleton.
+///
+/// This function is the identity (`GodotDef`) producer; `infer::resolve_name` is the `Ty` producer.
+/// They are intentionally separate (the latter is woven with flow-narrowing + `UNUSED`/`UNASSIGNED`
+/// side-effects and runs mid-inference), but must never **drift** on *which* declaration a use binds
+/// to — the `classify_and_infer_agree_*` tests (gdscript-ide) lock that agreement at every rung.
 fn resolve_name_to_def(
     db: &dyn Db,
     ft: FileText,
@@ -349,31 +401,42 @@ fn resolve_name_to_def(
         return Some(GodotDef::Engine { name: name.clone() });
     }
     // 5. A `class_name` global.
-    if let Some(root) = db.source_root()
-        && let Some(decl) = crate::queries::global_registry(db, root).resolve(name)
-    {
-        return Some(GodotDef::Global {
-            decl_file: decl.file_id(db),
-            name: name.clone(),
-        });
+    if let Some(def) = class_name_global_def(db, name) {
+        return Some(def);
     }
     // 6. An autoload singleton.
-    if let Some(config) = db.project_config()
-        && let Some(path) = crate::queries::autoload_registry(db, config)
-            .resolve_path(name)
-            .cloned()
-    {
-        let target = db.source_root().and_then(|root| {
-            crate::queries::res_path_registry(db, root)
-                .get(path.as_str())
-                .copied()
-        });
-        return Some(GodotDef::Autoload {
-            name: name.clone(),
-            target_file: target,
-        });
-    }
-    None
+    autoload_def(db, name)
+}
+
+/// Rung 5 of the canonical lookup order: a project-global `class_name` → its declaring file's
+/// [`GodotDef::Global`]. (The same `global_registry` `infer::resolve_name` resolves through, so the
+/// two paths agree on *which* file declares the class.)
+fn class_name_global_def(db: &dyn Db, name: &SmolStr) -> Option<GodotDef> {
+    let root = db.source_root()?;
+    let decl = crate::queries::global_registry(db, root).resolve(name)?;
+    Some(GodotDef::Global {
+        decl_file: decl.file_id(db),
+        name: name.clone(),
+    })
+}
+
+/// Rung 6 of the canonical lookup order: an autoload singleton → [`GodotDef::Autoload`], carrying the
+/// `.gd` it points to when resolvable (`None` for a `.tscn`/non-`.gd` target). (The same
+/// `autoload_registry` `infer::resolve_name` resolves through.)
+fn autoload_def(db: &dyn Db, name: &SmolStr) -> Option<GodotDef> {
+    let config = db.project_config()?;
+    let path = crate::queries::autoload_registry(db, config)
+        .resolve_path(name)
+        .cloned()?;
+    let target_file = db.source_root().and_then(|root| {
+        crate::queries::res_path_registry(db, root)
+            .get(path.as_str())
+            .copied()
+    });
+    Some(GodotDef::Autoload {
+        name: name.clone(),
+        target_file,
+    })
 }
 
 /// The file that *declares* member `name` for the script in `sref`, walking the `extends` chain
@@ -484,6 +547,181 @@ pub fn node_path_target(db: &dyn Db, pos: FilePosition) -> Option<NodePathTarget
         header_span: node.header_span,
         name_span: node.name_span,
     })
+}
+
+// ---- W8: node-as-symbol classification (scene-aware rename) -------------------------------
+
+/// Classify the cursor when it sits inside a `$Path`/`%Unique` node-path expression: resolve the
+/// path **up to the segment under the cursor** to a scene node, returning its [`GodotDef::SceneNode`]
+/// identity. A mid-path segment (`$A/B/C` on `B`) resolves `A/B`, so renaming `B` is distinct from
+/// renaming `C`. `None` when the cursor is not in a node path, the attachment is ambiguous
+/// (multi-scene — we can't say *which* scene's node), or the path doesn't resolve.
+fn classify_node_path_at(
+    db: &dyn Db,
+    ft: FileText,
+    _file: FileId,
+    tok: &GdToken,
+    offset: u32,
+) -> Option<GodotDef> {
+    let np = node_path_ancestor(tok)?;
+    let unique = np.kind() == SyntaxKind::UniqueNodeExpr;
+    let truncated = node_path_up_to_cursor(&np, offset)?;
+    let ctx = crate::queries::scene_context(db, ft)?;
+    if ctx.ambiguous {
+        return None; // multi-scene attachment — we can't identify *which* scene's node
+    }
+    let idx = if unique {
+        ctx.model.resolve_unique(&truncated)
+    } else {
+        ctx.model.resolve_path_from(ctx.attach, &truncated)
+    }?;
+    Some(GodotDef::SceneNode {
+        scene: ctx.scene,
+        path: ctx.model.node_full_path(idx)?,
+    })
+}
+
+/// Classify the cursor on the literal string of a `get_node("Panel/Btn")` / `get_node_or_null(…)`
+/// call (lowered to `Expr::GetNode`, but a `CallExpr` at the CST level so `classify_node_path_at`
+/// does not catch it). Resolves the path up to the cursor segment from the script's attach node.
+fn classify_get_node_call_at(
+    db: &dyn Db,
+    ft: FileText,
+    tok: &GdToken,
+    offset: u32,
+) -> Option<GodotDef> {
+    if tok.kind() != SyntaxKind::String {
+        return None;
+    }
+    let fi = crate::queries::analyze_file(db, ft);
+    let unit = fi.unit_at(offset)?;
+    let eid = unit.body.source_map.expr_at_offset(offset)?;
+    let crate::body::Expr::GetNode { path: Some(_), .. } = unit.body.expr(eid) else {
+        return None; // not a node-path call (or a computed `get_node(var)`)
+    };
+    let range = cst::token_range(tok);
+    let content = tok.text().trim_matches(['"', '\'']);
+    let truncated = segment_up_to(content, range.start + 1, offset)?;
+    let ctx = crate::queries::scene_context(db, ft)?;
+    if ctx.ambiguous {
+        return None;
+    }
+    // The literal may carry a `%Name` head; `resolve_path_from` strips the `%` per segment.
+    Some(GodotDef::SceneNode {
+        scene: ctx.scene,
+        path: ctx
+            .model
+            .node_full_path(ctx.model.resolve_path_from(ctx.attach, &truncated)?)?,
+    })
+}
+
+/// The innermost `GetNodeExpr`/`UniqueNodeExpr` ancestor of `tok`, if any.
+fn node_path_ancestor(tok: &GdToken) -> Option<GdNode> {
+    let mut cur = Some(tok.parent().clone());
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            SyntaxKind::GetNodeExpr | SyntaxKind::UniqueNodeExpr
+        ) {
+            return Some(n);
+        }
+        cur = n.parent().cloned();
+    }
+    None
+}
+
+/// The node path `np` truncated to (and including) the segment the cursor at `offset` is on. Two CST
+/// shapes: a token form (`$Panel/StartButton` — each segment its own `Ident`) and a string form
+/// (`$"Panel/StartButton"` — one `String` holding the path).
+fn node_path_up_to_cursor(np: &GdNode, offset: u32) -> Option<String> {
+    // String form: locate the segment by byte offset inside the quoted content.
+    if let Some(str_tok) = np
+        .children_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .find(|t| t.kind() == SyntaxKind::String)
+    {
+        let range = cst::token_range(str_tok);
+        let content = str_tok.text().trim_matches(['"', '\'']);
+        return segment_up_to(content, range.start + 1, offset); // +1 past the opening quote
+    }
+    // Token form: the segment `Ident`s (range, text) in order; keep through the one at the cursor.
+    let idents: Vec<(TextRange, String)> = np
+        .children_with_tokens()
+        .filter_map(cstree::util::NodeOrToken::into_token)
+        .filter(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| (cst::token_range(t), t.text().to_owned()))
+        .collect();
+    let hit = idents
+        .iter()
+        .position(|(r, _)| offset >= r.start && offset <= r.end)
+        // the cursor sits on a `/` or trailing space — attribute it to the preceding segment
+        .or_else(|| idents.iter().rposition(|(r, _)| r.start <= offset))?;
+    Some(
+        idents[..=hit]
+            .iter()
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// Classify a position in a `.tscn`: the node whose `name="…"` value contains the cursor →
+/// [`GodotDef::SceneNode`]. `None` if the cursor is not on a node name.
+/// The path `content` (located at byte `content_start`) truncated to (and including) the segment
+/// containing `offset`. Used for every `/`-segmented path value (a `$"…"` string, a `parent=`, a
+/// `[connection] from`/`to`). `None` if the cursor is outside the content.
+fn segment_up_to(content: &str, content_start: u32, offset: u32) -> Option<String> {
+    let rel = offset.checked_sub(content_start)? as usize;
+    if rel > content.len() {
+        return None;
+    }
+    let end = content[rel.min(content.len())..]
+        .find('/')
+        .map_or(content.len(), |i| rel + i);
+    Some(content[..end].to_owned())
+}
+
+/// Whether `offset` is inside `[span.start, span.end)`.
+fn in_span(offset: u32, span: TextRange) -> bool {
+    offset >= span.start && offset < span.end
+}
+
+/// Classify a position in a `.tscn`: the scene node the cursor identifies — its own `name="…"`, a
+/// `parent="…"` path segment, or a `[connection] from`/`to` path segment (all resolved to a
+/// [`GodotDef::SceneNode`] by full path). These are the dependent references a node rename rewrites.
+fn classify_scene_name(db: &dyn Db, ft: FileText, file: FileId, offset: u32) -> Option<GodotDef> {
+    let model = crate::queries::scene_model(db, ft);
+    let def = |idx: NodeIdx| {
+        Some(GodotDef::SceneNode {
+            scene: file,
+            path: model.node_full_path(idx)?,
+        })
+    };
+    // (1) The node's own `name="…"`.
+    for (i, n) in model.nodes.iter().enumerate() {
+        if in_span(offset, n.name_span) {
+            return def(NodeIdx(u32::try_from(i).ok()?));
+        }
+    }
+    // (2) A `parent="…"` path segment (root-relative; resolved from the root).
+    for n in &model.nodes {
+        if let (Some(span), Some(path)) = (n.parent_span, n.parent_path.as_deref())
+            && in_span(offset, span)
+        {
+            let trunc = segment_up_to(path, span.start, offset)?;
+            return def(model.resolve_path(&trunc)?);
+        }
+    }
+    // (3) A `[connection] from`/`to` path segment (root-relative).
+    for c in &model.connections {
+        for (span, path) in [(c.from_span, &c.from), (c.to_span, &c.to)] {
+            if in_span(offset, span) {
+                let trunc = segment_up_to(path, span.start, offset)?;
+                return def(model.resolve_path(&trunc)?);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

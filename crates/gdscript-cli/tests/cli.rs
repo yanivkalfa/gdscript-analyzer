@@ -51,6 +51,50 @@ fn clean_project_exits_0_with_empty_stdout() {
 }
 
 #[test]
+fn strict_flag_surfaces_the_opt_in_group_in_a_project() {
+    let dir = temp_project();
+    // A `project.godot` is present ⇒ default is engine-defaults (the opt-in UNSAFE_* group ignored).
+    write(
+        &dir,
+        "scripts/main.gd",
+        "extends Node\nfunc f(n: Node):\n\tn.no_such_method()\n",
+    );
+    let o = run(&["check", "--format", "json", dir.to_str().unwrap()]);
+    assert!(
+        !String::from_utf8_lossy(&o.stdout).contains("UNSAFE_METHOD_ACCESS"),
+        "default run must not surface the opt-in group: {}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let o2 = run(&[
+        "check",
+        "--strict",
+        "--format",
+        "json",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(
+        String::from_utf8_lossy(&o2.stdout).contains("UNSAFE_METHOD_ACCESS"),
+        "--strict must surface the opt-in group: {}",
+        String::from_utf8_lossy(&o2.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_and_engine_defaults_together_is_a_usage_error() {
+    let dir = temp_project();
+    write(&dir, "scripts/main.gd", "func f():\n\tpass\n");
+    let o = run(&[
+        "check",
+        "--strict",
+        "--engine-defaults",
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 2, "conflicting flags must be a usage error");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn warning_is_non_fatal_but_gateable() {
     let dir = temp_project();
     write(

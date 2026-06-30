@@ -416,20 +416,32 @@ impl Parser<'_> {
         self.close(m, PropertyBody);
     }
 
-    /// One `get`/`set` accessor (block or `= func` form).
+    /// One `get`/`set` accessor (an indented `:` block, or the inline `= func` form). Tightened: the
+    /// accessor keyword must be exactly `get` or `set` — a different identifier (a typo) is a parse
+    /// error, not a silently-accepted setter. A `get` takes no parameter; `set(value)` takes one.
     fn accessor(&mut self) {
-        let is_getter = self.cur_text() == "get";
+        let kind = match self.cur_text() {
+            "get" => Getter,
+            "set" => Setter,
+            // Recover by consuming the stray token so the accessor loop still makes progress.
+            _ => {
+                self.advance_with_error("expected `get` or `set` in a property accessor");
+                return;
+            }
+        };
         let m = self.open();
-        self.eat(Ident); // `get` / `set`
-        if self.at(LParen) {
-            self.param_list(); // `set(value)`
+        self.advance(); // `get` / `set`
+        // Only `set` carries a parameter (`set(value)`); a `get(x)` is rejected (the `(` is left for
+        // recovery — a `get` has no parameter list).
+        if kind == Setter && self.at(LParen) {
+            self.param_list();
         }
         if self.eat(Colon) {
             self.block();
         } else if self.eat(Eq) {
             self.expr();
         }
-        self.close(m, if is_getter { Getter } else { Setter });
+        self.close(m, kind);
     }
 
     // ---- statements & blocks --------------------------------------------------
@@ -487,7 +499,9 @@ impl Parser<'_> {
             IfKw => self.if_stmt(),
             ForKw => self.for_stmt(),
             WhileKw => self.while_stmt(),
-            MatchKw => self.match_stmt(),
+            // `match` is a soft keyword: a statement-initial `match` used as an identifier (`match.x`,
+            // `match = …`, `match(x)` with no trailing `:`) is an expression, not the match statement.
+            MatchKw if self.match_begins_statement() => self.match_stmt(),
             ReturnKw => self.return_stmt(),
             BreakKw => self.simple_stmt(BreakStmt),
             ContinueKw => self.simple_stmt(ContinueStmt),
@@ -900,7 +914,10 @@ impl Parser<'_> {
         self.expect(LBrace);
         while !self.at(RBrace) && !self.eof() {
             let e = self.open();
-            self.expr();
+            // Parse the key ABOVE assignment precedence so the Lua-style `key = value` separator is
+            // NOT folded into the key as an assignment expression: `{ pos = x }` is a dict entry
+            // (key `pos`, value `x`), not the statement `pos = x` (which would false-`TYPE_MISMATCH`).
+            self.expr_bp(bp(PREC_ASSIGN, Assoc::Right).0 + 1);
             if self.eat(Colon) || self.eat(Eq) {
                 self.expr();
             }
@@ -913,18 +930,31 @@ impl Parser<'_> {
         self.close(m, DictLit)
     }
 
-    /// `$Path` / `%Unique`: a sigil followed by a string or an identifier path.
+    /// `$Path` / `%Unique`: a sigil followed by a string, or a `/`-separated identifier path whose
+    /// segments may be `%`-prefixed unique-node names (`$%Unique`, `$A/%Unique/B`). A `%` is only a
+    /// path sigil when immediately followed by a name; a `%` before a non-name (`$A % 5`) is modulo
+    /// and is left for the Pratt loop.
     fn get_node(&mut self, node: SyntaxKind, sigil: SyntaxKind) -> MarkClosed {
         let m = self.open();
         self.expect(sigil);
         if self.eat(String) {
             // `$"Path/With Spaces"`
-        } else if self.eat(Ident) {
+        } else {
+            self.eat_node_path_segment();
             while self.eat(Slash) {
-                self.eat(Ident);
+                self.eat_node_path_segment();
             }
         }
         self.close(m, node)
+    }
+
+    /// One node-path segment: an optional `%` (unique-node sigil, only when it precedes a name)
+    /// followed by an identifier.
+    fn eat_node_path_segment(&mut self) {
+        if self.at(Percent) && self.nth(1) == Ident {
+            self.advance(); // `%`
+        }
+        self.eat(Ident);
     }
 
     /// A lambda (`func`-expression). Returns the closed node and whether its body was an

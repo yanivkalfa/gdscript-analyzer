@@ -339,6 +339,48 @@ fn parent_into_instanced_subscene_is_not_dangling_but_a_real_typo_is() {
 }
 
 #[test]
+fn a_cascading_dangling_parent_is_reported_only_once() {
+    // `A` is parented to a missing node `Ghost`; `B` is parented *through* `A` (`Ghost/A`). Only the
+    // root-cause `A` must be flagged — `B`'s miss is a cascade of `A` being detached, not a separate
+    // problem. `C` (one level deeper, `Ghost/A/B`) must also be suppressed.
+    let m = parse_scene(
+        "[gd_scene format=3]\n\
+         [node name=\"Root\" type=\"Node\"]\n\
+         [node name=\"A\" type=\"Node\" parent=\"Ghost\"]\n\
+         [node name=\"B\" type=\"Node\" parent=\"Ghost/A\"]\n\
+         [node name=\"C\" type=\"Node\" parent=\"Ghost/A/B\"]\n",
+    );
+    let dangling = m
+        .problems
+        .iter()
+        .filter(|p| matches!(p, SceneProblem::DanglingParent { .. }))
+        .count();
+    assert_eq!(
+        dangling, 1,
+        "only the root-cause node `A` should be flagged: {:?}",
+        m.problems
+    );
+}
+
+#[test]
+fn two_siblings_missing_the_same_parent_are_both_flagged() {
+    // Both `A` and `A2` directly reference the missing `Ghost` — each is its own root cause (not a
+    // cascade of the other), so BOTH are flagged.
+    let m = parse_scene(
+        "[gd_scene format=3]\n\
+         [node name=\"Root\" type=\"Node\"]\n\
+         [node name=\"A\" type=\"Node\" parent=\"Ghost\"]\n\
+         [node name=\"A2\" type=\"Node\" parent=\"Ghost\"]\n",
+    );
+    let dangling = m
+        .problems
+        .iter()
+        .filter(|p| matches!(p, SceneProblem::DanglingParent { .. }))
+        .count();
+    assert_eq!(dangling, 2, "{:?}", m.problems);
+}
+
+#[test]
 fn override_children_under_an_inherited_root_are_not_dangling() {
     // The websocket_chat pattern: an INHERITED-scene root whose override children reference base
     // nodes (`Connect`) not redeclared here. The resolved prefix isn't itself an instance, but it
@@ -430,4 +472,49 @@ fn never_panics_on_garbage() {
     ] {
         let _ = parse_scene(g); // must not panic
     }
+}
+
+#[test]
+fn captures_connections_with_inner_identifier_spans() {
+    let src = "[gd_scene format=3]\n\
+[node name=\"Main\" type=\"Control\"]\n\
+[node name=\"StartButton\" type=\"Button\" parent=\".\"]\n\
+[connection signal=\"pressed\" from=\"StartButton\" to=\".\" method=\"_on_start_pressed\"]\n";
+    let m = parse_scene(src);
+    assert!(m.problems.is_empty(), "{:?}", m.problems);
+    assert_eq!(m.connections.len(), 1);
+    let c = &m.connections[0];
+    assert_eq!(c.signal, "pressed");
+    assert_eq!(c.from, "StartButton");
+    assert_eq!(c.to, ".");
+    assert_eq!(c.method, "_on_start_pressed");
+    // Each span is the inner identifier (quotes excluded) — exactly what a rename rewrites.
+    let at = |r: gdscript_base::TextRange| &src[r.start as usize..r.end as usize];
+    assert_eq!(at(c.signal_span), "pressed");
+    assert_eq!(at(c.from_span), "StartButton");
+    assert_eq!(at(c.to_span), ".");
+    assert_eq!(at(c.method_span), "_on_start_pressed");
+}
+
+#[test]
+fn captures_node_property_keys_with_spans() {
+    let src = "[gd_scene format=3]\n\
+[node name=\"Enemy\" type=\"Node2D\"]\n\
+speed = 5.0\n\
+position = Vector2(1, 2)\n\
+theme_override_colors/font_color = Color(1, 1, 1, 1)\n";
+    let m = parse_scene(src);
+    assert!(m.problems.is_empty(), "{:?}", m.problems);
+    let n = m.node(m.root.unwrap()).unwrap();
+    let keys: Vec<&str> = n.properties.iter().map(|p| p.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["speed", "position", "theme_override_colors/font_color"]
+    );
+    // the key span is the bare key (for `speed`, exactly `speed`).
+    let speed = n.properties.iter().find(|p| p.key == "speed").unwrap();
+    assert_eq!(
+        &src[speed.key_span.start as usize..speed.key_span.end as usize],
+        "speed"
+    );
 }

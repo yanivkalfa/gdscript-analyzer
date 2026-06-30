@@ -203,8 +203,8 @@ func ramp() -> int:
         if (!az) return;
         const text = model.getValue();
         az.changeDocument(URI, text);
-        let diags = [];
-        try { diags = JSON.parse(az.diagnostics(URI)); } catch { /* keep [] */ }
+        // Queries return native JS values now (no JSON.parse); unknown/empty → [].
+        const diags = az.diagnostics(URI) ?? [];
         const markers = diags.map((d) => {
           const r = byteRangeToMonaco(text, d.range.start, d.range.end);
           return {
@@ -244,9 +244,7 @@ func ramp() -> int:
       monaco.languages.registerHoverProvider("gdscript", {
         provideHover(_m, position) {
           if (!az) return null;
-          const raw = az.hover(URI, byteAt(position));
-          if (!raw) return null;
-          let h; try { h = JSON.parse(raw); } catch { return null; }
+          const h = az.hover(URI, byteAt(position)); // object | null (no JSON.parse)
           if (!h?.ty_label) return null;
           const contents = [{ value: "```gdscript\n" + h.ty_label + "\n```" }];
           if (h.doc) contents.push({ value: h.doc });
@@ -260,8 +258,7 @@ func ramp() -> int:
         triggerCharacters: [".", "$", "%", "(", ","],
         provideCompletionItems(_m, position) {
           if (!az) return { suggestions: [] };
-          let items = [];
-          try { items = JSON.parse(az.completions(URI, byteAt(position))); } catch { /* [] */ }
+          const items = az.completions(URI, byteAt(position)) ?? []; // native array (no JSON.parse)
           const word = model.getWordUntilPosition(position);
           const range = {
             startLineNumber: position.lineNumber, endLineNumber: position.lineNumber,
@@ -284,9 +281,8 @@ func ramp() -> int:
         signatureHelpTriggerCharacters: ["(", ","],
         provideSignatureHelp(_m, position) {
           if (!az) return null;
-          const raw = az.signatureHelp(URI, byteAt(position));
-          if (!raw) return null;
-          let s; try { s = JSON.parse(raw); } catch { return null; }
+          const s = az.signatureHelp(URI, byteAt(position)); // object | null (no JSON.parse)
+          if (!s) return null;
           const sigs = (s.signatures ?? []).map((sig) => ({
             label: sig.label ?? "",
             // Monaco's signature field is `parameters`; the analyzer POD names it `params`.
