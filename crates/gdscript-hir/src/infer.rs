@@ -143,6 +143,10 @@ fn collect_assign_lhs(body: &Body) -> FxHashSet<ExprId> {
         .collect()
 }
 
+/// Infer one function/initializer body against a class scope: walks the lowered [`body::Body`],
+/// resolving each expression's [`Ty`] (engine + cross-file members, scene-node paths, flow
+/// narrowing) and recording the bindings, diagnostics, and severity-free gateable warnings.
+/// Returns the [`InferenceResult`] the IDE features and the warning gate read.
 #[must_use]
 #[allow(
     clippy::too_many_lines,

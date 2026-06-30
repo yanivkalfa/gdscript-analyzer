@@ -1,5 +1,8 @@
 //! `gdscript-api` — the Godot engine model, generated from `extension_api.json`.
 //!
+//! > **Internal layer (not a stable API).** Depend on [`gdscript-ide`](https://docs.rs/gdscript-ide) (the public surface); the items here
+//! > may change between releases.
+//!
 //! The model (engine classes + inheritance chain, methods, properties, signals, enums,
 //! constants, singletons, utility functions, builtin Variant types) plus the hand-authored
 //! GDScript layer the dump omits (pseudo-constants + builtin functions). See

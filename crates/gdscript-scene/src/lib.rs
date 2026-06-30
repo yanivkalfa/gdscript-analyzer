@@ -1,5 +1,8 @@
 //! `gdscript-scene` — a `.tscn`/`.tres` **text** parser for scene-aware analysis (Phase 4).
 //!
+//! > **Internal layer (not a stable API).** Depend on [`gdscript-ide`](https://docs.rs/gdscript-ide) (the public surface); the items here
+//! > may change between releases.
+//!
 //! Godot's text scene format is INI-like: bracketed section headers (`[node …]`, `[ext_resource …]`,
 //! …) followed by `key = value` property lines. This crate parses that structure — node names,
 //! types, parent paths, attached scripts, `unique_name_in_owner`, and instanced sub-scenes — into a
@@ -19,6 +22,7 @@
 //! **Portability:** a core crate — wasm32-clean (no `std::fs`, no `Instant`, no threads); `.tscn`
 //! text is injected via the VFS exactly like `.gd`.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 
 mod model;
 mod parse;

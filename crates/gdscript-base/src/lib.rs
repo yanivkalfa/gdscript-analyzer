@@ -7,7 +7,12 @@
 //!
 //! All offsets are **byte** offsets into a file's UTF-8 source. No logic beyond the
 //! conversions lives here. The crate is `wasm32`-safe (no `std::fs`, clocks, threads).
+//!
+//! These POD result structs are the analyzer's **public wire contract** (consumed via
+//! [`gdscript_ide`](https://docs.rs/gdscript-ide)), so every public item is documented and
+//! `#![deny(missing_docs)]` keeps it that way.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 
 use serde::{Deserialize, Serialize};
 

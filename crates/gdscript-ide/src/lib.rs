@@ -14,7 +14,11 @@
 //! a concurrent `apply_change` cancels in-flight reads on outstanding handles, which unwind
 //! into `Err(Cancelled)` at the query boundary (see [`catch`]). The public API shape is
 //! unchanged. The crate stays `wasm32`-safe (CI guards this).
+//!
+//! This is the analyzer's **public Rust API**, so every public item is documented and
+//! `#![deny(missing_docs)]` keeps it that way.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 
 use std::sync::Arc;
 

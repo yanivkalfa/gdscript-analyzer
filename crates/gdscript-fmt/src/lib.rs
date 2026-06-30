@@ -1,5 +1,8 @@
 //! `gdscript-fmt` — the GDScript source formatter (Phase-6 Workstream 3).
 //!
+//! > **Internal layer (not a stable API).** Depend on [`gdscript-ide`](https://docs.rs/gdscript-ide) (the public surface); the items here
+//! > may change between releases.
+//!
 //! A pure `fn(source, &FmtConfig) -> String`: no engine model, no filesystem, `wasm32`-safe.
 //! It re-emits the lexer/pre-pass token stream, normalizing **block indentation** (to the
 //! configured unit), **trailing whitespace**, and the **final newline** — every *significant*
@@ -25,6 +28,7 @@
 //! behaviours (magic trailing comma, operator-chain paren injection, quote normalization) are
 //! token-mutating and documented in `DEVIATIONS.md`.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 
 use gdscript_syntax::SyntaxKind;
 

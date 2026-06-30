@@ -1016,11 +1016,14 @@ each with its own bug-hunt, than batched in under freeze pressure. Sequenced by 
       `gdscript-base` are the public contract per their READMEs; everything else is the "internal layer"):
       - per-crate READMEs — author the 4 missing (`gdscript-cli`/`gdscript-ffi`/`gdscript-lsp`/
         `gdscript-session`) + `xtask`, uniform with the existing 8.
-      - rustdoc completeness — `#![deny(missing_docs)]` on the **contract** crates (`gdscript-base` is
-        already gap-free; `gdscript-ide` — fill), an **"internal — not a stable API"** banner on the
-        non-contract crates, and `missing_docs` enforcement where the gap is bounded (the gate's
-        `-D warnings` promotes `missing_docs` to an error, so the lint is added only when the crate is
-        fully filled).
+      - rustdoc completeness — **DONE.** `#![deny(missing_docs)]` on **6 crates**, all verified gap-free:
+        the contract crates `gdscript-base` + `gdscript-ide` (both already complete), and the internal
+        `gdscript-fmt` / `gdscript-hir` / `gdscript-scene` / `gdscript-session` (gap-free after a 1-item
+        `infer` fill). An **"internal — not a stable API"** banner on all 7 internal library crates.
+        `missing_docs` is intentionally **not** denied on `gdscript-api` (2 rkyv-`Archive`-*generated*
+        fields), `gdscript-db` (salsa-derived items), or `gdscript-syntax` (the 157-variant `SyntaxKind`
+        token/node catalog + ast accessors — a self-describing bulk surface) — the gate's `-D warnings`
+        would force documenting macro-generated / low-value items; the banner + module docs carry those.
       - mdBook (`docs/src`) — verified all 13 referenced pages exist; light link/coverage pass.
       **Remains for W6 (by definition):** the **contract page** (verbatim semver policy + the
       Godot-version matrix, authored *with* the freeze) + the playground-as-live-docs deep links.
