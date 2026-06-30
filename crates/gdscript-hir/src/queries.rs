@@ -2185,6 +2185,9 @@ mod tests {
              \tvar hp: int = 5\n\
              \tfunc ping() -> int:\n\
              \t\treturn 1\n\
+             \tfunc combo() -> int:\n\
+             \t\tvar s := self.get_class()\n\
+             \t\treturn hp + ping()\n\
              func f():\n\
              \tvar x := Inner.new()\n\
              \tvar a := x.hp\n\

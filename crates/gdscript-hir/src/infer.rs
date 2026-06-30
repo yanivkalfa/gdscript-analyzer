@@ -578,11 +578,99 @@ pub fn analyze_file(db: &dyn Db, api: &EngineApi, root: &GdNode, file_id: FileId
         }
     }
 
+    // Pass 2b — inner-class method bodies. The top-level pass skips `Member::Class`, so inner `class
+    // Name:` methods were never inferred (no units / diagnostics / resolvable refs). Analyze them with
+    // `self` typed as the inner class, so `self.member` / bare member refs resolve against the inner
+    // item-tree + its `extends` chain; anything unresolved stays the seam (no false positive).
+    infer_inner_class_bodies(
+        db,
+        api,
+        root,
+        &tree,
+        file_id,
+        "",
+        res_path.as_deref(),
+        &mut units,
+        &mut diagnostics,
+        &mut raw_warnings,
+        0,
+    );
+
     FileInference {
         tree,
         units,
         diagnostics,
         raw_warnings,
+    }
+}
+
+/// Infer the method bodies of every inner `class Name:` in `tree` (recursively), with `self` typed as
+/// the inner class. `path_prefix` is the dotted path to `tree`'s class (`""` at the top level), used
+/// to build each inner class's [`crate::ty::InnerClassRef`] path. Depth-bounded against pathological
+/// nesting. Inner-class *field* fixpoint pre-pass is intentionally skipped (an inner field types by
+/// annotation only — lossy, like the cross-file path).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads the same analyze_file accumulators a free helper can't capture from a closure"
+)]
+fn infer_inner_class_bodies(
+    db: &dyn Db,
+    api: &EngineApi,
+    root: &GdNode,
+    tree: &ItemTree,
+    file_id: FileId,
+    path_prefix: &str,
+    res_path: Option<&str>,
+    units: &mut Vec<Unit>,
+    diagnostics: &mut Vec<Diagnostic>,
+    raw_warnings: &mut Vec<RawWarning>,
+    depth: u32,
+) {
+    if depth > 16 {
+        return;
+    }
+    for m in &tree.members {
+        let Member::Class(c) = m else { continue };
+        let inner_path = if path_prefix.is_empty() {
+            c.name.to_string()
+        } else {
+            format!("{path_prefix}.{}", c.name)
+        };
+        let mut class = ClassScope::new(db, api, &c.tree, res_path);
+        class.self_ty = Ty::InnerClass(crate::ty::InnerClassRef {
+            file: file_id.0,
+            path: SmolStr::new(&inner_path),
+        });
+        for im in &c.tree.members {
+            let Member::Func(f) = im else { continue };
+            let Some(node) = f.ptr.to_node(root) else {
+                continue;
+            };
+            let body = body::body_of_func(&node);
+            let return_ty = cst::first_child(&node, |k| k == gdscript_syntax::SyntaxKind::TypeRef)
+                .map_or(Ty::Variant, |t| resolve::resolve_type_ref(db, api, &t));
+            let result = infer(db, api, root, &class, &body, return_ty, true);
+            diagnostics.extend(result.diagnostics.iter().cloned());
+            raw_warnings.extend(result.raw_warnings.iter().cloned());
+            units.push(Unit {
+                range: f.range,
+                body,
+                result,
+            });
+        }
+        infer_inner_class_bodies(
+            db,
+            api,
+            root,
+            &c.tree,
+            file_id,
+            &inner_path,
+            res_path,
+            units,
+            diagnostics,
+            raw_warnings,
+            depth + 1,
+        );
     }
 }
 
