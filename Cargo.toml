@@ -118,7 +118,7 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1"
 ignore = "0.4"
 annotate-snippets = "0.12"
-toml = "0.8"
+toml = "1.1"
 # Phase 5 — the standalone LSP server (`gdscript-lsp`, native-only; never in the wasm32 core gate).
 # rust-analyzer's own low-level stack: `lsp-server` (stdio transport + a `Connection` = a pair of
 # crossbeam channels → trivial in-process test harness) + `lsp-types` (LSP 3.17 structs incl.
