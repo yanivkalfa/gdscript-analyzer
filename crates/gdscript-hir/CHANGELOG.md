@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (under Cargo's 0.x reading: while `0.x`, a breaking change bumps the minor and a
 new feature is a patch).
+## [0.5.4] - 2026-07-02
+
+### Added
+
+- **hir:** UNDEFINED_METHOD/UNDEFINED_PROPERTY on builtin receivers + initializer narrowing for untyped locals
+
+### Fixed
+
+- **hir:** Review pass — keyed sugar wins over method names, tuple escape-widening, cast-store invalidation; ADRs 0007/0008
+
+
+
 ## [0.5.1] - 2026-06-30
 
 
