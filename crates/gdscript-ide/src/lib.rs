@@ -68,6 +68,10 @@ pub struct Change {
     /// The project's `project.godot` text (loader-supplied; M4 `[autoload]` resolution). Set once
     /// on project open / when it changes; omit on `.gd` keystrokes.
     pub project_config: Option<Arc<str>>,
+    /// The loader's claim that the file set is the **whole project** (every `.gd` under the
+    /// project root) — the gate for absence-based diagnostics (`UNDEFINED_FUNCTION` /
+    /// `UNDEFINED_IDENTIFIER`). Set once at load; omit on edits. `None` leaves it unchanged.
+    pub workspace_complete: Option<bool>,
 }
 
 impl Change {
@@ -97,6 +101,13 @@ impl Change {
     /// / when it changes; omit on `.gd` keystrokes.
     pub fn set_project_config(&mut self, text: impl Into<Arc<str>>) {
         self.project_config = Some(text.into());
+    }
+
+    /// Record the loader's claim that the file set is the **whole project** (see
+    /// [`Change::workspace_complete`]). Only a loader that actually walked the whole project root
+    /// should pass `true` — it is the soundness gate for the absence-based `UNDEFINED_*` codes.
+    pub fn set_workspace_complete(&mut self, complete: bool) {
+        self.workspace_complete = Some(complete);
     }
 }
 
@@ -137,6 +148,11 @@ impl AnalysisHost {
         // MEDIUM-durability registry stays firewalled against keystrokes.
         if structure_changed {
             self.db.sync_source_root();
+        }
+        // The loader's whole-project claim — after the sync so it lands on the (possibly fresh)
+        // root. No-op-guarded in the db, so re-sending the same claim never bumps a revision.
+        if let Some(complete) = change.workspace_complete {
+            self.db.set_workspace_complete(complete);
         }
     }
 

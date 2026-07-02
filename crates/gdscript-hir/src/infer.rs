@@ -1697,7 +1697,7 @@ impl Cx<'_> {
             Expr::Index { base, index } => {
                 let base_ty = self.infer_expr(base, &Expectation::None);
                 self.infer_expr(index, &Expectation::None);
-                self.index_ty(&base_ty)
+                self.index_ty(&base_ty, index)
             }
             Expr::Is { operand, .. } => {
                 self.infer_expr(operand, &Expectation::None);
@@ -1799,7 +1799,7 @@ impl Cx<'_> {
 
     fn literal_ty(&self, lit: Literal) -> Ty {
         match lit {
-            Literal::Int => self.int_ty(),
+            Literal::Int(_) => self.int_ty(),
             Literal::Float | Literal::MathConst => self.float_ty(),
             Literal::Bool(_) => self.bool_ty(),
             Literal::Str => self.builtin("String"),
@@ -2191,7 +2191,27 @@ impl Cx<'_> {
                 self.infer_field(receiver, &name, name_range, /*as_method=*/ true)
             }
             Expr::Name(name) => {
-                let ret = self.resolve_call_name(&name);
+                // Locals first (BUG A2), matching `resolve_name`'s canonical local→member→… order:
+                // a bare-name call on a local/param (`var f = func(): …` then `f(0)`, a
+                // `cb: Callable` param, a hook alias `var useState = Hooks.useState`) is a READ of
+                // that binding — routed through `resolve_name` so it gets the FULL read treatment
+                // (`used_locals` for `UNUSED_*`, the `UNASSIGNED_VARIABLE` definite-assignment
+                // check, flow narrowing), not just a use mark. The local also shadows a same-named
+                // own/inherited method (real GDScript scoping). Its call result is the seam:
+                // `Ty::Callable` carries no signature, and `Variant` here would fire false
+                // `INFERENCE_ON_VARIANT` on `var x := f()`.
+                let ret = if self.locals.contains_key(name.as_str()) {
+                    self.resolve_name(callee, &name);
+                    Ty::Unknown
+                } else if let Some(t) = self.resolve_call_name(&name) {
+                    t
+                } else {
+                    // Every same-file tier missed. With a COMPLETE workspace this is provably a
+                    // typo (`usseState(0)`) unless a cross-file global/autoload/member exists —
+                    // `UNDEFINED_FUNCTION` (BUG A1); otherwise the silent seam as before.
+                    self.maybe_warn_undefined_call(callee, &name);
+                    Ty::Unknown
+                };
                 self.expr_ty.insert(callee, Ty::Callable);
                 ret
             }
@@ -2269,6 +2289,12 @@ impl Cx<'_> {
     /// first, then the `self` engine base's method. Utilities/builtins are skipped (looser, often
     /// variadic typing — out of the conservative MVP slice).
     fn name_call_param_tys(&self, name: &str) -> Option<Vec<Ty>> {
+        // A local/param shadows a same-named method for a bare-name call (BUG A2, mirroring
+        // `infer_call`'s locals-first resolution) — the local `Callable`'s params aren't modeled,
+        // so the shadowed method's signature must not arg-check the call.
+        if self.locals.contains_key(name) {
+            return None;
+        }
         if let Some(item) = self.class.lookup(name)
             && let Some(Member::Func(f)) = self.class.member(item)
         {
@@ -2297,39 +2323,137 @@ impl Cx<'_> {
     }
 
     /// Resolve a bare-name call (`foo(...)`): own method → utility/builtin fn → constructor.
-    fn resolve_call_name(&self, name: &str) -> Ty {
+    /// A local/param callee never reaches here — `infer_call`'s `Expr::Name` arm resolves locals
+    /// first (BUG A2; this fn is `&self` and could not record the read into `used_locals`).
+    /// `None` when every tier missed — the caller decides between the silent `Ty::Unknown` seam
+    /// (cross-file / incomplete workspace) and `UNDEFINED_FUNCTION` (BUG A1; this fn is `&self`
+    /// and cannot emit).
+    fn resolve_call_name(&self, name: &str) -> Option<Ty> {
         if let Some(item) = self.class.lookup(name)
             && let Some(Member::Func(f)) = self.class.member(item)
         {
-            return self.func_return_ty(f.return_type.as_deref());
+            return Some(self.func_call_return_ty(f));
         }
         // A bare call inside the class is `self.name(...)` — resolve against the inherited base.
         if let Ty::Object(base) = self.class.base
             && let Some(MemberRef::Method(sig)) = self.api.lookup_member(base, name)
         {
-            return ty::resolve_tyref(self.api, &sig.return_ty);
+            return Some(ty::resolve_tyref(self.api, &sig.return_ty));
         }
         if let Some(u) = self.api.utility(name) {
-            return ty::resolve_tyref(self.api, &u.return_ty);
+            return Some(ty::resolve_tyref(self.api, &u.return_ty));
         }
         if let Some(f) = self.api.gdscript_builtin(name) {
-            return resolve::layer_to_ty(self.api, f.ret);
+            return Some(resolve::layer_to_ty(self.api, f.ret));
         }
         // A builtin / class name used as a constructor: `Vector2(...)` / `Array(...)`.
         // Normalize via `resolve_tyref` so `Array`/`Dictionary`/`Callable`/`Signal` land on
         // their dedicated `Ty` variants rather than `Builtin(...)`.
         if let Some(b) = self.api.builtin_by_name(name) {
-            return ty::resolve_tyref(self.api, &TyRef::Builtin(b));
+            return Some(ty::resolve_tyref(self.api, &TyRef::Builtin(b)));
         }
-        // Otherwise unresolved — most likely a cross-file global / autoload / a method on a
-        // `class_name` base we can't see. Treat as the seam so `var x := foo()` never warns.
-        Ty::Unknown
+        // Unresolved — a cross-file global / autoload / a method on a `class_name` base we can't
+        // see, or a genuine typo. The caller disambiguates.
+        None
+    }
+
+    /// The soundness gate for the absence-based `UNDEFINED_*` codes (BUG A1). Emitting "defined
+    /// nowhere" requires being able to SEE everywhere a definition could live, so all of:
+    /// - the loader declared the workspace COMPLETE ([`gdscript_db::SourceRoot::complete`]) — a
+    ///   lone file (or a partial load) can never prove absence of a cross-file `class_name`;
+    /// - this is a top-level script class (`self_ty` is a `ScriptRef`) — an inner class's bare
+    ///   names may bind to outer-class members this scope's lookup does not chain to;
+    /// - the base chain is fully engine-native (`Ty::Object`) — a user-script base (`ScriptRef`)
+    ///   or an unresolved `extends` could hide an inherited definition the walk can't rule out;
+    /// - the project does not target an engine NEWER than the bundled API model — a newer minor
+    ///   adds classes/utilities the model can't rule out (corpus: `DrawableTexture2D` on a 4.5
+    ///   model). An undeclared version is trusted at the bundled model's own version.
+    fn undefined_symbols_provable(&self) -> bool {
+        matches!(self.self_ty, Ty::ScriptRef(_))
+            && matches!(self.class.base, Ty::Object(_))
+            && self.db.source_root().is_some_and(|r| r.complete(self.db))
+            && crate::queries::project_engine_version(self.db)
+                .is_none_or(|v| v <= crate::warnings::bundled_version())
+    }
+
+    /// The trailing `name`-sized slice of `id`'s range — the exact identifier token. An
+    /// `Expr::Name` node's range may include LEADING trivia (the CST attaches it to the node) but
+    /// always ends at the identifier's last byte, so anchoring on the tail yields a precise
+    /// squiggle instead of one that bleeds onto the previous line.
+    fn name_token_range(&self, id: ExprId, name: &str) -> TextRange {
+        let r = self.range_of(id);
+        let len = u32::try_from(name.len()).unwrap_or(0);
+        TextRange::new(r.end.saturating_sub(len).max(r.start), r.end)
+    }
+
+    /// `UNDEFINED_FUNCTION` (BUG A1) for a bare-name call whose every same-file tier already
+    /// missed (`resolve_call_name` returned `None`, and the name is not a local — the A2 branch).
+    /// Cross-file tiers are checked here: a project `class_name`, a `*`-autoload, or an engine
+    /// global keeps the silent seam (calling those is a *different* mistake than "undefined", and
+    /// Godot reports it differently). A member of ANY kind (var/const/signal/enum/inner class) on
+    /// the class or its engine base also keeps the seam — "defined but not callable" is not
+    /// "undefined". Emission is gated by [`Self::undefined_symbols_provable`].
+    fn maybe_warn_undefined_call(&mut self, callee: ExprId, name: &str) {
+        if !self.undefined_symbols_provable() || self.class.lookup(name).is_some() {
+            return;
+        }
+        if let Ty::Object(base) = self.class.base
+            && self.api.lookup_member(base, name).is_some()
+        {
+            return;
+        }
+        if resolve::resolve_global(self.api, name).is_some()
+            || is_registered_global_class(self.db, name)
+            || is_autoload_singleton(self.db, name)
+        {
+            return;
+        }
+        self.warn(
+            self.name_token_range(callee, name),
+            WarningCode::UndefinedFunction,
+            format!(
+                "The function \"{name}()\" is not declared in this class, its base, or anywhere in the loaded project."
+            ),
+        );
+    }
+
+    /// `UNDEFINED_IDENTIFIER` (BUG A1) at `resolve_name`'s final fallthrough — every tier
+    /// (locals, own members, the engine base, engine globals, the project `class_name` registry,
+    /// autoload singletons) already missed structurally by the time this is called, so with the
+    /// [`Self::undefined_symbols_provable`] gate the name is provably undeclared.
+    fn maybe_warn_undefined_identifier(&mut self, id: ExprId, name: &str) {
+        if !self.undefined_symbols_provable() {
+            return;
+        }
+        // A REGISTERED autoload can still resolve to the seam (`resolve_autoload` deliberately
+        // yields `Unknown` for a scene-backed singleton — `Music="*res://music.tscn"` — whose
+        // root-script type we can't see): registry presence means DEFINED, so never warn.
+        if is_autoload_singleton(self.db, name) {
+            return;
+        }
+        self.warn(
+            self.name_token_range(id, name),
+            WarningCode::UndefinedIdentifier,
+            format!(
+                "The identifier \"{name}\" is not declared in the current scope or anywhere in the loaded project."
+            ),
+        );
     }
 
     fn func_return_ty(&self, annotation: Option<&str>) -> Ty {
         annotation.map_or(Ty::Variant, |t| {
             resolve::resolve_type_name(self.db, self.api, t)
         })
+    }
+
+    /// The return type of CALLING an own `func`: a `## @return-tuple(T0, T1, …)` doc-tag (BUG A3)
+    /// wins — its positional element types become a [`Ty::Tuple`], so a constant index projects
+    /// the element's real type — else the plain annotation.
+    fn func_call_return_ty(&self, f: &crate::item_tree::FuncItem) -> Ty {
+        if let Some(names) = &f.tuple_return {
+            return resolve::resolve_tuple_return(self.db, self.api, names);
+        }
+        self.func_return_ty(f.return_type.as_deref())
     }
 
     /// Member access `receiver.name`. When `as_method`, resolve a method (and use its return
@@ -2362,21 +2486,25 @@ impl Cx<'_> {
                     // e.g. GDScript, also carry a modeled `new` member — the constructor wins).
                     recv_ty.clone()
                 } else if let Some(m) = self.api.lookup_member(*class, name) {
+                    // `lookup_member` also resolves enum VALUES (`Control.PRESET_FULL_RECT` →
+                    // `MemberRef::EnumValue`, typed as its enum by `member_ref_ty`) — the single
+                    // source of truth for that rule.
                     self.check_member_kind_misuse(&m, as_method, name, name_range);
                     self.check_static_on_instance(receiver, &m, as_method, name_range);
                     self.member_ref_ty(&m, as_method)
-                } else if let Some(t) = self.class_enum_value(*class, name) {
-                    // A statically-accessed enum value (`Control.PRESET_FULL_RECT`).
-                    t
                 } else {
                     // Self with an Object base already checked own members above.
                     self.emit_unsafe(name, &recv_ty, name_range, as_method);
                     Ty::Variant
                 }
             }
-            Ty::Builtin(_) | Ty::Array(_) | Ty::Dict(..) | Ty::Callable | Ty::Signal(_) => {
-                self.builtin_member_ty(&recv_ty, name, name_range, as_method)
-            }
+            // A tuple's members are its runtime `Array`'s (`size`/`append`/… via builtin_id_of).
+            Ty::Builtin(_)
+            | Ty::Array(_)
+            | Ty::Tuple(_)
+            | Ty::Dict(..)
+            | Ty::Callable
+            | Ty::Signal(_) => self.builtin_member_ty(&recv_ty, name, name_range, as_method),
             // Accessing a member of an enum namespace (`State.IDLE`) yields the enum type itself —
             // an enum value (freely int-assignable via `ty::is_assignable`). Was `int`, which lost
             // the enum type and false-`INFERENCE_ON_VARIANT`'d a same-file `var x := State.IDLE`.
@@ -2703,18 +2831,26 @@ impl Cx<'_> {
                     Ty::Callable
                 }
             }
+            // An enum-typed property resolves its qualified enum name through the SAME resolver
+            // annotations use (`resolve_type_name` handles both `Enum` and `Class.Enum`), so the
+            // real `is_bitfield` is recovered — a hardcoded `bitfield: false` made
+            // `size_flags_horizontal = SIZE_EXPAND_FILL` look like two DIFFERENT enums and
+            // false-fired `INT_AS_ENUM_WITHOUT_CAST` on the same-enum assignment.
             MemberRef::Property(p) => p.enum_of.as_ref().map_or_else(
                 || ty::resolve_tyref(self.api, &p.ty),
-                |q| {
-                    Ty::Enum(EnumRef {
-                        qualified: SmolStr::new(q),
-                        bitfield: false,
-                    })
-                },
+                |q| resolve::resolve_type_name(self.db, self.api, q),
             ),
             MemberRef::Const(c) => ty::resolve_tyref(self.api, &c.ty),
             MemberRef::Signal(_) => Ty::Signal(None),
             MemberRef::Enum(_) => Ty::Variant,
+            // A class enum's VALUE (`Control.SIZE_EXPAND_FILL` / bare in a subclass): its
+            // declaring ENUM type (mirroring `class_enum_value`), so an enum member into its own
+            // enum slot stays `Assign::Ok` — never a false `INT_AS_ENUM_WITHOUT_CAST`. (Still
+            // freely assignable to `int` via `ty::is_assignable`.)
+            MemberRef::EnumValue { class, decl, .. } => Ty::Enum(EnumRef {
+                qualified: SmolStr::new(format!("{}.{}", class, decl.name)),
+                bitfield: decl.is_bitfield,
+            }),
         }
     }
 
@@ -2758,36 +2894,12 @@ impl Cx<'_> {
         Ty::Variant
     }
 
-    /// The type of a class enum **value** accessed statically (`Control.PRESET_FULL_RECT`):
-    /// the engine exposes enum values as class members, so search every (inherited) enum's
-    /// values. Returns the value's **declaring enum type** (`Ty::Enum`) — mirroring how a
-    /// `Class.Enum` *annotation* resolves (`resolve::resolve_named`), so an enum member assigned
-    /// to a slot of that same enum is `Assign::Ok`, not a false `INT_AS_ENUM_WITHOUT_CAST`. (An
-    /// enum value is still freely assignable to `int` — see `ty::is_assignable`.)
-    fn class_enum_value(&self, class: gdscript_api::ClassId, name: &str) -> Option<Ty> {
-        let mut cur = Some(class);
-        while let Some(cid) = cur {
-            let c = self.api.class(cid);
-            if let Some(e) = c
-                .enums
-                .iter()
-                .find(|e| e.values.iter().any(|v| v.name == name))
-            {
-                return Some(Ty::Enum(EnumRef {
-                    qualified: SmolStr::new(format!("{}.{}", c.name, e.name)),
-                    bitfield: e.is_bitfield,
-                }));
-            }
-            cur = c.base;
-        }
-        None
-    }
-
     /// The builtin id backing a builtin / `Array` / `Dictionary` receiver.
     fn builtin_id_of(&self, ty: &Ty) -> Option<gdscript_api::BuiltinId> {
         match ty {
             Ty::Builtin(b) => Some(*b),
-            Ty::Array(_) => self.api.builtin_by_name("Array"),
+            // A tuple IS an `Array` at runtime — its methods (`size`/`append`/…) are Array's.
+            Ty::Array(_) | Ty::Tuple(_) => self.api.builtin_by_name("Array"),
             Ty::Dict(..) => self.api.builtin_by_name("Dictionary"),
             Ty::Callable => self.api.builtin_by_name("Callable"),
             Ty::Signal(_) => self.api.builtin_by_name("Signal"),
@@ -2795,10 +2907,22 @@ impl Cx<'_> {
         }
     }
 
-    /// The element type of an indexing expression (Playbook §2 switch).
-    fn index_ty(&self, base: &Ty) -> Ty {
+    /// The element type of an indexing expression (Playbook §2 switch). `index` is the subscript
+    /// expression — a CONSTANT integer literal selects a [`Ty::Tuple`]'s positional element type
+    /// (BUG A3: `useState(...)[1]` is the setter `Callable`, not `Variant`).
+    fn index_ty(&self, base: &Ty, index: ExprId) -> Ty {
         match base {
             Ty::Array(elem) => (**elem).clone(),
+            // A tuple projects the element at a constant in-bounds index; a dynamic or
+            // out-of-bounds index degrades to the runtime element type (`Variant`), exactly like
+            // the untyped `Array` the tuple is at runtime.
+            Ty::Tuple(elems) => match self.body.expr(index) {
+                Expr::Literal(body::Literal::Int(Some(i))) => usize::try_from(*i)
+                    .ok()
+                    .and_then(|i| elems.get(i).cloned())
+                    .unwrap_or(Ty::Variant),
+                _ => Ty::Variant,
+            },
             Ty::Builtin(b) => self
                 .api
                 .builtin(*b)
@@ -2812,7 +2936,9 @@ impl Cx<'_> {
         }
     }
 
-    /// The loop variable's type for `for v in iter:` (Playbook §2 switch).
+    /// The loop variable's type for `for v in iter:` (Playbook §2 switch). Iterating a
+    /// [`Ty::Tuple`] visits its runtime array's elements (`Variant` — positions are meaningless
+    /// during iteration), which is the wildcard arm below.
     fn loop_var_ty(&self, iter: &Ty) -> Ty {
         match iter {
             Ty::Array(elem) => (**elem).clone(),
@@ -2946,7 +3072,14 @@ impl Cx<'_> {
         if !by_class.is_unknown() {
             return by_class;
         }
-        resolve::resolve_external(self.db, &resolve::ExternalRef::Autoload(SmolStr::new(name)))
+        let by_autoload =
+            resolve::resolve_external(self.db, &resolve::ExternalRef::Autoload(SmolStr::new(name)));
+        if by_autoload.is_unknown() {
+            // EVERY tier missed. With a complete workspace this name is provably undeclared —
+            // `UNDEFINED_IDENTIFIER` (BUG A1); otherwise the silent seam as before.
+            self.maybe_warn_undefined_identifier(id, name);
+        }
+        by_autoload
     }
 
     fn own_member_ty(&self, item: ClassItem, as_method: bool) -> Ty {
@@ -2957,7 +3090,7 @@ impl Cx<'_> {
                 Some(Member::Const(c)) => self.field_ty(&c.name, c.ptr),
                 Some(Member::Func(f)) => {
                     if as_method {
-                        self.func_return_ty(f.return_type.as_deref())
+                        self.func_call_return_ty(f)
                     } else {
                         Ty::Callable
                     }
@@ -3202,6 +3335,36 @@ mod tests {
             .collect()
     }
 
+    /// Whole-file codes for `files[0]`, analyzed in PROJECT mode (BUG A1 harness): every
+    /// `(res_path, text)` pair is loaded into the db, the source root is synced, and the loader's
+    /// completeness claim is applied. `project_godot`, when given, feeds the autoload registry.
+    fn project_codes(
+        files: &[(&str, &str)],
+        project_godot: Option<&str>,
+        complete: bool,
+    ) -> Vec<String> {
+        let api = gdscript_api::bundled();
+        let mut db = gdscript_db::RootDatabase::default();
+        for (i, (path, text)) in files.iter().enumerate() {
+            let id = FileId(u32::try_from(i).unwrap());
+            db.set_file_text(id, text, salsa::Durability::LOW);
+            db.set_file_path(id, path);
+        }
+        if let Some(cfg) = project_godot {
+            db.set_project_config(cfg);
+        }
+        db.sync_source_root();
+        db.set_workspace_complete(complete);
+        let root = parse(files[0].1).syntax_node();
+        let fi = analyze_file(&db, api, &root, FileId(0));
+        fi.diagnostics
+            .iter()
+            .map(|d| d.code.clone())
+            .chain(fi.raw_warnings.iter().map(|w| w.code.as_str().to_owned()))
+            .filter(|c| !DECLARATION_STRICTNESS.contains(&c.as_str()))
+            .collect()
+    }
+
     /// Run the whole-file pass (Pass 1 field fixpoint + Pass 2 functions) and collect every
     /// diagnostic code (ungated diagnostics + raw gateable warnings). Drives `analyze_file`
     /// directly so the bounded member fixpoint runs.
@@ -3216,6 +3379,298 @@ mod tests {
             .chain(fi.raw_warnings.iter().map(|w| w.code.as_str().to_owned()))
             .filter(|c| !DECLARATION_STRICTNESS.contains(&c.as_str()))
             .collect()
+    }
+
+    // ── Review-pass regressions (branch fix/guitkx-diagnostic-gaps) ──────────────────────────
+
+    #[test]
+    fn bare_global_enum_value_types_as_its_enum_not_int() {
+        // `MOUSE_BUTTON_LEFT` is a `MouseButton` value: assigning it to a `MouseButton` slot is
+        // Enum→Enum (Ok) — the int typing regression fired a false INT_AS_ENUM_WITHOUT_CAST on
+        // code Godot accepts.
+        let h =
+            infer_first_func("func f():\n\tvar b: MouseButton = MOUSE_BUTTON_LEFT\n\treturn b\n");
+        assert!(
+            !codes(&h).contains(&"INT_AS_ENUM_WITHOUT_CAST"),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn gdscript_builtin_surface_is_complete_no_undefined_function() {
+        // The full @GDScript pseudo-class surface must resolve — `print_debug` etc. are absent
+        // from every extracted table, and an uncovered one false-flags as an ERROR-severity
+        // UNDEFINED_FUNCTION in a complete workspace.
+        let src = "func f():\n\tprint_debug(\"x\")\n\tprint_stack()\n\tvar st = get_stack()\n\tvar o = ord(\"a\")\n\tvar c = convert(1, TYPE_STRING)\n\tvar t = type_exists(\"Node\")\n\tvar d = inst_to_dict(self)\n\tvar i = dict_to_inst(d)\n\treturn [st, o, c, t, d, i]\n";
+        let c = project_codes(&[("res://main.gd", src)], None, true);
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "every @GDScript builtin must resolve: {c:?}"
+        );
+    }
+
+    #[test]
+    fn scene_autoload_singleton_is_never_undefined() {
+        // A REGISTERED `*`-autoload backed by a .tscn resolves to the seam (its root script is
+        // invisible) — registry presence means DEFINED, so the identifier must not flag.
+        let c = project_codes(
+            &[("res://main.gd", "func f():\n\treturn Music\n")],
+            Some("[autoload]\nMusic=\"*res://music.tscn\"\n"),
+            true,
+        );
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "a registered scene autoload is defined: {c:?}"
+        );
+    }
+
+    #[test]
+    fn calling_an_unassigned_local_callable_still_flags_unassigned() {
+        // The locals-first CALL branch routes through resolve_name, so the definite-assignment
+        // check fires for a call-before-assignment exactly like a read-before-assignment.
+        let h = infer_first_func(
+            "func f():\n\tvar cb: Callable\n\tcb.call()\n\tvar g: Callable\n\tg = Callable()\n\tg.call()\n",
+        );
+        // (cb is read via the receiver path; keep this focused on the bare-call form:)
+        let h2 = infer_first_func("func f():\n\tvar cb: Callable\n\tcb()\n\tcb = Callable()\n");
+        assert!(
+            codes(&h2).contains(&"UNASSIGNED_VARIABLE"),
+            "a bare call reads the local before assignment: {:?} / {:?}",
+            codes(&h),
+            codes(&h2)
+        );
+    }
+
+    #[test]
+    fn over_indent_recovered_statements_are_still_analyzed() {
+        // The recovery Block's statements flatten into the function scope (GDScript locals are
+        // function-scoped): the over-indented `5 / 2` must still produce INTEGER_DIVISION.
+        let src =
+            "func f():\n\tvar a = 1\n\t\tvar bad = 5 / 2\n\tvar b = 2\n\treturn [a, b, bad]\n";
+        let c = file_codes(src);
+        assert!(
+            c.iter().any(|x| x == INTEGER_DIVISION),
+            "recovered statements must be analyzed: {c:?}"
+        );
+    }
+
+    // ── BUG A3: `## @return-tuple(...)` → Ty::Tuple + constant-index projection ──────────────
+
+    const HOOK_DECL: &str =
+        "## @return-tuple(Variant, Callable)\nstatic func useState(v):\n\treturn [v, Callable()]\n";
+
+    #[test]
+    fn return_tuple_tag_projects_a_constant_index() {
+        // `useState(0)[1]` is the setter: a REAL `Callable`, so a typo'd method on it is caught
+        // (UNSAFE_METHOD_ACCESS on the Callable builtin) while the correct `.call` stays silent.
+        // Both direct indexing and an `:=`-inferred local carry the tuple.
+        let src = format!(
+            "{HOOK_DECL}func f():\n\tvar s := useState(0)\n\ts[1].call(1)\n\ts[1].casll(1)\n\tuseState(0)[1].casll(2)\n"
+        );
+        let c = file_codes(&src);
+        assert_eq!(
+            c.iter().filter(|x| *x == "UNSAFE_METHOD_ACCESS").count(),
+            2,
+            "exactly the two typo'd setter methods flag: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_untyped_local_stays_variant_by_godot_semantics() {
+        // An UNTYPED `var s = useState(0)` local is a `Variant` variable in GDScript (only `:=`
+        // infers) — Godot itself cannot check through it, and neither do we. Seeing through an
+        // untyped local would need assignment-carried flow narrowing (a Workstream-2 extension,
+        // documented follow-up), not a projection change.
+        let src =
+            format!("{HOOK_DECL}func f():\n\tvar s = useState(0)\n\ts[1].casll(1)\n\treturn s\n");
+        let c = file_codes(&src);
+        assert!(
+            !c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            "an untyped local is Variant — never checked: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_dynamic_or_oob_index_degrades_to_variant() {
+        // A dynamic index (or an out-of-bounds constant) cannot select a position — it degrades
+        // to the runtime element type (`Variant`), which never fires member checks.
+        let src = format!(
+            "{HOOK_DECL}func f(i: int):\n\tvar s := useState(0)\n\ts[i].casll(1)\n\ts[7].casll(1)\n"
+        );
+        let c = file_codes(&src);
+        assert!(
+            !c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            "no confident projection without a constant in-bounds index: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_widens_to_array_for_assignment_and_methods() {
+        // At runtime the tuple IS an untyped Array: it assigns to an `Array` slot without a
+        // mismatch, and Array methods (`size`) resolve on it.
+        let src = format!(
+            "{HOOK_DECL}func f():\n\tvar s := useState(0)\n\tvar a: Array = s\n\treturn [a, s.size()]\n"
+        );
+        let c = file_codes(&src);
+        assert!(
+            !c.iter()
+                .any(|x| x == TYPE_MISMATCH || x == "UNSAFE_METHOD_ACCESS"),
+            "a tuple behaves as its runtime Array: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_resolves_cross_file_via_the_member_table() {
+        // The guitkx shape once the virtual doc emits field calls: `Hooks.useState(...)` in ONE
+        // file, the tagged hook in ANOTHER — the tuple flows through the script member table.
+        let files = [
+            (
+                "res://main.gd",
+                "func f():\n\tvar s := Hooks.useState(0)\n\ts[1].casll(1)\n",
+            ),
+            (
+                "res://hooks.gd",
+                "class_name Hooks\n## @return-tuple(Variant, Callable)\nstatic func useState(v):\n\treturn [v, Callable()]\n",
+            ),
+        ];
+        let c = project_codes(&files, None, true);
+        assert!(
+            c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            "the typo'd setter method must flag cross-file: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_tag_is_ignored_when_malformed() {
+        // One name is not a tuple; the tag degrades to the plain (annotationless) return.
+        let src = "## @return-tuple(Variant)\nstatic func one(v):\n\treturn [v]\nfunc f():\n\tvar s = one(0)\n\ts[0].casll(1)\n";
+        let c = file_codes(src);
+        assert!(
+            !c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            "a malformed tag must not project: {c:?}"
+        );
+    }
+
+    // ── BUG A1: UNDEFINED_FUNCTION / UNDEFINED_IDENTIFIER (complete-workspace gated) ─────────
+
+    #[test]
+    fn undefined_function_fires_with_a_complete_workspace() {
+        let c = project_codes(
+            &[("res://main.gd", "func f():\n\tusseState(0)\n")],
+            None,
+            true,
+        );
+        assert!(
+            c.iter().any(|x| x == "UNDEFINED_FUNCTION"),
+            "a provable typo call must fire: {c:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_function_is_silent_without_the_completeness_claim() {
+        // The same typo with the workspace NOT declared complete (a lone file / partial load, even
+        // with a source root present) keeps the silent seam — absence is not provable.
+        let c = project_codes(
+            &[("res://main.gd", "func f():\n\tusseState(0)\n")],
+            None,
+            false,
+        );
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "incomplete workspace must stay silent: {c:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_function_skips_cross_file_class_names_and_autoloads() {
+        // `Enemy` is a registered global class in ANOTHER file, `Music` a `*`-autoload singleton:
+        // calling/reading them is never "undefined" (misusing them is a different mistake).
+        let files = [
+            (
+                "res://main.gd",
+                "func f():\n\tvar e = Enemy.new()\n\tMusic.play()\n\treturn e\n",
+            ),
+            ("res://enemy.gd", "class_name Enemy\nfunc hit(): pass\n"),
+            ("res://music.gd", "func play(): pass\n"),
+        ];
+        let c = project_codes(
+            &files,
+            Some("[autoload]\nMusic=\"*res://music.gd\"\n"),
+            true,
+        );
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "cross-file globals + autoloads must resolve: {c:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_function_skips_locals_engine_methods_utilities_and_members() {
+        // A local Callable call (A2), an inherited engine method, a utility fn, and a bare call on
+        // a member that exists as a VAR (defined-but-not-callable is not "undefined").
+        let src = "extends Node\nvar handler: Callable\nfunc f():\n\tvar cb = func(): return 1\n\tcb()\n\tget_child(0)\n\tprint(\"x\")\n\thandler()\n";
+        let c = project_codes(&[("res://main.gd", src)], None, true);
+        assert!(
+            !c.iter().any(|x| x == "UNDEFINED_FUNCTION"),
+            "locals / engine methods / utilities / members must never flag: {c:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_function_is_silent_under_a_user_script_base() {
+        // `extends Base` (a class_name in another file): the base chain is not engine-native, so
+        // absence of an inherited method is not provable — the gate keeps the seam even though
+        // `base_method` is defined only on the base.
+        let files = [
+            (
+                "res://main.gd",
+                "extends Base\nfunc f():\n\tbase_method()\n",
+            ),
+            (
+                "res://base.gd",
+                "class_name Base\nfunc base_method(): pass\n",
+            ),
+        ];
+        let c = project_codes(&files, None, true);
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "a ScriptRef base must gate emission off: {c:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_identifier_fires_and_respects_the_gate() {
+        let fire = project_codes(
+            &[("res://main.gd", "func f():\n\treturn nonexistent_thing\n")],
+            None,
+            true,
+        );
+        assert!(
+            fire.iter().any(|x| x == "UNDEFINED_IDENTIFIER"),
+            "a provable undeclared read must fire: {fire:?}"
+        );
+        let silent = project_codes(
+            &[("res://main.gd", "func f():\n\treturn nonexistent_thing\n")],
+            None,
+            false,
+        );
+        assert!(
+            !silent.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "incomplete workspace must stay silent: {silent:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_identifier_skips_lambda_captures_and_inner_class_bodies() {
+        // A lambda reading an outer local (a capture) is declared; an inner-class body is outside
+        // the gate (its bare names may bind outer-class members its scope doesn't chain to).
+        let src = "static func outer_helper(): pass\nclass Inner:\n\tfunc g():\n\t\touter_helper()\nfunc f():\n\tvar captured = 1\n\tvar l = func(): return captured\n\treturn l\n";
+        let c = project_codes(&[("res://main.gd", src)], None, true);
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "captures + inner-class bodies must never flag: {c:?}"
+        );
     }
 
     #[test]
@@ -4122,6 +4577,66 @@ mod tests {
             !codes(&h).contains(&INFERENCE_ON_VARIANT),
             "{:?}",
             h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_a_local_callable_param_is_a_use() {
+        // Regression (BUG A2): a bare-name call `cb(0)` on a param never recorded a read — only
+        // the value-read path (`resolve_name`) fed `used_locals` — so a param that was ONLY ever
+        // called fired a false UNUSED_PARAMETER.
+        let src = "func f(cb: Callable):\n\tcb(0)\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&"UNUSED_PARAMETER"),
+            "calling a param is a use: {:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_a_local_lambda_var_is_a_use() {
+        // Regression (BUG A2), local-var flavor: `var lam = func(x): …` then `lam(5)` used to
+        // fire UNUSED_VARIABLE on `lam` (the guitkx hook-stub symptom:
+        // `var useState = Hooks.useState` + `useState(0)` flagged useState unused).
+        let src = "func g():\n\tvar lam = func(x): return x + 1\n\tlam(5)\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&"UNUSED_VARIABLE"),
+            "calling a local is a use: {:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_a_local_callable_result_stays_the_seam() {
+        // The call RESULT of a local Callable is the seam (Ty::Callable carries no signature) —
+        // never `Variant`, so `var x := cb(0)` must not fire INFERENCE_ON_VARIANT.
+        let src = "func f(cb: Callable):\n\tvar x := cb(0)\n\treturn x\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn local_callable_shadows_same_named_method_in_a_call() {
+        // GDScript scoping: a local shadows an own/inherited method for a bare-name call, matching
+        // resolve_name's canonical local-first order. So the call binds the LOCAL: it is a use (no
+        // UNUSED_VARIABLE) and the shadowed method's signature must NOT arg-check the call (the
+        // local Callable's params aren't modeled — no UNSAFE_CALL_ARGUMENT / TYPE_MISMATCH).
+        let src = "func helper(x: int) -> int:\n\treturn x\nfunc f():\n\tvar helper = func(): return 1\n\thelper(\"not an int\")\n";
+        let c = file_codes(src);
+        assert!(
+            !c.iter().any(|x| x == "UNUSED_VARIABLE"),
+            "the shadowing local is used by the call: {c:?}"
+        );
+        assert!(
+            !c.iter()
+                .any(|x| x == "UNSAFE_CALL_ARGUMENT" || x == TYPE_MISMATCH),
+            "the shadowed method's signature must not check the local's call: {c:?}"
         );
     }
 

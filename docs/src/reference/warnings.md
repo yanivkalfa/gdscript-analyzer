@@ -43,6 +43,8 @@ Every gateable GDScript warning the analyzer can emit, with its `project.godot` 
 | `STATIC_CALLED_ON_INSTANCE` | `static_called_on_instance` | Warn | 4.3 | A static method is called through an instance. |
 | `UNASSIGNED_VARIABLE` | `unassigned_variable` | Warn | 4.3 | A typed local is read before it is assigned a value. |
 | `UNASSIGNED_VARIABLE_OP_ASSIGN` | `unassigned_variable_op_assign` | Warn | 4.3 | A compound assignment (`+=`, …) is applied to a still-unassigned local. |
+| `UNDEFINED_FUNCTION` | `undefined_function` | Error | 4.3 | A called function is not defined anywhere in the loaded project (a compile error in Godot). Analyzer-specific code; fires only when the loader declared the workspace complete. |
+| `UNDEFINED_IDENTIFIER` | `undefined_identifier` | Error | 4.3 | An identifier is not declared anywhere in the loaded project (a compile error in Godot). Analyzer-specific code; fires only when the loader declared the workspace complete. |
 | `UNREACHABLE_CODE` | `unreachable_code` | Warn | 4.3 | A statement follows an unconditional `return`/`break`/`continue` (or an exhaustive `match`). |
 | `UNREACHABLE_PATTERN` | `unreachable_pattern` | Warn | 4.3 | A `match` pattern can never match (it follows a wildcard). |
 | `UNSAFE_CALL_ARGUMENT` | `unsafe_call_argument` | Ignore | 4.3 | An argument needs an unsafe implicit cast into the parameter type. |

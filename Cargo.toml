@@ -25,7 +25,7 @@ default-members = [
 
 # Shared metadata inherited by every crate via `*.workspace = true`.
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 rust-version = "1.88.0" # MSRV = napi-rs v3 floor (asserted by the `msrv` CI job)
 license = "MIT OR Apache-2.0"

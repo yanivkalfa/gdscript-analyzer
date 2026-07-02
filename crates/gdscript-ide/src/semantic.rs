@@ -316,6 +316,10 @@ fn member_ref_label(api: &EngineApi, m: &MemberRef) -> Option<String> {
         MemberRef::Const(c) => ty::resolve_tyref(api, &c.ty).label(api),
         MemberRef::Signal(s) => Some(format!("signal {}", s.name)),
         MemberRef::Enum(e) => Some(format!("enum {}", e.name)),
+        MemberRef::EnumValue { class, decl, value } => Some(format!(
+            "{}.{}.{} = {}",
+            class, decl.name, value.name, value.value
+        )),
     }
 }
 
@@ -365,6 +369,8 @@ fn member_ref_doc(api: &EngineApi, m: &MemberRef) -> Option<String> {
         MemberRef::Signal(s) => s.doc,
         MemberRef::Const(c) => c.doc,
         MemberRef::Enum(e) => e.doc,
+        // Enum values carry no per-value doc handle in the model; hover shows the label only.
+        MemberRef::EnumValue { .. } => None,
     }?;
     api.doc(id).map(str::to_owned)
 }
@@ -718,6 +724,10 @@ fn member_ref_item(api: &EngineApi, m: &MemberRef) -> CompletionItem {
         ),
         MemberRef::Signal(_) => (CompletionKind::Signal, None),
         MemberRef::Enum(_) => (CompletionKind::Enum, None),
+        MemberRef::EnumValue { class, decl, .. } => (
+            CompletionKind::Constant,
+            Some(format!("{}.{}", class, decl.name)),
+        ),
     };
     CompletionItem {
         label: m.name().to_owned(),

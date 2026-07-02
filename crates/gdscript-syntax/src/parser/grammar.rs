@@ -463,6 +463,17 @@ impl Parser<'_> {
                         self.advance();
                         continue;
                     }
+                    // A stray, deeper `Indent` where a statement is expected: the pre-pass
+                    // emitted an `Indent`/`Dedent` pair around an over-indented line inside this
+                    // block (e.g. one body line accidentally indented one level too far). Consume
+                    // the *balanced* over-indented region as a single error region so its closing
+                    // `Dedent` does NOT terminate this block early — otherwise every following body
+                    // statement would spill to the enclosing scope and cascade ("expected a
+                    // declaration"). Emits exactly one diagnostic for the whole region.
+                    if self.at(Indent) {
+                        self.over_indented_region();
+                        continue;
+                    }
                     self.stmt();
                 }
                 self.eat(Dedent);
@@ -486,6 +497,42 @@ impl Parser<'_> {
             self.close(m, Block);
             false
         }
+    }
+
+    /// Recover from a stray, deeper `Indent` inside a block body (an over-indented line — one
+    /// or more body statements accidentally indented a level too far). The pre-pass wraps such a
+    /// run in a balanced `Indent … Dedent` pair; if the block loop let its `Dedent` fall through
+    /// it would close the *enclosing* block one level early and every following statement would
+    /// spill to the outer scope and cascade. Instead we open one `Block` node for the whole
+    /// over-indented run, parse its statements normally (so they are still analyzed — just nested
+    /// deeper), and consume the matching `Dedent`, balancing any further nesting inside. Emits
+    /// exactly one diagnostic for the region.
+    fn over_indented_region(&mut self) {
+        self.error("unexpected indentation".to_owned());
+        let m = self.open();
+        let mut depth = 0u32; // extra nested Indents opened inside this region
+        self.advance(); // the stray INDENT
+        loop {
+            match self.nth(0) {
+                Indent => {
+                    depth += 1;
+                    self.advance();
+                }
+                Dedent => {
+                    self.advance();
+                    if depth == 0 {
+                        break; // closes the stray region's own indent
+                    }
+                    depth -= 1;
+                }
+                Eof => break,
+                Newline | Semicolon => self.advance(),
+                // stmt() always consumes at least one token (resilient-parser invariant), so the
+                // loop provably progresses; the `Eof` arm is the only exit needed at end-of-file.
+                _ => self.stmt(),
+            }
+        }
+        self.close(m, Block);
     }
 
     /// One statement. Does not consume its trailing newline — the enclosing block /

@@ -150,6 +150,16 @@ impl Session {
         self.host.apply_change(change);
     }
 
+    /// Declare whether the opened file set is the **whole project** (every `.gd` under the project
+    /// root). Only a client that actually walked the whole root should pass `true` — it arms the
+    /// absence-based `UNDEFINED_FUNCTION` / `UNDEFINED_IDENTIFIER` diagnostics, which stay silent
+    /// otherwise (a partial view can never prove a name is defined nowhere).
+    pub fn set_workspace_complete(&mut self, complete: bool) {
+        let mut change = Change::new();
+        change.set_workspace_complete(complete);
+        self.host.apply_change(change);
+    }
+
     /// Install a runtime-fetched engine model (the wasm path: a `fetch`ed `extension_api` blob).
     /// Returns `false` if the bytes fail to decode. Native builds use the bundled model and need not
     /// call this; the **wasm** binding fetches the blob and installs it (without it, completion/hover

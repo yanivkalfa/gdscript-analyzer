@@ -24,3 +24,5 @@
   - [ADR-0002: Hand-written parser, tree-sitter as oracle](adr/0002-handwritten-parser-treesitter-oracle.md)
   - [ADR-0003: napi-rs v3 dual-target binding](adr/0003-napi-rs-v3-dual-target.md)
   - [ADR-0004: Lightweight RFC process + graduation trigger](adr/0004-rfc-graduation-trigger.md)
+  - [ADR-0005: Absence diagnostics gate on loader-asserted completeness](adr/0005-absence-diagnostics-completeness-gate.md)
+  - [ADR-0006: `@return-tuple` doc-tag + synthesized `Ty::Tuple`](adr/0006-return-tuple-doc-tag.md)

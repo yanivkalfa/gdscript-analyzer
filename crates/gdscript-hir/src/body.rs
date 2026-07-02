@@ -29,8 +29,9 @@ pub type Block = Vec<StmtId>;
 /// A literal's kind (the value text lives in the CST; only the kind drives typing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Literal {
-    /// An integer literal.
-    Int,
+    /// An integer literal, carrying its parsed value when it fits (`None` for an overflow) —
+    /// a CONSTANT index selects a [`crate::ty::Ty::Tuple`] element's positional type (BUG A3).
+    Int(Option<i64>),
     /// A float literal.
     Float,
     /// `true` / `false` (carries the value, for constant checks like `ASSERT_ALWAYS_*`).
@@ -741,7 +742,20 @@ impl Lowerer {
                     .iter()
                     .map(|e| {
                         let kv = cst::child_exprs(e);
-                        let key = self.lower_or_missing(kv.first(), cst::text_range_of(e));
+                        // A Lua-style entry (`IDLE = "idle"`, `=` instead of `:`) keys by the
+                        // IDENTIFIER'S NAME as a literal `String` — Godot never resolves it as an
+                        // expression. Lowering it as a name read fabricated a read of a
+                        // (usually undeclared) identifier: bogus flow facts and, with the
+                        // A1 `UNDEFINED_IDENTIFIER` check armed, a false positive on every
+                        // `{key = value}` dictionary (the corpus' biggest FP bucket).
+                        let key = if cst::has_token(e, K::Eq) {
+                            let range = kv
+                                .first()
+                                .map_or_else(|| cst::text_range_of(e), cst::text_range_of);
+                            self.alloc_expr(Expr::Literal(Literal::Str), range)
+                        } else {
+                            self.lower_or_missing(kv.first(), cst::text_range_of(e))
+                        };
                         let value = kv.get(1).map(|v| self.lower_expr(v));
                         (key, value)
                     })
@@ -821,10 +835,24 @@ impl Lowerer {
     }
 
     fn lower_block(&mut self, block: &GdNode) -> Block {
-        block
-            .children()
-            .filter_map(|c| self.lower_stmt(c))
-            .collect()
+        let mut out = Block::default();
+        self.lower_block_into(block, &mut out);
+        out
+    }
+
+    /// Lower a block's statements into `out`, FLATTENING any nested bare `Block` child — the
+    /// parser's over-indent recovery wraps a run of over-indented statements in one (see
+    /// `grammar.rs over_indented_region`), and GDScript locals are function-scoped (not
+    /// block-scoped), so its statements belong to the same scope and must be analyzed like any
+    /// sibling — not silently dropped by `lower_stmt`'s declaration fallthrough.
+    fn lower_block_into(&mut self, block: &GdNode, out: &mut Block) {
+        for c in block.children() {
+            if c.kind() == SyntaxKind::Block {
+                self.lower_block_into(c, out);
+            } else if let Some(s) = self.lower_stmt(c) {
+                out.push(s);
+            }
+        }
     }
 
     fn lower_stmt(&mut self, node: &GdNode) -> Option<StmtId> {
@@ -962,7 +990,9 @@ fn type_ref_ptr(node: &GdNode) -> Option<AstPtr> {
 fn literal_kind(node: &GdNode) -> Literal {
     use SyntaxKind as K;
     match cst::first_token(node).map(|t| t.kind()) {
-        Some(K::Int) => Literal::Int,
+        Some(K::Int) => {
+            Literal::Int(cst::first_token(node).and_then(|t| parse_int_literal(t.text())))
+        }
         Some(K::Float) => Literal::Float,
         Some(K::String) => Literal::Str,
         Some(K::StringName) => Literal::StringName,
@@ -971,6 +1001,19 @@ fn literal_kind(node: &GdNode) -> Literal {
         Some(K::False) => Literal::Bool(false),
         Some(K::ConstPi | K::ConstTau | K::ConstInf | K::ConstNan) => Literal::MathConst,
         _ => Literal::Null,
+    }
+}
+
+/// Parse a GDScript integer literal (decimal / `0x` hex / `0b` binary, `_` separators allowed).
+/// `None` on overflow or a malformed token (the parser owns that diagnostic).
+fn parse_int_literal(text: &str) -> Option<i64> {
+    let t = text.replace('_', "");
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        i64::from_str_radix(bin, 2).ok()
+    } else {
+        t.parse().ok()
     }
 }
 
