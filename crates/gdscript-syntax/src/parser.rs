@@ -885,9 +885,14 @@ func _ready() -> void:
         // level and cascaded into a swarm of "expected a declaration" errors (~13 for this input).
         // The over-indented run must now be recovered *inside* the function body, emitting exactly
         // one diagnostic, so the trailing statements stay in the body.
-        let src = "func render():\n\tvar a = 1\n\t\tvar bad = 2\n\tvar b = 2\n\tfor i in 3:\n\t\tpass\n";
+        let src =
+            "func render():\n\tvar a = 1\n\t\tvar bad = 2\n\tvar b = 2\n\tfor i in 3:\n\t\tpass\n";
         let parse = parse(src);
-        assert_eq!(parse.syntax_node().to_string(), src, "recovery stays lossless");
+        assert_eq!(
+            parse.syntax_node().to_string(),
+            src,
+            "recovery stays lossless"
+        );
         assert_eq!(
             parse.errors().len(),
             1,

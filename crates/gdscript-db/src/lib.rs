@@ -98,6 +98,13 @@ pub struct SourceRoot {
     /// Every file currently in the project, ordered by `FileId` for determinism.
     #[returns(ref)]
     pub files: Vec<FileText>,
+    /// The loader's assertion that this file set is the **whole project** (every `.gd` under the
+    /// project root was fed in). Default `false`. Absence-based diagnostics (`UNDEFINED_FUNCTION`
+    /// / `UNDEFINED_IDENTIFIER`) key on this: proving a name is defined *nowhere* requires seeing
+    /// *everywhere*, and neither `source_root().is_some()` (true after one lone file) nor
+    /// `project_config().is_some()` (a single-file CLI run still discovers `project.godot`) can
+    /// establish that — only the loader knows whether it walked the whole root.
+    pub complete: bool,
 }
 
 /// The project's `project.godot`, injected as raw text — the wasm-clean core never reads the
@@ -337,7 +344,28 @@ impl RootDatabase {
                 .with_durability(Durability::MEDIUM)
                 .to(files);
         } else {
-            let root = SourceRoot::builder(files)
+            // A fresh root starts INCOMPLETE — only the loader's explicit claim
+            // (`set_workspace_complete`) flips it.
+            let root = SourceRoot::builder(files, false)
+                .durability(Durability::MEDIUM)
+                .new(self);
+            self.root = Some(root);
+        }
+    }
+
+    /// Record the loader's claim that the current file set is the **whole project** (see
+    /// [`SourceRoot::complete`]). No-op if unchanged (salsa bumps an input field's revision on
+    /// every set, even for an identical value). Creates the (empty) root if none exists yet so
+    /// the claim survives a set-before-first-file ordering.
+    pub fn set_workspace_complete(&mut self, complete: bool) {
+        if let Some(root) = self.root {
+            if root.complete(self) != complete {
+                root.set_complete(self)
+                    .with_durability(Durability::MEDIUM)
+                    .to(complete);
+            }
+        } else {
+            let root = SourceRoot::builder(self.files.all(), complete)
                 .durability(Durability::MEDIUM)
                 .new(self);
             self.root = Some(root);

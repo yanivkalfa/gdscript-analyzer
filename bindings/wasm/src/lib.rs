@@ -103,6 +103,14 @@ impl Analyzer {
         self.session.set_project_config(&text);
     }
 
+    /// Declare whether the opened file set is the **whole project** (every `.gd` under the
+    /// project root). Pass `true` only after feeding every project file — it arms the
+    /// absence-based `UNDEFINED_FUNCTION` / `UNDEFINED_IDENTIFIER` diagnostics (silent otherwise).
+    #[wasm_bindgen(js_name = setWorkspaceComplete)]
+    pub fn set_workspace_complete(&mut self, complete: bool) {
+        self.session.set_workspace_complete(complete);
+    }
+
     /// Whether `uri` is currently open (distinguishes "not tracked" from a genuine empty result).
     #[wasm_bindgen(js_name = isOpen)]
     #[must_use]

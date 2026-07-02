@@ -167,7 +167,7 @@ fn run_format(args: &FormatArgs, g: &GlobalArgs) -> i32 {
 
     let mut unformatted = 0usize;
     let mut write_errors = 0usize;
-    for f in &project.files {
+    for f in project.targets() {
         let formatted = gdscript_fmt::format(&f.text, &cfg);
         let changed = formatted != *f.text;
         if args.check {

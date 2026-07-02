@@ -78,6 +78,15 @@ impl AnalysisHandle {
         self.session.set_project_config(&text);
     }
 
+    /// Declare whether the opened file set is the **whole project** (every `.gd` under the
+    /// project root). Pass `true` only after feeding every project file — it arms the
+    /// absence-based `UNDEFINED_FUNCTION` / `UNDEFINED_IDENTIFIER` diagnostics (silent otherwise:
+    /// a partial view can never prove a name is defined nowhere).
+    #[napi]
+    pub fn set_workspace_complete(&mut self, complete: bool) {
+        self.session.set_workspace_complete(complete);
+    }
+
     /// Whether `uri` is currently open. Lets a client distinguish "file not tracked" from a genuine
     /// empty result (the array queries return `[]` and the `null`-returning queries `null` for both).
     #[napi]

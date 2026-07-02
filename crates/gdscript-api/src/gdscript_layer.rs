@@ -22,6 +22,8 @@ pub enum LayerTy {
     Str,
     /// Bare `Array` (`Array[Variant]`).
     Array,
+    /// `Color`.
+    Color,
     /// The dynamic `Variant` top type.
     Variant,
     /// The Phase-3 seam marker — distinct from `Variant`, never warns (e.g. `preload`).
@@ -82,8 +84,23 @@ pub fn global_consts() -> Vec<GlobalConst> {
 /// it; these are the ones inference and completion rely on in Phase 2.
 #[must_use]
 pub fn builtin_fns() -> Vec<BuiltinFn> {
-    use LayerTy::{Array, Int, Str, Unknown, Void};
+    use LayerTy::{Array, Bool, Color, Int, Str, Unknown, Void};
     vec![
+        // Two `@GlobalScope` utility functions the extracted blob omits (the extraction filtered
+        // them; they are real bare globals — the corpus calls both). Hand-authored here, exactly
+        // what this layer is for, so bare calls resolve and never false-flag as UNDEFINED.
+        BuiltinFn {
+            name: "Color8",
+            min_args: 3,
+            max_args: Some(4),
+            ret: Color,
+        },
+        BuiltinFn {
+            name: "is_instance_of",
+            min_args: 2,
+            max_args: Some(2),
+            ret: Bool,
+        },
         // `preload(path)` resolves to a script/resource — opaque in Phase 2 (the seam).
         BuiltinFn {
             name: "preload",

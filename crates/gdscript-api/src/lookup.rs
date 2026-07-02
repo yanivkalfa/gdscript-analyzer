@@ -24,6 +24,18 @@ pub enum MemberRef<'a> {
     Const(&'a ConstInfo),
     /// A nested enum.
     Enum(&'a EnumInfo),
+    /// A VALUE of a nested enum, addressable bare on the class (`Control.SIZE_EXPAND_FILL` — and
+    /// bare `SIZE_EXPAND_FILL` inside a class extending it). Carries the declaring class + enum
+    /// so consumers can type it as its **enum** (`Class.EnumName`), not bare `int` — an enum
+    /// member into its own enum slot must stay `Assign::Ok` (no false `INT_AS_ENUM_WITHOUT_CAST`).
+    EnumValue {
+        /// The declaring class's name.
+        class: &'a str,
+        /// The declaring enum.
+        decl: &'a EnumInfo,
+        /// The value itself.
+        value: &'a crate::model::EnumValue,
+    },
 }
 
 impl MemberRef<'_> {
@@ -36,6 +48,7 @@ impl MemberRef<'_> {
             Self::Signal(s) => &s.name,
             Self::Const(c) => &c.name,
             Self::Enum(e) => &e.name,
+            Self::EnumValue { value, .. } => &value.name,
         }
     }
 }
@@ -107,6 +120,16 @@ impl EngineApi {
         self.data.global_enums.get(i as usize)
     }
 
+    /// Look up a `@GlobalScope` enum VALUE by its bare name (`MOUSE_BUTTON_LEFT`, `OK`,
+    /// `TYPE_STRING`, …) — these are global identifiers in GDScript. Returns the declaring enum
+    /// and the value.
+    #[must_use]
+    pub fn global_enum_value(&self, name: &str) -> Option<(&EnumInfo, &crate::model::EnumValue)> {
+        let (ei, vi) = *self.global_enum_value_by_name.get(name)?;
+        let e = self.data.global_enums.get(ei as usize)?;
+        Some((e, e.values.get(vi as usize)?))
+    }
+
     /// Look up a hand-authored pseudo-constant (`PI`/`TAU`/`INF`/`NAN`).
     #[must_use]
     pub fn global_const(&self, name: &str) -> Option<&GlobalConst> {
@@ -141,6 +164,19 @@ impl EngineApi {
             }
             if let Some(e) = c.enums.iter().find(|e| e.name == name) {
                 return Some(MemberRef::Enum(e));
+            }
+            // A class enum's VALUES are addressable bare on the class, like constants
+            // (`Control.SIZE_EXPAND_FILL`, and bare inside a subclass).
+            if let Some((e, v)) = c
+                .enums
+                .iter()
+                .find_map(|e| e.values.iter().find(|v| v.name == name).map(|v| (e, v)))
+            {
+                return Some(MemberRef::EnumValue {
+                    class: &c.name,
+                    decl: e,
+                    value: v,
+                });
             }
             cur = c.base;
         }

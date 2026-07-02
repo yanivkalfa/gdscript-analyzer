@@ -741,7 +741,20 @@ impl Lowerer {
                     .iter()
                     .map(|e| {
                         let kv = cst::child_exprs(e);
-                        let key = self.lower_or_missing(kv.first(), cst::text_range_of(e));
+                        // A Lua-style entry (`IDLE = "idle"`, `=` instead of `:`) keys by the
+                        // IDENTIFIER'S NAME as a literal `String` — Godot never resolves it as an
+                        // expression. Lowering it as a name read fabricated a read of a
+                        // (usually undeclared) identifier: bogus flow facts and, with the
+                        // A1 `UNDEFINED_IDENTIFIER` check armed, a false positive on every
+                        // `{key = value}` dictionary (the corpus' biggest FP bucket).
+                        let key = if cst::has_token(e, K::Eq) {
+                            let range = kv
+                                .first()
+                                .map_or_else(|| cst::text_range_of(e), cst::text_range_of);
+                            self.alloc_expr(Expr::Literal(Literal::Str), range)
+                        } else {
+                            self.lower_or_missing(kv.first(), cst::text_range_of(e))
+                        };
                         let value = kv.get(1).map(|v| self.lower_expr(v));
                         (key, value)
                     })

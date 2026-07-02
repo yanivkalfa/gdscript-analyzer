@@ -357,6 +357,7 @@ pub fn layer_to_ty(api: &EngineApi, lt: LayerTy) -> Ty {
         LayerTy::Bool => builtin(api, "bool"),
         LayerTy::Str => builtin(api, "String"),
         LayerTy::Array => Ty::array_of_variant(),
+        LayerTy::Color => builtin(api, "Color"),
         LayerTy::Variant => Ty::Variant,
         LayerTy::Unknown => Ty::Unknown,
         LayerTy::Void => Ty::Void,
@@ -520,6 +521,11 @@ pub fn resolve_global(api: &EngineApi, name: &str) -> Option<GlobalDef> {
     }
     if api.global_enum(name).is_some() {
         return Some(GlobalDef::GlobalEnum);
+    }
+    // A `@GlobalScope` enum VALUE used bare (`MOUSE_BUTTON_LEFT`, `OK`, `TYPE_STRING`, …) — a
+    // global `int` constant in GDScript. Last so it can never shadow a real class/type name.
+    if api.global_enum_value(name).is_some() {
+        return Some(GlobalDef::Const(layer_to_ty(api, LayerTy::Int)));
     }
     None
 }

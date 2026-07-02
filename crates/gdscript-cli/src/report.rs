@@ -307,6 +307,7 @@ mod tests {
             line_index: LineIndex::new(text),
             text: text.into(),
             path: None,
+            is_target: true,
         }
     }
 
