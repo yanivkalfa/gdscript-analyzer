@@ -42,8 +42,8 @@ gdscript-base = { path = "crates/gdscript-base", version = "0.5.2" }
 gdscript-syntax = { path = "crates/gdscript-syntax", version = "0.5.2" }
 gdscript-api = { path = "crates/gdscript-api", version = "0.5.2" }
 gdscript-db = { path = "crates/gdscript-db", version = "0.5.2" }
-gdscript-hir = { path = "crates/gdscript-hir", version = "0.5.2" }
-gdscript-ide = { path = "crates/gdscript-ide", version = "0.5.2" }
+gdscript-hir = { path = "crates/gdscript-hir", version = "0.5.4" }
+gdscript-ide = { path = "crates/gdscript-ide", version = "0.5.4" }
 gdscript-fmt = { path = "crates/gdscript-fmt", version = "0.5.2" }
 gdscript-scene = { path = "crates/gdscript-scene", version = "0.5.2" }
 # `gdscript-session` is internal-only (`publish = false`) — bundled into the napi/wasm bindings, never
