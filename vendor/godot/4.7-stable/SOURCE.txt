@@ -1,0 +1,30 @@
+source:        Godot Engine v4.7.stable.official.5b4e0cb0f (official Windows binary)
+file:           extension_api.json
+method:         `godot --headless --dump-extension-api` — the GODOT-SYNC.md §4 binary-dump
+                fallback (godot-cpp's latest tagged JSON lagged at 4.5 while the engine's
+                latest stable is 4.7; the dump from the official binary is identical content).
+godot_version:  4.7.0-stable  (header.version_full_name = "Godot Engine v4.7.stable.official")
+precision:      single (float_32 / float_64 build configs present)
+size:           6,965,055 bytes
+fetched:        2026-07-02
+
+doc XML (hover source — GODOT-SYNC.md §4):
+  source:   godotengine/godot @ tag `4.7-stable`
+  paths:    doc/classes/*.xml (810, core engine classes + builtins + @GlobalScope)
+            + modules/*/doc_classes/*.xml + platform/*/doc_classes/*.xml (268, module/platform
+              classes — flattened into doc/classes/ here since class names are globally unique)
+            + modules/gdscript/doc_classes/@GDScript.xml (the GDScript-layer pseudo-class)
+  total:    1078 files
+  fetched:  2026-07-02 (blobless sparse checkout of the doc subtrees at the tag — a release
+            binary's `--doctool` dump only emits empty skeletons, so the source tree is the
+            only doc-prose source; the codegen golden "Node.add_child has a hover doc" guards this)
+
+notes:
+  - Bumped from 4.5-stable so the analyzer's engine model matches current-stable projects:
+    the absence-based UNDEFINED_FUNCTION / UNDEFINED_IDENTIFIER diagnostics are version-gated
+    (a project targeting an engine NEWER than the bundled model stays silent — its new classes
+    can't be ruled out), so the bundled model must track the latest stable for the diagnostics
+    to be armed on real projects. (Corpus: `DrawableTexture2D` is a 4.6+ class that false-flagged
+    under the 4.5 model.)
+  - License: Godot is MIT/Expat; these files are MIT-licensed Godot content. See
+    THIRD-PARTY-NOTICES.md.

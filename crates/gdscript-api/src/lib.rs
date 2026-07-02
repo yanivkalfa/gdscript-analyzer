@@ -72,6 +72,10 @@ pub struct EngineApi {
     pub(crate) singleton_by_name: FxHashMap<String, ClassId>,
     pub(crate) utility_by_name: FxHashMap<String, u32>,
     pub(crate) global_enum_by_name: FxHashMap<String, u32>,
+    /// Every `@GlobalScope` enum VALUE name (`MOUSE_BUTTON_LEFT`, `OK`, `TYPE_STRING`, …) →
+    /// `(enum index, value index)`. These are bare globals in GDScript; first declarer wins on
+    /// the (rare) duplicate name.
+    pub(crate) global_enum_value_by_name: FxHashMap<String, (u32, u32)>,
     /// Hand-authored `@GlobalScope`/`@GDScript` pseudo-constants (`PI`/`TAU`/`INF`/`NAN`).
     pub(crate) global_consts: Vec<gdscript_layer::GlobalConst>,
     /// Hand-authored GDScript builtin functions (`preload`/`range`/`len`/…).
@@ -113,8 +117,15 @@ impl EngineApi {
             utility_by_name.insert(u.name.clone(), u32::try_from(i).unwrap_or(u32::MAX));
         }
         let mut global_enum_by_name = FxHashMap::default();
+        let mut global_enum_value_by_name = FxHashMap::default();
         for (i, e) in data.global_enums.iter().enumerate() {
-            global_enum_by_name.insert(e.name.clone(), u32::try_from(i).unwrap_or(u32::MAX));
+            let ei = u32::try_from(i).unwrap_or(u32::MAX);
+            global_enum_by_name.insert(e.name.clone(), ei);
+            for (j, v) in e.values.iter().enumerate() {
+                global_enum_value_by_name
+                    .entry(v.name.clone())
+                    .or_insert((ei, u32::try_from(j).unwrap_or(u32::MAX)));
+            }
         }
         let int_builtin = builtin_by_name.get("int").copied();
 
@@ -125,6 +136,7 @@ impl EngineApi {
             singleton_by_name,
             utility_by_name,
             global_enum_by_name,
+            global_enum_value_by_name,
             global_consts: gdscript_layer::global_consts(),
             gdscript_builtins: gdscript_layer::builtin_fns(),
             int_builtin,
@@ -230,9 +242,15 @@ mod tests {
     fn bundled_blob_loads_and_resolves_golden_symbols() {
         let api = crate::bundled();
 
-        // Version came through the blob, not just `generated.rs`.
-        assert_eq!(api.version().major, 4);
-        assert_eq!(api.version().minor, 5);
+        // Version came through the blob and MATCHES `generated.rs` (the two artifacts are
+        // regenerated together by `cargo xtask codegen-api` — a mismatch means a stale blob).
+        let expected: Vec<u32> = crate::generated::GODOT_VERSION
+            .split(['.', '-'])
+            .take(2)
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        assert_eq!(api.version().major, expected[0]);
+        assert_eq!(api.version().minor, expected[1]);
 
         // Direct + inherited member resolution and the inheritance walk.
         let node = api.class_by_name("Node").expect("Node class present");

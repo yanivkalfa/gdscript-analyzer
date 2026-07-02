@@ -878,6 +878,47 @@ func _ready() -> void:
     }
 
     #[test]
+    fn over_indented_body_line_does_not_cascade_to_class_level() {
+        // Regression (BUG A4): one body line indented a level too far used to close the enclosing
+        // block early — its stray INDENT was swallowed as an error token, leaving the matching
+        // DEDENT to terminate the function. Every following body statement then spilled to class
+        // level and cascaded into a swarm of "expected a declaration" errors (~13 for this input).
+        // The over-indented run must now be recovered *inside* the function body, emitting exactly
+        // one diagnostic, so the trailing statements stay in the body.
+        let src =
+            "func render():\n\tvar a = 1\n\t\tvar bad = 2\n\tvar b = 2\n\tfor i in 3:\n\t\tpass\n";
+        let parse = parse(src);
+        assert_eq!(
+            parse.syntax_node().to_string(),
+            src,
+            "recovery stays lossless"
+        );
+        assert_eq!(
+            parse.errors().len(),
+            1,
+            "exactly one diagnostic, not a cascade: {:?}",
+            parse.errors()
+        );
+        // No statement escaped to class level: the file has a single FuncDecl and nothing else.
+        let root = parse.syntax_node();
+        let top_funcs = root
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::FuncDecl)
+            .count();
+        assert_eq!(top_funcs, 1, "the whole body stays in one function");
+        assert!(
+            !root.children().any(|n| n.kind() == SyntaxKind::VarDecl),
+            "no body statement leaked to class level: {}",
+            parse.debug_tree()
+        );
+        // The `for` loop that followed the over-indented line is a real body statement now.
+        assert!(
+            root.descendants().any(|n| n.kind() == SyntaxKind::ForStmt),
+            "the trailing `for` is recovered as a body statement"
+        );
+    }
+
+    #[test]
     fn golden_small_class() {
         let parse = parse("class_name Foo\nvar x := 1\n");
         expect_test::expect_file!["../test_data/golden/small_class.cst"]

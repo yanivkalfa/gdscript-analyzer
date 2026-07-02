@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use gdscript_base::{Diagnostic, DocumentSymbol, FileId};
 use gdscript_ide::{AnalysisHost, Change};
-use ignore::WalkBuilder;
 use rayon::prelude::*;
 
 use crate::lines::LineIndex;
@@ -27,10 +26,16 @@ pub struct SourceFile {
     pub display: String,
     /// The source text (also fed to the host; reused for human snippets + the line index).
     pub text: Arc<str>,
-    /// The per-file 1-based position converter.
-    pub line_index: LineIndex,
+    /// The per-file 1-based position converter. Built for TARGET files only (`Some` iff
+    /// `is_target`) — context files are never rendered, and the O(len) scan per file would
+    /// otherwise scale every command with project size.
+    pub line_index: Option<LineIndex>,
     /// The on-disk path (for `format --write`); `None` for stdin.
     pub path: Option<PathBuf>,
+    /// Whether the user asked to check this file. When a `project.godot` root is found, the whole
+    /// project is loaded so cross-file resolution (`class_name`, autoloads, `UNDEFINED_*`) is
+    /// sound; the extra files are CONTEXT (`false`) — analyzed for resolution, never reported.
+    pub is_target: bool,
 }
 
 /// A file we could not read (surfaced as a usage-level problem, not a diagnostic).
@@ -75,13 +80,25 @@ impl Project {
     /// host. `targets` may be files, directories, or `-` (stdin, read as a single anonymous file).
     #[must_use]
     pub fn load(targets: &[PathBuf]) -> Self {
+        Self::load_inner(targets, /*deep=*/ true)
+    }
+
+    /// Load ONLY the targets — no whole-project context walk, no completeness claim. For the
+    /// purely per-file commands (`format`, `symbols`) that need zero cross-file analysis: a
+    /// single-file format must not scale with project size.
+    #[must_use]
+    pub fn load_shallow(targets: &[PathBuf]) -> Self {
+        Self::load_inner(targets, /*deep=*/ false)
+    }
+
+    fn load_inner(targets: &[PathBuf], deep: bool) -> Self {
         // Each entry is `(display, res_path, text)`. The **display path is derived from the
         // `res://` path** (the single source of truth) so the two never diverge: when a file
         // resolves under the project root both are `Some`/relative; otherwise both fall back to the
         // raw path together (Hunt #2/#3 — a prior split derivation could disagree if root vs file
         // canonicalization differed).
-        // `(display, res_path, text, on-disk path)`.
-        type Discovered = (String, Option<String>, Arc<str>, Option<PathBuf>);
+        // `(display, res_path, text, on-disk path, is_target)`.
+        type Discovered = (String, Option<String>, Arc<str>, Option<PathBuf>, bool);
         let mut discovered: Vec<Discovered> = Vec::new();
         let mut errors = Vec::new();
         let mut seen = BTreeSet::new();
@@ -90,16 +107,21 @@ impl Project {
         let stdin_requested = targets.iter().any(|t| t.as_os_str() == "-");
         let fs_targets: Vec<&PathBuf> = targets.iter().filter(|t| t.as_os_str() != "-").collect();
 
-        // The project root: the nearest `project.godot` ancestor of the first filesystem target.
-        let root = fs_targets
-            .first()
-            .map(|p| p.as_path())
-            .and_then(find_project_root);
+        // Each filesystem target's project root (its nearest `project.godot` ancestor). The FIRST
+        // target's root anchors `res://` paths + the context walk; the completeness claim below
+        // additionally requires that EVERY target lives under that same root — a target from a
+        // second project would otherwise be judged "complete" without its own siblings loaded.
+        let roots: Vec<Option<PathBuf>> = fs_targets
+            .iter()
+            .map(|p| find_project_root(p.as_path()))
+            .collect();
+        let root = roots.first().cloned().flatten();
+        let single_root = root.is_some() && roots.iter().all(|r| r.as_deref() == root.as_deref());
 
         if stdin_requested {
             let mut buf = String::new();
             match std::io::stdin().read_to_string(&mut buf) {
-                Ok(_) => discovered.push(("<stdin>".to_owned(), None, Arc::from(buf), None)),
+                Ok(_) => discovered.push(("<stdin>".to_owned(), None, Arc::from(buf), None, true)),
                 Err(e) => errors.push(LoadError {
                     display: "<stdin>".into(),
                     message: e.to_string(),
@@ -107,28 +129,64 @@ impl Project {
             }
         }
 
-        for target in fs_targets {
-            for path in walk_gd_files(target) {
-                let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-                if !seen.insert(canon.clone()) {
-                    continue; // dedup files reached via overlapping targets
+        let mut discover = |path: PathBuf, is_target: bool| {
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !seen.insert(canon.clone()) {
+                return; // dedup files reached via overlapping targets / the context walk
+            }
+            let res_path = root.as_deref().and_then(|r| res_path_for(r, &canon));
+            let display = res_path
+                .as_deref()
+                .map_or_else(|| raw_display(&path), res_display);
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    // GDScript is UTF-8; decode lossily so a stray byte never aborts the run.
+                    let text: Arc<str> = Arc::from(String::from_utf8_lossy(&bytes).into_owned());
+                    discovered.push((display, res_path, text, Some(path), is_target));
                 }
-                let res_path = root.as_deref().and_then(|r| res_path_for(r, &canon));
-                let display = res_path
-                    .as_deref()
-                    .map_or_else(|| raw_display(&path), res_display);
-                match std::fs::read(&path) {
-                    Ok(bytes) => {
-                        // GDScript is UTF-8; decode lossily so a stray byte never aborts the run.
-                        let text: Arc<str> =
-                            Arc::from(String::from_utf8_lossy(&bytes).into_owned());
-                        discovered.push((display, res_path, text, Some(path.clone())));
-                    }
-                    Err(e) => errors.push(LoadError {
-                        display,
-                        message: e.to_string(),
-                    }),
-                }
+                Err(e) => errors.push(LoadError {
+                    display,
+                    message: e.to_string(),
+                }),
+            }
+        };
+
+        // Godot-faithful discovery (see `godot_walk`): `.gitignore` is deliberately NOT honored
+        // and `.gdignore` is Godot's empty MARKER (skip the whole directory) — the loaded set
+        // must be exactly what Godot itself would compile, or the completeness claim is a lie.
+        let mut unanalyzable = false;
+        let root_canon = root
+            .as_deref()
+            .map(|r| r.canonicalize().unwrap_or_else(|_| r.to_path_buf()));
+        let mut root_walked = false;
+        for target in &fs_targets {
+            let walk = godot_walk(target);
+            // A target that IS the project root already covers the whole tree — its walk doubles
+            // as the context walk (no second traversal, and its unanalyzable flag is the root's).
+            if root_canon
+                .as_deref()
+                .is_some_and(|rc| target.canonicalize().is_ok_and(|c| c == rc))
+            {
+                root_walked = true;
+                unanalyzable |= walk.unanalyzable;
+            }
+            for path in walk.gd_files {
+                discover(path, true);
+            }
+        }
+        // With a project root found, ALSO load every other `.gd` under it as CONTEXT (dedup'd
+        // against the targets): cross-file resolution — `class_name` globals, autoload scripts,
+        // and the whole-project absence proof behind `UNDEFINED_*` — needs the full graph in ONE
+        // host. Context files are analyzed for resolution only, never reported. Shallow loads
+        // (per-file commands) skip this entirely.
+        if deep
+            && !root_walked
+            && let Some(r) = root.as_deref()
+        {
+            let walk = godot_walk(r);
+            unanalyzable |= walk.unanalyzable;
+            for path in walk.gd_files {
+                discover(path, false);
             }
         }
 
@@ -136,7 +194,7 @@ impl Project {
         let mut host = AnalysisHost::new();
         let mut change = Change::new();
         let mut files = Vec::with_capacity(discovered.len());
-        for (i, (display, res_path, text, path)) in discovered.into_iter().enumerate() {
+        for (i, (display, res_path, text, path, is_target)) in discovered.into_iter().enumerate() {
             let id = FileId(u32::try_from(i).unwrap_or(u32::MAX));
             change.change_file(id, Arc::clone(&text));
             if let Some(res) = &res_path {
@@ -145,15 +203,27 @@ impl Project {
             files.push(SourceFile {
                 id,
                 display,
-                line_index: LineIndex::new(&text),
+                line_index: is_target.then(|| LineIndex::new(&text)),
                 text,
                 path,
+                is_target,
             });
         }
         // Feed `project.godot` so autoload resolution lights up.
         if let Some(cfg) = root.as_deref().and_then(read_project_godot) {
             change.set_project_config(cfg);
         }
+        // The workspace-completeness claim arming the absence-based `UNDEFINED_*` diagnostics.
+        // Claimed ONLY when this load provably saw everything Godot would compile:
+        // - a deep load with a project root, whose whole tree was walked (Godot-faithfully);
+        // - every filesystem target under that SAME root (a second project's targets would be
+        //   judged against the wrong graph);
+        // - no stdin (its content has no project anchor);
+        // - no `.gdextension` / C# sources (runtime-registered classes are invisible to us);
+        // - zero read failures (an unreadable file's `class_name`s are missing from the view).
+        let complete =
+            deep && single_root && !stdin_requested && !unanalyzable && errors.is_empty();
+        change.set_workspace_complete(complete);
         host.apply_change(change);
 
         Self {
@@ -163,6 +233,12 @@ impl Project {
         }
     }
 
+    /// The files the user asked to check (context files loaded for cross-file resolution are
+    /// excluded) — what every reporting command iterates.
+    pub fn targets(&self) -> impl Iterator<Item = &SourceFile> {
+        self.files.iter().filter(|f| f.is_target)
+    }
+
     /// Apply a CLI `--strict` / `--engine-defaults` warning-strictness override before any
     /// `diagnostics()` snapshot. A plain host field (not a salsa input), so it only affects the
     /// downstream gate, never re-running inference.
@@ -170,15 +246,17 @@ impl Project {
         self.host.set_warning_override(ov);
     }
 
-    /// Run `diagnostics(file)` for every file, in parallel over per-worker snapshot clones. Results
-    /// are sorted by `(display path, start offset)` for deterministic output regardless of
-    /// scheduling. `Analysis` is `Send + Clone` but not `Sync`, so `map_with` hands each rayon
-    /// worker its own cheap clone (the load→fan-out model) rather than sharing one snapshot.
+    /// Run `diagnostics(file)` for every TARGET file (context files resolve, never report), in
+    /// parallel over per-worker snapshot clones. Results are sorted by `(display path, start
+    /// offset)` for deterministic output regardless of scheduling. `Analysis` is `Send + Clone`
+    /// but not `Sync`, so `map_with` hands each rayon worker its own cheap clone (the
+    /// load→fan-out model) rather than sharing one snapshot.
     #[must_use]
     pub fn diagnostics(&self) -> Vec<FileDiagnostics<'_>> {
         let mut out: Vec<FileDiagnostics<'_>> = self
             .files
             .par_iter()
+            .filter(|f| f.is_target)
             .map_with(self.host.analysis(), |analysis, file| {
                 // No concurrent writes during the read phase ⇒ the snapshot never cancels.
                 let mut diagnostics = analysis.diagnostics(file.id).unwrap_or_default();
@@ -198,12 +276,13 @@ impl Project {
         out
     }
 
-    /// Run `document_symbols(file)` for every file, in parallel. Sorted by display path.
+    /// Run `document_symbols(file)` for every TARGET file, in parallel. Sorted by display path.
     #[must_use]
     pub fn symbols(&self) -> Vec<FileSymbols<'_>> {
         let mut out: Vec<FileSymbols<'_>> = self
             .files
             .par_iter()
+            .filter(|f| f.is_target)
             .map_with(self.host.analysis(), |analysis, file| FileSymbols {
                 file,
                 symbols: analysis.document_symbols(file.id).unwrap_or_default(),
@@ -219,32 +298,78 @@ impl Project {
     }
 }
 
-/// Walk a target path for `.gd` files, honoring `.gitignore` + a custom `.gdignore`. A target that
-/// is itself a file is yielded directly (even without a `.gd` extension would be skipped); a
-/// directory is walked.
-fn walk_gd_files(target: &Path) -> Vec<PathBuf> {
+/// One Godot-faithful discovery pass: the `.gd` files plus whether the tree contains sources that
+/// can register globals the analyzer cannot see (see [`is_unanalyzable`]).
+struct GodotWalk {
+    gd_files: Vec<PathBuf>,
+    unanalyzable: bool,
+}
+
+/// Walk a target the way GODOT's filesystem scan does — the loaded set must be exactly what the
+/// engine itself would compile, or the workspace-completeness claim behind `UNDEFINED_*` is a lie:
+/// - `.gitignore` is deliberately NOT honored (Godot compiles gitignored scripts; a gitignored
+///   `addons/` full of `class_name`s is the classic false-positive trap);
+/// - Godot's `.gdignore` is an empty MARKER file — a directory containing one is skipped
+///   ENTIRELY (it is not a gitignore-style pattern file);
+/// - dot-directories (`.git`, `.godot`, …) are skipped, like the editor's scan.
+///
+/// A target that is itself a file is yielded directly.
+fn godot_walk(target: &Path) -> GodotWalk {
+    let mut out = GodotWalk {
+        gd_files: Vec::new(),
+        unanalyzable: false,
+    };
     if target.is_file() {
-        return if is_gd(target) {
-            vec![target.to_path_buf()]
-        } else {
-            Vec::new()
-        };
+        if is_gd(target) {
+            out.gd_files.push(target.to_path_buf());
+        } else if is_unanalyzable(target) {
+            out.unanalyzable = true;
+        }
+        return out;
     }
-    let mut out = Vec::new();
-    let mut builder = WalkBuilder::new(target);
-    builder.add_custom_ignore_filename(".gdignore");
-    for entry in builder.build().flatten() {
-        let p = entry.path();
-        if p.is_file() && is_gd(p) {
-            out.push(p.to_path_buf());
+    godot_walk_dir(target, &mut out);
+    out
+}
+
+fn godot_walk_dir(dir: &Path, out: &mut GodotWalk) {
+    if dir.join(".gdignore").is_file() {
+        return; // Godot excludes this whole directory
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // Sort for a deterministic discovery order — FileId order feeds the first-wins registries.
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for e in entries {
+        let p = e.path();
+        if p.is_dir() {
+            if !e.file_name().to_string_lossy().starts_with('.') {
+                godot_walk_dir(&p, out);
+            }
+        } else if is_gd(&p) {
+            out.gd_files.push(p);
+        } else if is_unanalyzable(&p) {
+            out.unanalyzable = true;
         }
     }
-    out
 }
 
 /// Whether a path has a `.gd` extension (case-insensitive).
 fn is_gd(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gd"))
+}
+
+/// A source that can register globals the analyzer cannot see — a GDExtension (`.gdextension`) or
+/// C# (`.csproj`/`.sln`/`.cs`). Their runtime-registered classes make "defined nowhere"
+/// unprovable, so their presence withholds the workspace-completeness claim.
+fn is_unanalyzable(p: &Path) -> bool {
+    p.extension().is_some_and(|e| {
+        e.eq_ignore_ascii_case("gdextension")
+            || e.eq_ignore_ascii_case("csproj")
+            || e.eq_ignore_ascii_case("sln")
+            || e.eq_ignore_ascii_case("cs")
+    })
 }
 
 /// Walk up from `start` (a file or dir) to the nearest ancestor directory containing `project.godot`.

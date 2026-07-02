@@ -67,6 +67,13 @@ pub enum Ty {
     InnerClass(InnerClassRef),
     /// `Array[T]`; a bare `Array` is `Array(Box::new(Ty::Variant))`.
     Array(Box<Ty>),
+    /// A SYNTHESIZED fixed-shape array with per-position element types (`[Variant, Callable]` —
+    /// a React-style hook's `[value, setter]` pair). GDScript has no tuple syntax, so no
+    /// annotation ever resolves to this; it only arises from the `## @return-tuple(...)` doc-tag
+    /// (BUG A3). At runtime it IS an untyped `Array`: assignability widens it to
+    /// `Array[Variant]`, and `label` renders it as the array it is — the positional info exists
+    /// solely so a constant index (`pair[1]`) projects the element's real type.
+    Tuple(Vec<Ty>),
     /// `Dictionary[K, V]`; a bare `Dictionary` is `Dict(Variant, Variant)`.
     Dict(Box<Ty>, Box<Ty>),
     /// An enum type (an enum value is assignable to `int`).
@@ -97,6 +104,16 @@ impl Ty {
     #[must_use]
     pub fn dict_of_variant() -> Self {
         Self::Dict(Box::new(Self::Variant), Box::new(Self::Variant))
+    }
+
+    /// The array a [`Ty::Tuple`] IS at runtime (`Array[Variant]`) — the widening every
+    /// non-positional consumer (assignability, labels, iteration) sees. Identity otherwise.
+    #[must_use]
+    pub fn widen_tuple(&self) -> Ty {
+        match self {
+            Self::Tuple(_) => Self::array_of_variant(),
+            other => other.clone(),
+        }
     }
 
     /// Whether this is the gradual top `Variant`.
@@ -142,6 +159,8 @@ impl Ty {
                 _ => "Dictionary".to_owned(),
             },
             Self::Enum(e) => e.qualified.to_string(),
+            // A tuple renders as the array it is at runtime — never syntax a user can't write.
+            Self::Tuple(_) => "Array".to_owned(),
             Self::Signal(_) => "Signal".to_owned(),
             Self::Callable => "Callable".to_owned(),
             Self::Void => "void".to_owned(),
@@ -259,6 +278,13 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
     if from.is_variant() {
         return Assign::OkUnsafe;
     }
+    // A tuple SOURCE assigns exactly like the untyped `Array` it is at runtime (widen-only — a
+    // tuple never REJECTS anything its array form would accept). A tuple is never a valid
+    // TARGET: no annotation resolves to it, so a `to` tuple only arises from a tuple-typed
+    // binding re-checked against itself — widen that side too, below.
+    if matches!(from, Ty::Tuple(_)) {
+        return is_assignable(api, &from.widen_tuple(), to);
+    }
 
     match to {
         Ty::Builtin(to_id) => {
@@ -276,15 +302,30 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
                 _ => Assign::No,
             }
         }
-        Ty::Enum(to_enum) => match from {
-            Ty::Enum(from_enum) if from_enum == to_enum => Assign::Ok,
-            // A *different* enum's value is an `int` at runtime: Godot wants a cast
-            // (`INT_AS_ENUM_WITHOUT_CAST`) — never a hard `TYPE_MISMATCH`.
-            Ty::Enum(_) => Assign::IntAsEnum,
-            // `int` → enum without a cast.
-            Ty::Builtin(id) if api.builtin(*id).name == "int" => Assign::IntAsEnum,
-            _ => Assign::No,
-        },
+        Ty::Enum(to_enum) => {
+            // A BITFIELD enum is int-friendly by design: real code OR-combines its flags
+            // (`size_flags_horizontal = SIZE_SHRINK_BEGIN | SIZE_EXPAND`, an `int` expression),
+            // and Godot's `INT_AS_ENUM_WITHOUT_CAST` applies to plain enums only.
+            if to_enum.bitfield {
+                return match from {
+                    Ty::Enum(_) => Assign::Ok,
+                    Ty::Builtin(id) if api.builtin(*id).name == "int" => Assign::Ok,
+                    _ => Assign::No,
+                };
+            }
+            match from {
+                // Same enum — compared by QUALIFIED NAME only: the `bitfield` flag is a
+                // representation detail different resolution paths may record differently, and
+                // it must never make an enum incompatible with itself.
+                Ty::Enum(from_enum) if from_enum.qualified == to_enum.qualified => Assign::Ok,
+                // A *different* enum's value is an `int` at runtime: Godot wants a cast
+                // (`INT_AS_ENUM_WITHOUT_CAST`) — never a hard `TYPE_MISMATCH`.
+                Ty::Enum(_) => Assign::IntAsEnum,
+                // `int` → enum without a cast.
+                Ty::Builtin(id) if api.builtin(*id).name == "int" => Assign::IntAsEnum,
+                _ => Assign::No,
+            }
+        }
         Ty::Object(to_class) => match from {
             Ty::Object(from_class) if api.is_subclass(*from_class, *to_class) => Assign::Ok,
             // Downcast (a base value into a derived slot): permitted with a runtime check —
@@ -339,6 +380,8 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
                 Assign::No
             }
         }
+        // A tuple target behaves as its runtime array form (see the widen-only rule above).
+        Ty::Tuple(_) => is_assignable(api, from, &to.widen_tuple()),
         // An opaque script-ref / inner-class target, and the `Variant`/`Unknown`/`Error` targets
         // already handled above, all accept anything.
         Ty::ScriptRef(_) | Ty::InnerClass(_) | Ty::Variant | Ty::Unknown | Ty::Error => Assign::Ok,

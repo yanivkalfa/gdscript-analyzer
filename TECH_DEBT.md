@@ -37,6 +37,67 @@ are **not** open work and do **not** appear in the phase backlogs below.
 
 ---
 
+## Undefined-symbol detection + guitkx diagnostic gaps (A1–A4) — **DONE** on `fix/guitkx-diagnostic-gaps`
+
+The four analyzer bugs from the ReactiveUI-Godot audit (`plans/BUG_AUDIT.md` there), all landed on
+one branch with per-bug commits. Kept here as the record + the follow-ups they surfaced.
+
+- [x] **A1 — `UNDEFINED_FUNCTION` / `UNDEFINED_IDENTIFIER`** (was: calling `usseState(0)` produced
+      zero diagnostics — the `resolve_call_name` `Ty::Unknown` seam was undifferentiated). Split on a
+      **loader-asserted complete workspace**: a new `SourceRoot::complete` salsa input
+      (`Change::set_workspace_complete`, Session/napi/wasm `setWorkspaceComplete`) — neither
+      `source_root()` presence (one lone file) nor `project_config()` presence (a single-file CLI run
+      still discovers `project.godot`) can prove absence. Emission additionally requires a top-level
+      script class, a fully engine-native base chain, and a project engine version ≤ the bundled
+      model. Both codes are gateable `WarningCode`s in the ERROR-default group (compile errors in
+      Godot). The CLI now loads the whole project root as CONTEXT (targets keep exclusive reporting)
+      and withholds the claim for projects with `.gdextension`/C# sources. **Validated: 138
+      godot-demo-projects, 216 first-run false positives driven to 0 by root-cause fixes** —
+      global-enum-value lookup (`EngineApi::global_enum_value` + `resolve_global` arm), class enum
+      values in `lookup_member` (`MemberRef::EnumValue` typing as its ENUM), hand-authored
+      `Color8`/`is_instance_of`, Lua-style dict keys lowered as literal `String` keys (not name
+      reads), and the engine model bumped **4.5 → 4.7-stable** (`vendor/godot/4.7-stable`).
+
+- [x] **A2 — a bare call on a local/param `Callable` is a use and shadows methods** (was: false
+      `UNUSED_VARIABLE`/`UNUSED_PARAMETER` on `var useState = Hooks.useState; useState(0)`).
+      Locals-first in `infer_call`'s `Expr::Name` arm + `name_call_param_tys`; call result stays the
+      seam.
+
+- [x] **A4 — over-indented body lines recover instead of cascading** (was: one bad line → ~13–30
+      bogus diagnostics, statements spilling to class level). `block()` consumes the balanced stray
+      `Indent…Dedent` region as a nested error `Block` with ONE `"unexpected indentation"`.
+
+- [x] **A3 — `Ty::Tuple` + `## @return-tuple(T0, T1, …)` doc-tag** (was: `useState(...)[1]` lost the
+      setter's `Callable`, so `sliced[1].casll()` was uncheckable). Constant-index projection
+      (`Literal::Int` carries its value); widen-only everywhere non-positional; flows through own-func
+      and cross-file member-table call paths. `sliced[1].casll()` now reports `UNSAFE_METHOD_ACCESS`
+      on the `Callable` (opt-in group — Godot parity; `--strict`/per-code setting arms it).
+
+**Follow-ups surfaced by the work (open):**
+
+- [ ] **Assignment-carried flow narrowing for untyped locals.** `var s = useState(0)` is a `Variant`
+      VARIABLE by GDScript semantics (only `:=` infers), so the tuple doesn't project through it —
+      Godot can't check through it either, but the flow framework (Workstream 2) could carry the
+      RHS's inferred type as a narrowing fact (widen-only value-add, same class as `is`-narrowing).
+      Needed for the guitkx `.casll` end-to-end with verbatim user code (which writes `var s = …`).
+- [ ] **A4 parity for the remaining `while !self.at(Dedent)` blocks**: `property_body`, `match_stmt`
+      arms, inner-class `members(&[Dedent])` — an over-indented line there still cascades (low
+      real-world incidence).
+- [ ] **Closed-builtin receiver misses: severity parity study.** `c.casll()` on a `Callable` (a
+      CLOSED builtin type) is arguably a hard compile error in Godot, but we emit the opt-in
+      `UNSAFE_METHOD_ACCESS` — silent under project defaults. Promoting builtin-receiver misses to a
+      hard diagnostic needs its own corpus study (Object receivers must STAY opt-in — Godot parity).
+- [ ] **guitkx (ReactiveUI-Godot) side for the tuple e2e**: the virtual doc must emit hook calls as
+      `Hooks.useState(...)` field-calls (its `var useState = Hooks.useState` alias loses the
+      signature — locals carry no return type), plus the `## @return-tuple` tags in `core/hooks.gd`.
+      Tracked as the cross-repo note in that repo's `plans/BUG_SPLIT.md`.
+- [ ] **Multi-version engine-model bundling** (GODOT-SYNC.md): with one bundled model, projects
+      declaring a NEWER engine than bundled get `UNDEFINED_*` gated off (sound but silent) — tracking
+      latest-stable promptly keeps the diagnostics armed; snapping to the nearest bundled minor is
+      the Phase-6 plan.
+
+---
+
 ## Phase 4 — Scene awareness (in progress)
 
 Driven by `plans/PHASE-4-SCENE-AWARENESS.md` + the fact-checked `plans/PHASE-4-M0-PLAYBOOK.md`.

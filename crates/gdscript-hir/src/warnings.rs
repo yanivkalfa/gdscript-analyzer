@@ -132,6 +132,13 @@ pub enum WarningCode {
     GetNodeDefaultWithoutOnready,
     /// `@onready` together with `@export` on one member.
     OnreadyWithExport,
+    // Undefined symbols (analyzer-specific codes; compile ERRORS in Godot itself, so they default
+    // to ERROR here). Only emitted when the loader declared the workspace COMPLETE
+    // (`SourceRoot::complete`) — proving a name is defined nowhere requires seeing everywhere.
+    /// A bare-name call that resolves to nothing anywhere (a typo like `usseState(0)`).
+    UndefinedFunction,
+    /// A bare identifier that resolves to nothing anywhere.
+    UndefinedIdentifier,
 }
 
 /// Godot's `WarnLevel` (`gdscript_warning.h`): the resolved severity of a code.
@@ -232,6 +239,8 @@ impl WarningCode {
         Self::NativeMethodOverride,
         Self::GetNodeDefaultWithoutOnready,
         Self::OnreadyWithExport,
+        Self::UndefinedFunction,
+        Self::UndefinedIdentifier,
     ];
 
     /// The stable serialized identity — what `Diagnostic.code` carries (e.g. `INTEGER_DIVISION`).
@@ -288,6 +297,8 @@ impl WarningCode {
             Self::NativeMethodOverride => "NATIVE_METHOD_OVERRIDE",
             Self::GetNodeDefaultWithoutOnready => "GET_NODE_DEFAULT_WITHOUT_ONREADY",
             Self::OnreadyWithExport => "ONREADY_WITH_EXPORT",
+            Self::UndefinedFunction => "UNDEFINED_FUNCTION",
+            Self::UndefinedIdentifier => "UNDEFINED_IDENTIFIER",
         }
     }
 
@@ -385,6 +396,14 @@ impl WarningCode {
                 "A `get_node(...)` default initializer should be `@onready`."
             }
             Self::OnreadyWithExport => "`@onready` and `@export` are used together on one member.",
+            Self::UndefinedFunction => {
+                "A called function is not defined anywhere in the loaded project (a compile error in Godot). \
+                 Analyzer-specific code; fires only when the loader declared the workspace complete."
+            }
+            Self::UndefinedIdentifier => {
+                "An identifier is not declared anywhere in the loaded project (a compile error in Godot). \
+                 Analyzer-specific code; fires only when the loader declared the workspace complete."
+            }
         }
     }
 
@@ -401,11 +420,15 @@ impl WarningCode {
             | Self::UnsafeCallArgument
             | Self::ReturnValueDiscarded
             | Self::MissingAwait => WarnLevel::Ignore,
-            // The hard-fail group: ERROR by default.
+            // The hard-fail group: ERROR by default. The `UNDEFINED_*` pair are compile errors in
+            // Godot itself (not warnings), so they land here; being gateable codes still leaves a
+            // per-code project setting / `@warning_ignore` as the escape hatch.
             Self::InferenceOnVariant
             | Self::NativeMethodOverride
             | Self::GetNodeDefaultWithoutOnready
-            | Self::OnreadyWithExport => WarnLevel::Error,
+            | Self::OnreadyWithExport
+            | Self::UndefinedFunction
+            | Self::UndefinedIdentifier => WarnLevel::Error,
             // Everything else defaults to WARN.
             _ => WarnLevel::Warn,
         }
@@ -952,7 +975,7 @@ mod tests {
             assert_eq!(WarningCode::from_setting_name(&c.setting_name()), Some(c));
         }
         // The set is the catalog; a missed `ALL` entry shows up as a short count.
-        assert_eq!(seen.len(), 49);
+        assert_eq!(seen.len(), 51);
     }
 
     #[test]
@@ -1099,7 +1122,9 @@ mod tests {
             )
             .is_none()
         );
-        let new = WarningSettings::engine_default((4, 5));
+        // A project on the bundled model's own version (`Since::Master` resolves to it) fires —
+        // derived, not hardcoded, so bumping the vendored engine model doesn't break this test.
+        let new = WarningSettings::engine_default(bundled_version());
         assert!(
             gate(
                 &raw(WarningCode::ConfusableTemporaryModification),
