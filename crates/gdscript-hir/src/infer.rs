@@ -2191,7 +2191,20 @@ impl Cx<'_> {
                 self.infer_field(receiver, &name, name_range, /*as_method=*/ true)
             }
             Expr::Name(name) => {
-                let ret = self.resolve_call_name(&name);
+                // Locals first (BUG A2), matching `resolve_name`'s canonical local→member→… order:
+                // a bare-name call on a local/param (`var f = func(): …` then `f(0)`, a
+                // `cb: Callable` param, a hook alias `var useState = Hooks.useState`) is a READ of
+                // that binding — record it for `UNUSED_*`, which only the value-read path used to
+                // do, so a binding that was only ever *called* fired a false UNUSED. The local also
+                // shadows a same-named own/inherited method (real GDScript scoping). Its call
+                // result is the seam: `Ty::Callable` carries no signature, and `Variant` here
+                // would fire false `INFERENCE_ON_VARIANT` on `var x := f()`.
+                let ret = if self.locals.contains_key(name.as_str()) {
+                    self.used_locals.insert(name.clone());
+                    Ty::Unknown
+                } else {
+                    self.resolve_call_name(&name)
+                };
                 self.expr_ty.insert(callee, Ty::Callable);
                 ret
             }
@@ -2269,6 +2282,12 @@ impl Cx<'_> {
     /// first, then the `self` engine base's method. Utilities/builtins are skipped (looser, often
     /// variadic typing — out of the conservative MVP slice).
     fn name_call_param_tys(&self, name: &str) -> Option<Vec<Ty>> {
+        // A local/param shadows a same-named method for a bare-name call (BUG A2, mirroring
+        // `infer_call`'s locals-first resolution) — the local `Callable`'s params aren't modeled,
+        // so the shadowed method's signature must not arg-check the call.
+        if self.locals.contains_key(name) {
+            return None;
+        }
         if let Some(item) = self.class.lookup(name)
             && let Some(Member::Func(f)) = self.class.member(item)
         {
@@ -2297,6 +2316,8 @@ impl Cx<'_> {
     }
 
     /// Resolve a bare-name call (`foo(...)`): own method → utility/builtin fn → constructor.
+    /// A local/param callee never reaches here — `infer_call`'s `Expr::Name` arm resolves locals
+    /// first (BUG A2; this fn is `&self` and could not record the read into `used_locals`).
     fn resolve_call_name(&self, name: &str) -> Ty {
         if let Some(item) = self.class.lookup(name)
             && let Some(Member::Func(f)) = self.class.member(item)
@@ -4122,6 +4143,65 @@ mod tests {
             !codes(&h).contains(&INFERENCE_ON_VARIANT),
             "{:?}",
             h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_a_local_callable_param_is_a_use() {
+        // Regression (BUG A2): a bare-name call `cb(0)` on a param never recorded a read — only
+        // the value-read path (`resolve_name`) fed `used_locals` — so a param that was ONLY ever
+        // called fired a false UNUSED_PARAMETER.
+        let src = "func f(cb: Callable):\n\tcb(0)\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&"UNUSED_PARAMETER"),
+            "calling a param is a use: {:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_a_local_lambda_var_is_a_use() {
+        // Regression (BUG A2), local-var flavor: `var lam = func(x): …` then `lam(5)` used to
+        // fire UNUSED_VARIABLE on `lam` (the guitkx hook-stub symptom:
+        // `var useState = Hooks.useState` + `useState(0)` flagged useState unused).
+        let src = "func g():\n\tvar lam = func(x): return x + 1\n\tlam(5)\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&"UNUSED_VARIABLE"),
+            "calling a local is a use: {:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_a_local_callable_result_stays_the_seam() {
+        // The call RESULT of a local Callable is the seam (Ty::Callable carries no signature) —
+        // never `Variant`, so `var x := cb(0)` must not fire INFERENCE_ON_VARIANT.
+        let src = "func f(cb: Callable):\n\tvar x := cb(0)\n\treturn x\n";
+        let h = infer_first_func(src);
+        assert!(
+            !codes(&h).contains(&INFERENCE_ON_VARIANT),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn local_callable_shadows_same_named_method_in_a_call() {
+        // GDScript scoping: a local shadows an own/inherited method for a bare-name call, matching
+        // resolve_name's canonical local-first order. So the call binds the LOCAL: it is a use (no
+        // UNUSED_VARIABLE) and the shadowed method's signature must NOT arg-check the call (the
+        // local Callable's params aren't modeled — no UNSAFE_CALL_ARGUMENT / TYPE_MISMATCH).
+        let src = "func helper(x: int) -> int:\n\treturn x\nfunc f():\n\tvar helper = func(): return 1\n\thelper(\"not an int\")\n";
+        let c = file_codes(src);
+        assert!(
+            !c.iter().any(|x| x == "UNUSED_VARIABLE"),
+            "the shadowing local is used by the call: {c:?}"
+        );
+        assert!(
+            !c.iter().any(|x| x == "UNSAFE_CALL_ARGUMENT" || x == TYPE_MISMATCH),
+            "the shadowed method's signature must not check the local's call: {c:?}"
         );
     }
 
