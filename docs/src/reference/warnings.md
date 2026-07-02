@@ -45,6 +45,8 @@ Every gateable GDScript warning the analyzer can emit, with its `project.godot` 
 | `UNASSIGNED_VARIABLE_OP_ASSIGN` | `unassigned_variable_op_assign` | Warn | 4.3 | A compound assignment (`+=`, …) is applied to a still-unassigned local. |
 | `UNDEFINED_FUNCTION` | `undefined_function` | Error | 4.3 | A called function is not defined anywhere in the loaded project (a compile error in Godot). Analyzer-specific code; fires only when the loader declared the workspace complete. |
 | `UNDEFINED_IDENTIFIER` | `undefined_identifier` | Error | 4.3 | An identifier is not declared anywhere in the loaded project (a compile error in Godot). Analyzer-specific code; fires only when the loader declared the workspace complete. |
+| `UNDEFINED_METHOD` | `undefined_method` | Error | 4.3 | A method called on a built-in type does not exist on it (a compile error in Godot; the bundled built-in tables are closed, so no completeness claim is needed). |
+| `UNDEFINED_PROPERTY` | `undefined_property` | Error | 4.3 | A property accessed on a built-in type does not exist on it (a compile error in Godot; the bundled built-in tables are closed, so no completeness claim is needed). |
 | `UNREACHABLE_CODE` | `unreachable_code` | Warn | 4.3 | A statement follows an unconditional `return`/`break`/`continue` (or an exhaustive `match`). |
 | `UNREACHABLE_PATTERN` | `unreachable_pattern` | Warn | 4.3 | A `match` pattern can never match (it follows a wildcard). |
 | `UNSAFE_CALL_ARGUMENT` | `unsafe_call_argument` | Ignore | 4.3 | An argument needs an unsafe implicit cast into the parameter type. |

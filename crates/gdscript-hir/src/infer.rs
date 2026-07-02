@@ -143,6 +143,41 @@ fn collect_assign_lhs(body: &Body) -> FxHashSet<ExprId> {
         .collect()
 }
 
+/// Every name a body ever REBINDS (`x = …` / `x += …`) or INDEX-stores into (`s[i] = …`, at any
+/// index depth). An untyped local outside this set is effectively single-assignment: its
+/// initializer's inferred type is the only type the binding can ever hold, so it can soundly serve
+/// as the binding type (initializer narrowing, ADR-0007). The whole expression arena is scanned, so
+/// lambda bodies are included (conservative — invalidating costs a missed narrowing, never a false
+/// positive). A `Field` step anywhere in the write target means the store lands inside a member
+/// VALUE — the local's own binding type (and a tuple's positional types) are untouched, so those
+/// don't invalidate; an `Index` chain does (it can re-type a tuple position: `s[1] = 5`).
+fn collect_rebound_names(body: &Body) -> FxHashSet<SmolStr> {
+    let mut out = FxHashSet::default();
+    for e in &body.exprs {
+        let Expr::Bin {
+            op: BinOp::Assign,
+            lhs,
+            ..
+        } = e
+        else {
+            continue;
+        };
+        let mut cur = *lhs;
+        loop {
+            match body.expr(cur) {
+                Expr::Name(n) => {
+                    out.insert(n.clone());
+                    break;
+                }
+                Expr::Paren(inner) => cur = *inner,
+                Expr::Index { base, .. } => cur = *base,
+                _ => break,
+            }
+        }
+    }
+    out
+}
+
 /// Infer one function/initializer body against a class scope: walks the lowered [`body::Body`],
 /// resolving each expression's [`Ty`] (engine + cross-file members, scene-node paths, flow
 /// narrowing) and recording the bindings, diagnostics, and severity-free gateable warnings.
@@ -190,6 +225,7 @@ pub fn infer(
         cur_stmt: None,
         needs_assignment: FxHashSet::default(),
         assign_lhs: collect_assign_lhs(body),
+        rebound: collect_rebound_names(body),
     };
     // Parameters bind first (their defaults can reference earlier params).
     let params = body.params.clone();
@@ -1203,6 +1239,10 @@ struct Cx<'a> {
     /// Names that are the direct LHS of an assignment (`x = …`/`x += …`) — a *write*, not a read, so
     /// excluded from the `UNASSIGNED_VARIABLE` check even though inference resolves the LHS.
     assign_lhs: FxHashSet<ExprId>,
+    /// Names ever rebound / index-stored anywhere in this body (see [`collect_rebound_names`]) —
+    /// untyped locals OUTSIDE this set are effectively single-assignment and eligible for
+    /// initializer narrowing (ADR-0007).
+    rebound: FxHashSet<SmolStr>,
 }
 
 impl Cx<'_> {
@@ -1533,9 +1573,17 @@ impl Cx<'_> {
                     init.clone()
                 }
             }
-            // `var x = e` — untyped, soft → Variant. `const X = e` keeps the inferred type.
+            // `var x = e` — untyped, soft → `Variant` BY DECLARATION (Godot never checks through
+            // it); `const X = e` keeps the inferred type. But when the local is effectively
+            // single-assignment — never rebound or index-stored anywhere in the body
+            // ([`collect_rebound_names`]) — the initializer's inferred type is the ONLY type the
+            // binding can ever hold, so it soundly serves as the binding type: initializer
+            // narrowing (ADR-0007), the beyond-Godot value-add (same class as `is`-narrowing)
+            // that lets `var s = useState(0)` project `s[1]` as a checkable `Callable`.
+            // Uninformative initializers (`null`, the cross-file seam, `Variant`) stay `Variant`
+            // — Godot is silent on untyped nulls, and so are we.
             (None, Some(init)) => {
-                if v.is_const {
+                if v.is_const || (!init.is_uninformative() && !self.rebound.contains(&v.name)) {
                     init.clone()
                 } else {
                     Ty::Variant
@@ -2868,7 +2916,7 @@ impl Cx<'_> {
             return if let Some(sig) = self.api.builtin_method(bid, name) {
                 ty::resolve_tyref(self.api, &sig.return_ty)
             } else {
-                self.emit_unsafe(name, recv, range, true);
+                self.emit_builtin_miss(name, recv, bid, range, true);
                 Ty::Variant
             };
         }
@@ -2890,8 +2938,65 @@ impl Cx<'_> {
         if self.api.builtin_method(bid, name).is_some() {
             return Ty::Callable;
         }
-        self.emit_unsafe(name, recv, range, false);
+        // A KEYED builtin (`Dictionary`): `d.some_key` is subscript sugar for `d["some_key"]`, not
+        // a member lookup — Godot is silent on any name here, reads and writes alike (probed on
+        // 4.7; a METHOD miss still errors there, and the method path above still reports it).
+        // Type it as the dictionary's value type. Corpus proof: 111 of 111 first-run
+        // UNDEFINED_PROPERTY hits across godot-demo-projects were exactly this shape.
+        if let Ty::Dict(_, v) = recv {
+            return (**v).clone();
+        }
+        if data.is_keyed {
+            return Ty::Variant;
+        }
+        self.emit_builtin_miss(name, recv, bid, range, false);
         Ty::Variant
+    }
+
+    /// A member miss on a BUILT-IN receiver: `UNDEFINED_METHOD` / `UNDEFINED_PROPERTY`, ERROR by
+    /// default. Unlike `Object` receivers — where a script can attach members at runtime, so Godot
+    /// itself stays silent and we keep the opt-in `UNSAFE_*` — the builtin member tables are closed
+    /// and bundled, and Godot reports this exact case as a compile error ("Cannot find member … in
+    /// base …", verified on 4.7 for typed AND `:=`-inferred receivers, methods and properties
+    /// alike; keyed builtins' property access is subscript sugar and handled above, never here).
+    /// No workspace-completeness claim is needed (the table ships with the analyzer); the only
+    /// gates are the engine version — a NEWER project engine may have added the member, so fall
+    /// back to the opt-in `UNSAFE_*` signal there — and a `Nil` receiver, which is a nullability
+    /// question, not a member-existence one (Godot is silent on untyped nulls).
+    fn emit_builtin_miss(
+        &mut self,
+        name: &str,
+        recv: &Ty,
+        bid: gdscript_api::BuiltinId,
+        range: TextRange,
+        as_method: bool,
+    ) {
+        if crate::queries::project_engine_version(self.db)
+            .is_some_and(|v| v > crate::warnings::bundled_version())
+        {
+            self.emit_unsafe(name, recv, range, as_method);
+            return;
+        }
+        if self.api.builtin(bid).name == "Nil" {
+            return;
+        }
+        let recv_label = recv.label(self.api).unwrap_or_else(|| "?".to_owned());
+        let (code, message) = if as_method {
+            (
+                WarningCode::UndefinedMethod,
+                format!(
+                    "The method \"{name}()\" does not exist on the built-in type \"{recv_label}\"."
+                ),
+            )
+        } else {
+            (
+                WarningCode::UndefinedProperty,
+                format!(
+                    "The property \"{name}\" does not exist on the built-in type \"{recv_label}\"."
+                ),
+            )
+        };
+        self.warn(range, code, message);
     }
 
     /// The builtin id backing a builtin / `Array` / `Dictionary` receiver.
@@ -3463,31 +3568,85 @@ mod tests {
     #[test]
     fn return_tuple_tag_projects_a_constant_index() {
         // `useState(0)[1]` is the setter: a REAL `Callable`, so a typo'd method on it is caught
-        // (UNSAFE_METHOD_ACCESS on the Callable builtin) while the correct `.call` stays silent.
-        // Both direct indexing and an `:=`-inferred local carry the tuple.
+        // (UNDEFINED_METHOD — a compile error in Godot on a builtin receiver) while the correct
+        // `.call` stays silent. Both direct indexing and an `:=`-inferred local carry the tuple.
         let src = format!(
             "{HOOK_DECL}func f():\n\tvar s := useState(0)\n\ts[1].call(1)\n\ts[1].casll(1)\n\tuseState(0)[1].casll(2)\n"
         );
         let c = file_codes(&src);
         assert_eq!(
-            c.iter().filter(|x| *x == "UNSAFE_METHOD_ACCESS").count(),
+            c.iter().filter(|x| *x == "UNDEFINED_METHOD").count(),
             2,
             "exactly the two typo'd setter methods flag: {c:?}"
         );
     }
 
     #[test]
-    fn return_tuple_untyped_local_stays_variant_by_godot_semantics() {
-        // An UNTYPED `var s = useState(0)` local is a `Variant` variable in GDScript (only `:=`
-        // infers) — Godot itself cannot check through it, and neither do we. Seeing through an
-        // untyped local would need assignment-carried flow narrowing (a Workstream-2 extension,
-        // documented follow-up), not a projection change.
+    fn return_tuple_untyped_local_projects_via_initializer_narrowing() {
+        // An UNTYPED `var s = useState(0)` local is a `Variant` variable in GDScript, but this one
+        // is effectively single-assignment (never rebound or index-stored), so initializer
+        // narrowing (ADR-0007) carries the tuple through it — the typo'd setter method flags even
+        // in the verbatim user shape that motivated the whole workstream.
         let src =
             format!("{HOOK_DECL}func f():\n\tvar s = useState(0)\n\ts[1].casll(1)\n\treturn s\n");
         let c = file_codes(&src);
         assert!(
-            !c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
-            "an untyped local is Variant — never checked: {c:?}"
+            c.iter().any(|x| x == "UNDEFINED_METHOD"),
+            "initializer narrowing projects the tuple through the untyped local: {c:?}"
+        );
+    }
+
+    #[test]
+    fn initializer_narrowing_is_invalidated_by_rebinds_and_index_stores() {
+        // A later rebind means the initializer's type is NOT the only one the binding can hold —
+        // back to Godot semantics (Variant, unchecked). Same for an index store (`s[1] = …` can
+        // re-type a tuple position). A FIELD store mutates the value, not the binding — it keeps
+        // the narrowing.
+        let rebound = format!(
+            "{HOOK_DECL}func f():\n\tvar s = useState(0)\n\ts = 5\n\ts[1].casll(1)\n\treturn s\n"
+        );
+        let c = file_codes(&rebound);
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "a rebound local stays Variant: {c:?}"
+        );
+        let stored = format!(
+            "{HOOK_DECL}func f():\n\tvar s = useState(0)\n\ts[1] = 5\n\ts[1].casll(1)\n\treturn s\n"
+        );
+        let c2 = file_codes(&stored);
+        assert!(
+            !c2.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "an index-stored local stays Variant: {c2:?}"
+        );
+        let lambda = format!(
+            "{HOOK_DECL}func f():\n\tvar s = useState(0)\n\tvar g := func():\n\t\ts = 1\n\ts[1].casll(1)\n\treturn [s, g]\n"
+        );
+        let c3 = file_codes(&lambda);
+        assert!(
+            !c3.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "a lambda rebind conservatively invalidates: {c3:?}"
+        );
+        let field_store = "func f():\n\tvar v = Vector2.ONE\n\tv.x = 1.0\n\tv.zzz()\n\treturn v\n";
+        let c4 = file_codes(field_store);
+        assert!(
+            c4.iter().any(|x| x == "UNDEFINED_METHOD"),
+            "a field store keeps the narrowing (the binding type is untouched): {c4:?}"
+        );
+    }
+
+    #[test]
+    fn initializer_narrowing_skips_null_and_seam_initializers() {
+        // `var x = null` is a nullability question — Godot is silent (verified on 4.7) and so are
+        // we. A cross-file seam initializer stays the silent seam.
+        let c = file_codes("func f():\n\tvar x = null\n\tx.foo()\n");
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "null initializers never narrow: {c:?}"
+        );
+        let c2 = file_codes("func f():\n\tvar x = Missing.thing()\n\tx.foo()\n");
+        assert!(
+            !c2.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "seam initializers never narrow: {c2:?}"
         );
     }
 
@@ -3536,7 +3695,7 @@ mod tests {
         ];
         let c = project_codes(&files, None, true);
         assert!(
-            c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            c.iter().any(|x| x == "UNDEFINED_METHOD"),
             "the typo'd setter method must flag cross-file: {c:?}"
         );
     }
@@ -3659,6 +3818,61 @@ mod tests {
             !silent.iter().any(|x| x.starts_with("UNDEFINED_")),
             "incomplete workspace must stay silent: {silent:?}"
         );
+    }
+
+    #[test]
+    fn builtin_member_miss_is_undefined_method_or_property() {
+        // Godot 4.7 ground truth (probed with --check-only): a member miss on a BUILTIN receiver
+        // is a hard parse error — typed and `:=`-inferred alike, methods and properties alike —
+        // while `Object` receivers stay silent (a script can attach members at runtime). Needs NO
+        // completeness claim: the builtin tables are bundled and closed, hence `file_codes`.
+        let c = file_codes("func f():\n\tvar c: Callable = Callable()\n\tc.casll()\n");
+        assert!(c.iter().any(|x| x == "UNDEFINED_METHOD"), "{c:?}");
+        let c2 = file_codes("func f():\n\tvar v := Vector2.ONE\n\treturn v.zzz\n");
+        assert!(c2.iter().any(|x| x == "UNDEFINED_PROPERTY"), "{c2:?}");
+        // int/float/bool genuinely have NO methods in Godot (probed: `i.to_float()` errors).
+        let c3 = file_codes("func f():\n\tvar i: int = 5\n\ti.to_float()\n");
+        assert!(c3.iter().any(|x| x == "UNDEFINED_METHOD"), "{c3:?}");
+        // Valid members stay silent.
+        let ok = file_codes("func f():\n\tvar s: String = \"a\"\n\treturn s.to_upper().length()\n");
+        assert!(!ok.iter().any(|x| x.starts_with("UNDEFINED_")), "{ok:?}");
+        // Object receivers keep the opt-in UNSAFE_* (Godot is silent there too).
+        let obj = file_codes("func f():\n\tvar n: Node = Node.new()\n\tn.frobnicate()\n");
+        assert!(!obj.iter().any(|x| x.starts_with("UNDEFINED_")), "{obj:?}");
+        assert!(obj.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"), "{obj:?}");
+    }
+
+    #[test]
+    fn dictionary_property_access_is_keyed_sugar_never_undefined() {
+        // `d.some_key` on a Dictionary is subscript sugar (`d["some_key"]`) — Godot is silent on
+        // ANY name, reads and writes alike (probed on 4.7). A METHOD miss on Dictionary still
+        // errors in Godot and still flags here. The typed value projects.
+        let c = file_codes(
+            "func f():\n\tvar d: Dictionary = {}\n\tvar x = d.some_key\n\td.other_key = 5\n\treturn x\n",
+        );
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_") || x.starts_with("UNSAFE_")),
+            "keyed access is not a member miss: {c:?}"
+        );
+        let m = file_codes("func f():\n\tvar d: Dictionary = {}\n\td.casll()\n");
+        assert!(
+            m.iter().any(|x| x == "UNDEFINED_METHOD"),
+            "a Dictionary METHOD miss is still a Godot compile error: {m:?}"
+        );
+    }
+
+    #[test]
+    fn builtin_member_miss_falls_back_to_unsafe_on_a_newer_project_engine() {
+        // A project declaring a NEWER engine than the bundled model may use builtin members we
+        // don't know about — degrade to the opt-in UNSAFE_* signal instead of a false hard error.
+        let files = [(
+            "res://main.gd",
+            "func f():\n\tvar c: Callable = Callable()\n\tc.casll()\n",
+        )];
+        let cfg = "[application]\nconfig/features=PackedStringArray(\"4.9\")\n";
+        let c = project_codes(&files, Some(cfg), false);
+        assert!(!c.iter().any(|x| x == "UNDEFINED_METHOD"), "{c:?}");
+        assert!(c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"), "{c:?}");
     }
 
     #[test]
