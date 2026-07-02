@@ -129,6 +129,13 @@ pub struct FuncItem {
     pub params: Vec<ParamItem>,
     /// The written return-type annotation (unresolved text), if any.
     pub return_type: Option<SmolStr>,
+    /// The positional element type names of a `## @return-tuple(T0, T1, …)` doc-tag (BUG A3) —
+    /// an analyzer-specific convention letting a library declare a FIXED-SHAPE array return
+    /// (GDScript has no tuple syntax; `-> Array` loses the per-position types). Inert in Godot
+    /// (a doc comment), so annotating never breaks a real build. Resolves to
+    /// [`crate::ty::Ty::Tuple`], so a constant index projects the element's real type
+    /// (`useState(...)[1]` → the setter `Callable`).
+    pub tuple_return: Option<Vec<SmolStr>>,
     /// Whether this is a `static func`.
     pub is_static: bool,
     /// The decorator annotations on this function (`@onready`, `@rpc`, …), in source order.
@@ -285,12 +292,66 @@ fn lower_func(d: &ast::FuncDecl) -> FuncItem {
             .map(|pl| lower_params(&pl))
             .unwrap_or_default(),
         return_type: d.return_type().and_then(|t| t.text()).map(SmolStr::new),
+        tuple_return: doc_tuple_return(node),
         is_static: d.is_static(),
         annotations: preceding_annotations(node),
         ptr: AstPtr::of(node),
         range: cst::text_range_of(node),
         name_range: name_range(d.name(), node),
     }
+}
+
+/// Parse a `## @return-tuple(T0, T1, …)` doc-tag from the `FuncDecl`'s leading `##` doc comments
+/// (attached inside the node as leading trivia). At least two comma-separated identifiers are
+/// required — a "tuple" of fewer carries no positional information. `None` when absent/malformed
+/// (a malformed tag degrades to the plain annotation, never an error — it's a comment).
+fn doc_tuple_return(node: &GdNode) -> Option<Vec<SmolStr>> {
+    use cstree::util::NodeOrToken;
+    for el in node.children_with_tokens() {
+        match el {
+            NodeOrToken::Token(t) if t.kind() == SyntaxKind::DocComment => {
+                let text = t.text();
+                let Some(at) = text.find("@return-tuple(") else {
+                    continue;
+                };
+                let rest = &text[at + "@return-tuple(".len()..];
+                let inner = &rest[..rest.find(')')?];
+                let names: Vec<SmolStr> = inner
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(SmolStr::new)
+                    .collect();
+                if names.len() >= 2
+                    && names.iter().all(|n| {
+                        n.chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    })
+                {
+                    return Some(names);
+                }
+            }
+            // Leading trivia ends at the first real token/node (`static`/`func`/annotations).
+            // `NewlinePhys` is the RETAINED physical newline (the zero-width `Newline` is the
+            // synthetic structural token); both are trivia here.
+            NodeOrToken::Token(t)
+                if !matches!(
+                    t.kind(),
+                    SyntaxKind::DocComment
+                        | SyntaxKind::LineComment
+                        | SyntaxKind::RegionComment
+                        | SyntaxKind::Newline
+                        | SyntaxKind::NewlinePhys
+                        | SyntaxKind::Whitespace
+                ) =>
+            {
+                break;
+            }
+            NodeOrToken::Node(_) => break,
+            NodeOrToken::Token(_) => {}
+        }
+    }
+    None
 }
 
 fn lower_var(d: &ast::VarDecl) -> VarItem {

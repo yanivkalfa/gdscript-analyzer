@@ -1697,7 +1697,7 @@ impl Cx<'_> {
             Expr::Index { base, index } => {
                 let base_ty = self.infer_expr(base, &Expectation::None);
                 self.infer_expr(index, &Expectation::None);
-                self.index_ty(&base_ty)
+                self.index_ty(&base_ty, index)
             }
             Expr::Is { operand, .. } => {
                 self.infer_expr(operand, &Expectation::None);
@@ -1799,7 +1799,7 @@ impl Cx<'_> {
 
     fn literal_ty(&self, lit: Literal) -> Ty {
         match lit {
-            Literal::Int => self.int_ty(),
+            Literal::Int(_) => self.int_ty(),
             Literal::Float | Literal::MathConst => self.float_ty(),
             Literal::Bool(_) => self.bool_ty(),
             Literal::Str => self.builtin("String"),
@@ -2331,7 +2331,7 @@ impl Cx<'_> {
         if let Some(item) = self.class.lookup(name)
             && let Some(Member::Func(f)) = self.class.member(item)
         {
-            return Some(self.func_return_ty(f.return_type.as_deref()));
+            return Some(self.func_call_return_ty(f));
         }
         // A bare call inside the class is `self.name(...)` — resolve against the inherited base.
         if let Ty::Object(base) = self.class.base
@@ -2439,6 +2439,21 @@ impl Cx<'_> {
         })
     }
 
+    /// The return type of CALLING an own `func`: a `## @return-tuple(T0, T1, …)` doc-tag (BUG A3)
+    /// wins — its positional element types become a [`Ty::Tuple`], so a constant index projects
+    /// the element's real type — else the plain annotation.
+    fn func_call_return_ty(&self, f: &crate::item_tree::FuncItem) -> Ty {
+        if let Some(names) = &f.tuple_return {
+            return Ty::Tuple(
+                names
+                    .iter()
+                    .map(|n| resolve::resolve_type_name(self.db, self.api, n))
+                    .collect(),
+            );
+        }
+        self.func_return_ty(f.return_type.as_deref())
+    }
+
     /// Member access `receiver.name`. When `as_method`, resolve a method (and use its return
     /// type); otherwise resolve a property/const/etc. Raises `UNSAFE_*` only on a statically
     /// **known** receiver.
@@ -2481,9 +2496,13 @@ impl Cx<'_> {
                     Ty::Variant
                 }
             }
-            Ty::Builtin(_) | Ty::Array(_) | Ty::Dict(..) | Ty::Callable | Ty::Signal(_) => {
-                self.builtin_member_ty(&recv_ty, name, name_range, as_method)
-            }
+            // A tuple's members are its runtime `Array`'s (`size`/`append`/… via builtin_id_of).
+            Ty::Builtin(_)
+            | Ty::Array(_)
+            | Ty::Tuple(_)
+            | Ty::Dict(..)
+            | Ty::Callable
+            | Ty::Signal(_) => self.builtin_member_ty(&recv_ty, name, name_range, as_method),
             // Accessing a member of an enum namespace (`State.IDLE`) yields the enum type itself —
             // an enum value (freely int-assignable via `ty::is_assignable`). Was `int`, which lost
             // the enum type and false-`INFERENCE_ON_VARIANT`'d a same-file `var x := State.IDLE`.
@@ -2902,7 +2921,8 @@ impl Cx<'_> {
     fn builtin_id_of(&self, ty: &Ty) -> Option<gdscript_api::BuiltinId> {
         match ty {
             Ty::Builtin(b) => Some(*b),
-            Ty::Array(_) => self.api.builtin_by_name("Array"),
+            // A tuple IS an `Array` at runtime — its methods (`size`/`append`/…) are Array's.
+            Ty::Array(_) | Ty::Tuple(_) => self.api.builtin_by_name("Array"),
             Ty::Dict(..) => self.api.builtin_by_name("Dictionary"),
             Ty::Callable => self.api.builtin_by_name("Callable"),
             Ty::Signal(_) => self.api.builtin_by_name("Signal"),
@@ -2910,10 +2930,22 @@ impl Cx<'_> {
         }
     }
 
-    /// The element type of an indexing expression (Playbook §2 switch).
-    fn index_ty(&self, base: &Ty) -> Ty {
+    /// The element type of an indexing expression (Playbook §2 switch). `index` is the subscript
+    /// expression — a CONSTANT integer literal selects a [`Ty::Tuple`]'s positional element type
+    /// (BUG A3: `useState(...)[1]` is the setter `Callable`, not `Variant`).
+    fn index_ty(&self, base: &Ty, index: ExprId) -> Ty {
         match base {
             Ty::Array(elem) => (**elem).clone(),
+            // A tuple projects the element at a constant in-bounds index; a dynamic or
+            // out-of-bounds index degrades to the runtime element type (`Variant`), exactly like
+            // the untyped `Array` the tuple is at runtime.
+            Ty::Tuple(elems) => match self.body.expr(index) {
+                Expr::Literal(body::Literal::Int(Some(i))) => usize::try_from(*i)
+                    .ok()
+                    .and_then(|i| elems.get(i).cloned())
+                    .unwrap_or(Ty::Variant),
+                _ => Ty::Variant,
+            },
             Ty::Builtin(b) => self
                 .api
                 .builtin(*b)
@@ -2931,6 +2963,9 @@ impl Cx<'_> {
     fn loop_var_ty(&self, iter: &Ty) -> Ty {
         match iter {
             Ty::Array(elem) => (**elem).clone(),
+            // Iterating a tuple visits its runtime array's elements (`Variant` — positions are
+            // meaningless during iteration).
+            Ty::Tuple(_) => Ty::Variant,
             Ty::Builtin(b) => {
                 let data = self.api.builtin(*b);
                 if data.name == "int" {
@@ -3079,7 +3114,7 @@ impl Cx<'_> {
                 Some(Member::Const(c)) => self.field_ty(&c.name, c.ptr),
                 Some(Member::Func(f)) => {
                     if as_method {
-                        self.func_return_ty(f.return_type.as_deref())
+                        self.func_call_return_ty(f)
                     } else {
                         Ty::Callable
                     }
@@ -3368,6 +3403,103 @@ mod tests {
             .chain(fi.raw_warnings.iter().map(|w| w.code.as_str().to_owned()))
             .filter(|c| !DECLARATION_STRICTNESS.contains(&c.as_str()))
             .collect()
+    }
+
+    // ── BUG A3: `## @return-tuple(...)` → Ty::Tuple + constant-index projection ──────────────
+
+    const HOOK_DECL: &str =
+        "## @return-tuple(Variant, Callable)\nstatic func useState(v):\n\treturn [v, Callable()]\n";
+
+    #[test]
+    fn return_tuple_tag_projects_a_constant_index() {
+        // `useState(0)[1]` is the setter: a REAL `Callable`, so a typo'd method on it is caught
+        // (UNSAFE_METHOD_ACCESS on the Callable builtin) while the correct `.call` stays silent.
+        // Both direct indexing and an `:=`-inferred local carry the tuple.
+        let src = format!(
+            "{HOOK_DECL}func f():\n\tvar s := useState(0)\n\ts[1].call(1)\n\ts[1].casll(1)\n\tuseState(0)[1].casll(2)\n"
+        );
+        let c = file_codes(&src);
+        assert_eq!(
+            c.iter().filter(|x| *x == "UNSAFE_METHOD_ACCESS").count(),
+            2,
+            "exactly the two typo'd setter methods flag: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_untyped_local_stays_variant_by_godot_semantics() {
+        // An UNTYPED `var s = useState(0)` local is a `Variant` variable in GDScript (only `:=`
+        // infers) — Godot itself cannot check through it, and neither do we. Seeing through an
+        // untyped local would need assignment-carried flow narrowing (a Workstream-2 extension,
+        // documented follow-up), not a projection change.
+        let src =
+            format!("{HOOK_DECL}func f():\n\tvar s = useState(0)\n\ts[1].casll(1)\n\treturn s\n");
+        let c = file_codes(&src);
+        assert!(
+            !c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            "an untyped local is Variant — never checked: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_dynamic_or_oob_index_degrades_to_variant() {
+        // A dynamic index (or an out-of-bounds constant) cannot select a position — it degrades
+        // to the runtime element type (`Variant`), which never fires member checks.
+        let src = format!(
+            "{HOOK_DECL}func f(i: int):\n\tvar s := useState(0)\n\ts[i].casll(1)\n\ts[7].casll(1)\n"
+        );
+        let c = file_codes(&src);
+        assert!(
+            !c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            "no confident projection without a constant in-bounds index: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_widens_to_array_for_assignment_and_methods() {
+        // At runtime the tuple IS an untyped Array: it assigns to an `Array` slot without a
+        // mismatch, and Array methods (`size`) resolve on it.
+        let src = format!(
+            "{HOOK_DECL}func f():\n\tvar s := useState(0)\n\tvar a: Array = s\n\treturn [a, s.size()]\n"
+        );
+        let c = file_codes(&src);
+        assert!(
+            !c.iter()
+                .any(|x| x == TYPE_MISMATCH || x == "UNSAFE_METHOD_ACCESS"),
+            "a tuple behaves as its runtime Array: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_resolves_cross_file_via_the_member_table() {
+        // The guitkx shape once the virtual doc emits field calls: `Hooks.useState(...)` in ONE
+        // file, the tagged hook in ANOTHER — the tuple flows through the script member table.
+        let files = [
+            (
+                "res://main.gd",
+                "func f():\n\tvar s := Hooks.useState(0)\n\ts[1].casll(1)\n",
+            ),
+            (
+                "res://hooks.gd",
+                "class_name Hooks\n## @return-tuple(Variant, Callable)\nstatic func useState(v):\n\treturn [v, Callable()]\n",
+            ),
+        ];
+        let c = project_codes(&files, None, true);
+        assert!(
+            c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            "the typo'd setter method must flag cross-file: {c:?}"
+        );
+    }
+
+    #[test]
+    fn return_tuple_tag_is_ignored_when_malformed() {
+        // One name is not a tuple; the tag degrades to the plain (annotationless) return.
+        let src = "## @return-tuple(Variant)\nstatic func one(v):\n\treturn [v]\nfunc f():\n\tvar s = one(0)\n\ts[0].casll(1)\n";
+        let c = file_codes(src);
+        assert!(
+            !c.iter().any(|x| x == "UNSAFE_METHOD_ACCESS"),
+            "a malformed tag must not project: {c:?}"
+        );
     }
 
     // ── BUG A1: UNDEFINED_FUNCTION / UNDEFINED_IDENTIFIER (complete-workspace gated) ─────────

@@ -29,8 +29,9 @@ pub type Block = Vec<StmtId>;
 /// A literal's kind (the value text lives in the CST; only the kind drives typing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Literal {
-    /// An integer literal.
-    Int,
+    /// An integer literal, carrying its parsed value when it fits (`None` for an overflow) —
+    /// a CONSTANT index selects a [`crate::ty::Ty::Tuple`] element's positional type (BUG A3).
+    Int(Option<i64>),
     /// A float literal.
     Float,
     /// `true` / `false` (carries the value, for constant checks like `ASSERT_ALWAYS_*`).
@@ -975,7 +976,9 @@ fn type_ref_ptr(node: &GdNode) -> Option<AstPtr> {
 fn literal_kind(node: &GdNode) -> Literal {
     use SyntaxKind as K;
     match cst::first_token(node).map(|t| t.kind()) {
-        Some(K::Int) => Literal::Int,
+        Some(K::Int) => {
+            Literal::Int(cst::first_token(node).and_then(|t| parse_int_literal(t.text())))
+        }
         Some(K::Float) => Literal::Float,
         Some(K::String) => Literal::Str,
         Some(K::StringName) => Literal::StringName,
@@ -984,6 +987,19 @@ fn literal_kind(node: &GdNode) -> Literal {
         Some(K::False) => Literal::Bool(false),
         Some(K::ConstPi | K::ConstTau | K::ConstInf | K::ConstNan) => Literal::MathConst,
         _ => Literal::Null,
+    }
+}
+
+/// Parse a GDScript integer literal (decimal / `0x` hex / `0b` binary, `_` separators allowed).
+/// `None` on overflow or a malformed token (the parser owns that diagnostic).
+fn parse_int_literal(text: &str) -> Option<i64> {
+    let t = text.replace('_', "");
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        i64::from_str_radix(bin, 2).ok()
+    } else {
+        t.parse().ok()
     }
 }
 

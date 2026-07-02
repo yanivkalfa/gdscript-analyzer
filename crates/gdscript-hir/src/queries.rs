@@ -308,7 +308,20 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
     for m in &tree.members {
         let Some(name) = m.name() else { continue };
         let sig = match m {
-            Member::Func(f) => MemberSig::Method(resolve_ann(f.return_type.as_deref())),
+            // A `## @return-tuple(T0, T1, …)` doc-tag (BUG A3) wins over the plain annotation:
+            // the method's call result is a `Ty::Tuple`, so a constant index on it projects the
+            // element's real type cross-file too (`Hooks.useState(...)[1]` → `Callable`).
+            Member::Func(f) => MemberSig::Method(f.tuple_return.as_ref().map_or_else(
+                || resolve_ann(f.return_type.as_deref()),
+                |names| {
+                    Ty::Tuple(
+                        names
+                            .iter()
+                            .map(|n| crate::resolve::resolve_type_name(db, api, n))
+                            .collect(),
+                    )
+                },
+            )),
             Member::Var(v) => MemberSig::Field(resolve_ann(v.type_ref.as_deref())),
             // `const X = preload("res://…")` (no annotation) resolves cross-file to the preloaded
             // script's `ScriptRef` (the SCRIPT meta-type) — the same resolution the declaring file does
