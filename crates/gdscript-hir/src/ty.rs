@@ -302,15 +302,30 @@ pub fn is_assignable(api: &EngineApi, from: &Ty, to: &Ty) -> Assign {
                 _ => Assign::No,
             }
         }
-        Ty::Enum(to_enum) => match from {
-            Ty::Enum(from_enum) if from_enum == to_enum => Assign::Ok,
-            // A *different* enum's value is an `int` at runtime: Godot wants a cast
-            // (`INT_AS_ENUM_WITHOUT_CAST`) — never a hard `TYPE_MISMATCH`.
-            Ty::Enum(_) => Assign::IntAsEnum,
-            // `int` → enum without a cast.
-            Ty::Builtin(id) if api.builtin(*id).name == "int" => Assign::IntAsEnum,
-            _ => Assign::No,
-        },
+        Ty::Enum(to_enum) => {
+            // A BITFIELD enum is int-friendly by design: real code OR-combines its flags
+            // (`size_flags_horizontal = SIZE_SHRINK_BEGIN | SIZE_EXPAND`, an `int` expression),
+            // and Godot's `INT_AS_ENUM_WITHOUT_CAST` applies to plain enums only.
+            if to_enum.bitfield {
+                return match from {
+                    Ty::Enum(_) => Assign::Ok,
+                    Ty::Builtin(id) if api.builtin(*id).name == "int" => Assign::Ok,
+                    _ => Assign::No,
+                };
+            }
+            match from {
+                // Same enum — compared by QUALIFIED NAME only: the `bitfield` flag is a
+                // representation detail different resolution paths may record differently, and
+                // it must never make an enum incompatible with itself.
+                Ty::Enum(from_enum) if from_enum.qualified == to_enum.qualified => Assign::Ok,
+                // A *different* enum's value is an `int` at runtime: Godot wants a cast
+                // (`INT_AS_ENUM_WITHOUT_CAST`) — never a hard `TYPE_MISMATCH`.
+                Ty::Enum(_) => Assign::IntAsEnum,
+                // `int` → enum without a cast.
+                Ty::Builtin(id) if api.builtin(*id).name == "int" => Assign::IntAsEnum,
+                _ => Assign::No,
+            }
+        }
         Ty::Object(to_class) => match from {
             Ty::Object(from_class) if api.is_subclass(*from_class, *to_class) => Assign::Ok,
             // Downcast (a base value into a derived slot): permitted with a runtime check —

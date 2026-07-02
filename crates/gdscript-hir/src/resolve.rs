@@ -257,6 +257,19 @@ fn resolve_class_name(db: &dyn Db, name: &str) -> Ty {
 
 // ---- type-annotation resolution ----------------------------------------------------------
 
+/// Resolve a `## @return-tuple(T0, T1, …)` doc-tag's element type names to a [`Ty::Tuple`] — the
+/// ONE mapping both the same-file call path (`infer::func_call_return_ty`) and the cross-file
+/// member table (`queries::script_class`) use, so the two can never diverge.
+#[must_use]
+pub fn resolve_tuple_return(db: &dyn Db, api: &EngineApi, names: &[SmolStr]) -> Ty {
+    Ty::Tuple(
+        names
+            .iter()
+            .map(|n| resolve_type_name(db, api, n))
+            .collect(),
+    )
+}
+
 /// Resolve a GDScript source type annotation (a `TypeRef` CST node) to a [`Ty`]. Handles
 /// `void`/`Variant`, builtins, engine classes, `Array`/`Array[T]`, `Dictionary`/
 /// `Dictionary[K, V]`, global enums, and `Class.Enum`; an unknown bare name is treated as a
@@ -357,6 +370,7 @@ pub fn layer_to_ty(api: &EngineApi, lt: LayerTy) -> Ty {
         LayerTy::Bool => builtin(api, "bool"),
         LayerTy::Str => builtin(api, "String"),
         LayerTy::Array => Ty::array_of_variant(),
+        LayerTy::Dictionary => Ty::dict_of_variant(),
         LayerTy::Color => builtin(api, "Color"),
         LayerTy::Variant => Ty::Variant,
         LayerTy::Unknown => Ty::Unknown,
@@ -522,10 +536,16 @@ pub fn resolve_global(api: &EngineApi, name: &str) -> Option<GlobalDef> {
     if api.global_enum(name).is_some() {
         return Some(GlobalDef::GlobalEnum);
     }
-    // A `@GlobalScope` enum VALUE used bare (`MOUSE_BUTTON_LEFT`, `OK`, `TYPE_STRING`, …) — a
-    // global `int` constant in GDScript. Last so it can never shadow a real class/type name.
-    if api.global_enum_value(name).is_some() {
-        return Some(GlobalDef::Const(layer_to_ty(api, LayerTy::Int)));
+    // A `@GlobalScope` enum VALUE used bare (`MOUSE_BUTTON_LEFT`, `OK`, `TYPE_STRING`, …). Typed
+    // as its DECLARING enum — the same `EnumRef` a `MouseButton` annotation resolves to (see
+    // `resolve_named` above) — so `var b: MouseButton = MOUSE_BUTTON_LEFT` is `Enum → Enum`
+    // (`Assign::Ok`), never a false `INT_AS_ENUM_WITHOUT_CAST`; an enum value stays freely
+    // `int`-assignable via `ty::is_assignable`. Last so it can never shadow a real type name.
+    if let Some((e, _)) = api.global_enum_value(name) {
+        return Some(GlobalDef::Const(Ty::Enum(EnumRef {
+            qualified: SmolStr::new(&e.name),
+            bitfield: e.is_bitfield,
+        })));
     }
     None
 }

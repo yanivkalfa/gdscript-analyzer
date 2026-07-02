@@ -313,14 +313,7 @@ pub fn script_class(db: &dyn Db, file: FileText) -> Arc<ScriptClass> {
             // element's real type cross-file too (`Hooks.useState(...)[1]` → `Callable`).
             Member::Func(f) => MemberSig::Method(f.tuple_return.as_ref().map_or_else(
                 || resolve_ann(f.return_type.as_deref()),
-                |names| {
-                    Ty::Tuple(
-                        names
-                            .iter()
-                            .map(|n| crate::resolve::resolve_type_name(db, api, n))
-                            .collect(),
-                    )
-                },
+                |names| crate::resolve::resolve_tuple_return(db, api, names),
             )),
             Member::Var(v) => MemberSig::Field(resolve_ann(v.type_ref.as_deref())),
             // `const X = preload("res://…")` (no annotation) resolves cross-file to the preloaded

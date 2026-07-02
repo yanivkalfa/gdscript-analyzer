@@ -2194,13 +2194,14 @@ impl Cx<'_> {
                 // Locals first (BUG A2), matching `resolve_name`'s canonical local→member→… order:
                 // a bare-name call on a local/param (`var f = func(): …` then `f(0)`, a
                 // `cb: Callable` param, a hook alias `var useState = Hooks.useState`) is a READ of
-                // that binding — record it for `UNUSED_*`, which only the value-read path used to
-                // do, so a binding that was only ever *called* fired a false UNUSED. The local also
-                // shadows a same-named own/inherited method (real GDScript scoping). Its call
-                // result is the seam: `Ty::Callable` carries no signature, and `Variant` here
-                // would fire false `INFERENCE_ON_VARIANT` on `var x := f()`.
+                // that binding — routed through `resolve_name` so it gets the FULL read treatment
+                // (`used_locals` for `UNUSED_*`, the `UNASSIGNED_VARIABLE` definite-assignment
+                // check, flow narrowing), not just a use mark. The local also shadows a same-named
+                // own/inherited method (real GDScript scoping). Its call result is the seam:
+                // `Ty::Callable` carries no signature, and `Variant` here would fire false
+                // `INFERENCE_ON_VARIANT` on `var x := f()`.
                 let ret = if self.locals.contains_key(name.as_str()) {
-                    self.used_locals.insert(name.clone());
+                    self.resolve_name(callee, &name);
                     Ty::Unknown
                 } else if let Some(t) = self.resolve_call_name(&name) {
                     t
@@ -2424,6 +2425,12 @@ impl Cx<'_> {
         if !self.undefined_symbols_provable() {
             return;
         }
+        // A REGISTERED autoload can still resolve to the seam (`resolve_autoload` deliberately
+        // yields `Unknown` for a scene-backed singleton — `Music="*res://music.tscn"` — whose
+        // root-script type we can't see): registry presence means DEFINED, so never warn.
+        if is_autoload_singleton(self.db, name) {
+            return;
+        }
         self.warn(
             self.name_token_range(id, name),
             WarningCode::UndefinedIdentifier,
@@ -2444,12 +2451,7 @@ impl Cx<'_> {
     /// the element's real type — else the plain annotation.
     fn func_call_return_ty(&self, f: &crate::item_tree::FuncItem) -> Ty {
         if let Some(names) = &f.tuple_return {
-            return Ty::Tuple(
-                names
-                    .iter()
-                    .map(|n| resolve::resolve_type_name(self.db, self.api, n))
-                    .collect(),
-            );
+            return resolve::resolve_tuple_return(self.db, self.api, names);
         }
         self.func_return_ty(f.return_type.as_deref())
     }
@@ -2484,12 +2486,12 @@ impl Cx<'_> {
                     // e.g. GDScript, also carry a modeled `new` member — the constructor wins).
                     recv_ty.clone()
                 } else if let Some(m) = self.api.lookup_member(*class, name) {
+                    // `lookup_member` also resolves enum VALUES (`Control.PRESET_FULL_RECT` →
+                    // `MemberRef::EnumValue`, typed as its enum by `member_ref_ty`) — the single
+                    // source of truth for that rule.
                     self.check_member_kind_misuse(&m, as_method, name, name_range);
                     self.check_static_on_instance(receiver, &m, as_method, name_range);
                     self.member_ref_ty(&m, as_method)
-                } else if let Some(t) = self.class_enum_value(*class, name) {
-                    // A statically-accessed enum value (`Control.PRESET_FULL_RECT`).
-                    t
                 } else {
                     // Self with an Object base already checked own members above.
                     self.emit_unsafe(name, &recv_ty, name_range, as_method);
@@ -2829,14 +2831,14 @@ impl Cx<'_> {
                     Ty::Callable
                 }
             }
+            // An enum-typed property resolves its qualified enum name through the SAME resolver
+            // annotations use (`resolve_type_name` handles both `Enum` and `Class.Enum`), so the
+            // real `is_bitfield` is recovered — a hardcoded `bitfield: false` made
+            // `size_flags_horizontal = SIZE_EXPAND_FILL` look like two DIFFERENT enums and
+            // false-fired `INT_AS_ENUM_WITHOUT_CAST` on the same-enum assignment.
             MemberRef::Property(p) => p.enum_of.as_ref().map_or_else(
                 || ty::resolve_tyref(self.api, &p.ty),
-                |q| {
-                    Ty::Enum(EnumRef {
-                        qualified: SmolStr::new(q),
-                        bitfield: false,
-                    })
-                },
+                |q| resolve::resolve_type_name(self.db, self.api, q),
             ),
             MemberRef::Const(c) => ty::resolve_tyref(self.api, &c.ty),
             MemberRef::Signal(_) => Ty::Signal(None),
@@ -2892,31 +2894,6 @@ impl Cx<'_> {
         Ty::Variant
     }
 
-    /// The type of a class enum **value** accessed statically (`Control.PRESET_FULL_RECT`):
-    /// the engine exposes enum values as class members, so search every (inherited) enum's
-    /// values. Returns the value's **declaring enum type** (`Ty::Enum`) — mirroring how a
-    /// `Class.Enum` *annotation* resolves (`resolve::resolve_named`), so an enum member assigned
-    /// to a slot of that same enum is `Assign::Ok`, not a false `INT_AS_ENUM_WITHOUT_CAST`. (An
-    /// enum value is still freely assignable to `int` — see `ty::is_assignable`.)
-    fn class_enum_value(&self, class: gdscript_api::ClassId, name: &str) -> Option<Ty> {
-        let mut cur = Some(class);
-        while let Some(cid) = cur {
-            let c = self.api.class(cid);
-            if let Some(e) = c
-                .enums
-                .iter()
-                .find(|e| e.values.iter().any(|v| v.name == name))
-            {
-                return Some(Ty::Enum(EnumRef {
-                    qualified: SmolStr::new(format!("{}.{}", c.name, e.name)),
-                    bitfield: e.is_bitfield,
-                }));
-            }
-            cur = c.base;
-        }
-        None
-    }
-
     /// The builtin id backing a builtin / `Array` / `Dictionary` receiver.
     fn builtin_id_of(&self, ty: &Ty) -> Option<gdscript_api::BuiltinId> {
         match ty {
@@ -2959,13 +2936,12 @@ impl Cx<'_> {
         }
     }
 
-    /// The loop variable's type for `for v in iter:` (Playbook §2 switch).
+    /// The loop variable's type for `for v in iter:` (Playbook §2 switch). Iterating a
+    /// [`Ty::Tuple`] visits its runtime array's elements (`Variant` — positions are meaningless
+    /// during iteration), which is the wildcard arm below.
     fn loop_var_ty(&self, iter: &Ty) -> Ty {
         match iter {
             Ty::Array(elem) => (**elem).clone(),
-            // Iterating a tuple visits its runtime array's elements (`Variant` — positions are
-            // meaningless during iteration).
-            Ty::Tuple(_) => Ty::Variant,
             Ty::Builtin(b) => {
                 let data = self.api.builtin(*b);
                 if data.name == "int" {
@@ -3403,6 +3379,80 @@ mod tests {
             .chain(fi.raw_warnings.iter().map(|w| w.code.as_str().to_owned()))
             .filter(|c| !DECLARATION_STRICTNESS.contains(&c.as_str()))
             .collect()
+    }
+
+    // ── Review-pass regressions (branch fix/guitkx-diagnostic-gaps) ──────────────────────────
+
+    #[test]
+    fn bare_global_enum_value_types_as_its_enum_not_int() {
+        // `MOUSE_BUTTON_LEFT` is a `MouseButton` value: assigning it to a `MouseButton` slot is
+        // Enum→Enum (Ok) — the int typing regression fired a false INT_AS_ENUM_WITHOUT_CAST on
+        // code Godot accepts.
+        let h =
+            infer_first_func("func f():\n\tvar b: MouseButton = MOUSE_BUTTON_LEFT\n\treturn b\n");
+        assert!(
+            !codes(&h).contains(&"INT_AS_ENUM_WITHOUT_CAST"),
+            "{:?}",
+            h.result.diagnostics
+        );
+    }
+
+    #[test]
+    fn gdscript_builtin_surface_is_complete_no_undefined_function() {
+        // The full @GDScript pseudo-class surface must resolve — `print_debug` etc. are absent
+        // from every extracted table, and an uncovered one false-flags as an ERROR-severity
+        // UNDEFINED_FUNCTION in a complete workspace.
+        let src = "func f():\n\tprint_debug(\"x\")\n\tprint_stack()\n\tvar st = get_stack()\n\tvar o = ord(\"a\")\n\tvar c = convert(1, TYPE_STRING)\n\tvar t = type_exists(\"Node\")\n\tvar d = inst_to_dict(self)\n\tvar i = dict_to_inst(d)\n\treturn [st, o, c, t, d, i]\n";
+        let c = project_codes(&[("res://main.gd", src)], None, true);
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "every @GDScript builtin must resolve: {c:?}"
+        );
+    }
+
+    #[test]
+    fn scene_autoload_singleton_is_never_undefined() {
+        // A REGISTERED `*`-autoload backed by a .tscn resolves to the seam (its root script is
+        // invisible) — registry presence means DEFINED, so the identifier must not flag.
+        let c = project_codes(
+            &[("res://main.gd", "func f():\n\treturn Music\n")],
+            Some("[autoload]\nMusic=\"*res://music.tscn\"\n"),
+            true,
+        );
+        assert!(
+            !c.iter().any(|x| x.starts_with("UNDEFINED_")),
+            "a registered scene autoload is defined: {c:?}"
+        );
+    }
+
+    #[test]
+    fn calling_an_unassigned_local_callable_still_flags_unassigned() {
+        // The locals-first CALL branch routes through resolve_name, so the definite-assignment
+        // check fires for a call-before-assignment exactly like a read-before-assignment.
+        let h = infer_first_func(
+            "func f():\n\tvar cb: Callable\n\tcb.call()\n\tvar g: Callable\n\tg = Callable()\n\tg.call()\n",
+        );
+        // (cb is read via the receiver path; keep this focused on the bare-call form:)
+        let h2 = infer_first_func("func f():\n\tvar cb: Callable\n\tcb()\n\tcb = Callable()\n");
+        assert!(
+            codes(&h2).contains(&"UNASSIGNED_VARIABLE"),
+            "a bare call reads the local before assignment: {:?} / {:?}",
+            codes(&h),
+            codes(&h2)
+        );
+    }
+
+    #[test]
+    fn over_indent_recovered_statements_are_still_analyzed() {
+        // The recovery Block's statements flatten into the function scope (GDScript locals are
+        // function-scoped): the over-indented `5 / 2` must still produce INTEGER_DIVISION.
+        let src =
+            "func f():\n\tvar a = 1\n\t\tvar bad = 5 / 2\n\tvar b = 2\n\treturn [a, b, bad]\n";
+        let c = file_codes(src);
+        assert!(
+            c.iter().any(|x| x == INTEGER_DIVISION),
+            "recovered statements must be analyzed: {c:?}"
+        );
     }
 
     // ── BUG A3: `## @return-tuple(...)` → Ty::Tuple + constant-index projection ──────────────

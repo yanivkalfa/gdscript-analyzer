@@ -229,6 +229,17 @@ impl EngineApi {
                 if seen.insert(&e.name) {
                     out.push(MemberRef::Enum(e));
                 }
+                // Enum VALUES are addressable on the class too (`Control.SIZE_EXPAND_FILL`) —
+                // offer them in the same candidate set `lookup_member` resolves them from.
+                for v in &e.values {
+                    if seen.insert(&v.name) {
+                        out.push(MemberRef::EnumValue {
+                            class: &c.name,
+                            decl: e,
+                            value: v,
+                        });
+                    }
+                }
             }
             cur = c.base;
         }

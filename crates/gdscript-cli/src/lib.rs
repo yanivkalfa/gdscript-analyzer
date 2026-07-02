@@ -136,7 +136,8 @@ fn run_diagnostics(
 
 /// `symbols`: dump each file's document outline as JSON (always — it's a data command).
 fn run_symbols(paths: &PathsArg, g: &GlobalArgs) -> anyhow::Result<i32> {
-    let project = Project::load(&paths.paths);
+    // Document symbols are a per-file outline — no cross-file analysis, no context walk.
+    let project = Project::load_shallow(&paths.paths);
     print_load_errors(&project);
     let results = project.symbols();
     let mut w = open_writer(g)?;
@@ -148,7 +149,8 @@ fn run_symbols(paths: &PathsArg, g: &GlobalArgs) -> anyhow::Result<i32> {
 /// `format`: normalize each file via [`gdscript_fmt`]. Default streams to stdout; `--check` reports
 /// + exits 1 on any change; `--write` rewrites changed files in place.
 fn run_format(args: &FormatArgs, g: &GlobalArgs) -> i32 {
-    let project = Project::load(&args.paths.paths);
+    // Formatting is purely per-file textual — no cross-file analysis, so no project context walk.
+    let project = Project::load_shallow(&args.paths.paths);
     print_load_errors(&project);
     let cfg = gdscript_fmt::FmtConfig::default();
 

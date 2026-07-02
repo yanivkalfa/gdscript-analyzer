@@ -527,10 +527,9 @@ impl Parser<'_> {
                 }
                 Eof => break,
                 Newline | Semicolon => self.advance(),
+                // stmt() always consumes at least one token (resilient-parser invariant), so the
+                // loop provably progresses; the `Eof` arm is the only exit needed at end-of-file.
                 _ => self.stmt(),
-            }
-            if self.eof() {
-                break;
             }
         }
         self.close(m, Block);

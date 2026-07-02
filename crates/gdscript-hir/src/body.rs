@@ -835,10 +835,24 @@ impl Lowerer {
     }
 
     fn lower_block(&mut self, block: &GdNode) -> Block {
-        block
-            .children()
-            .filter_map(|c| self.lower_stmt(c))
-            .collect()
+        let mut out = Block::default();
+        self.lower_block_into(block, &mut out);
+        out
+    }
+
+    /// Lower a block's statements into `out`, FLATTENING any nested bare `Block` child — the
+    /// parser's over-indent recovery wraps a run of over-indented statements in one (see
+    /// `grammar.rs over_indented_region`), and GDScript locals are function-scoped (not
+    /// block-scoped), so its statements belong to the same scope and must be analyzed like any
+    /// sibling — not silently dropped by `lower_stmt`'s declaration fallthrough.
+    fn lower_block_into(&mut self, block: &GdNode, out: &mut Block) {
+        for c in block.children() {
+            if c.kind() == SyntaxKind::Block {
+                self.lower_block_into(c, out);
+            } else if let Some(s) = self.lower_stmt(c) {
+                out.push(s);
+            }
+        }
     }
 
     fn lower_stmt(&mut self, node: &GdNode) -> Option<StmtId> {

@@ -310,41 +310,14 @@ fn doc_tuple_return(node: &GdNode) -> Option<Vec<SmolStr>> {
     for el in node.children_with_tokens() {
         match el {
             NodeOrToken::Token(t) if t.kind() == SyntaxKind::DocComment => {
-                let text = t.text();
-                let Some(at) = text.find("@return-tuple(") else {
-                    continue;
-                };
-                let rest = &text[at + "@return-tuple(".len()..];
-                let inner = &rest[..rest.find(')')?];
-                let names: Vec<SmolStr> = inner
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(SmolStr::new)
-                    .collect();
-                if names.len() >= 2
-                    && names.iter().all(|n| {
-                        n.chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-                    })
-                {
+                if let Some(names) = parse_return_tuple_tag(t.text()) {
                     return Some(names);
                 }
             }
             // Leading trivia ends at the first real token/node (`static`/`func`/annotations).
-            // `NewlinePhys` is the RETAINED physical newline (the zero-width `Newline` is the
-            // synthetic structural token); both are trivia here.
-            NodeOrToken::Token(t)
-                if !matches!(
-                    t.kind(),
-                    SyntaxKind::DocComment
-                        | SyntaxKind::LineComment
-                        | SyntaxKind::RegionComment
-                        | SyntaxKind::Newline
-                        | SyntaxKind::NewlinePhys
-                        | SyntaxKind::Whitespace
-                ) =>
-            {
+            // `is_trivia` covers the retained trivia (whitespace, comments, `NewlinePhys`, …);
+            // the zero-width synthetic `Newline` is structural but equally skippable here.
+            NodeOrToken::Token(t) if !t.kind().is_trivia() && t.kind() != SyntaxKind::Newline => {
                 break;
             }
             NodeOrToken::Node(_) => break,
@@ -352,6 +325,27 @@ fn doc_tuple_return(node: &GdNode) -> Option<Vec<SmolStr>> {
         }
     }
     None
+}
+
+/// The `(T0, T1, …)` names of one doc line's `@return-tuple(...)` tag, or `None` when the line
+/// carries no well-formed tag (a malformed line never aborts the scan of later doc lines).
+fn parse_return_tuple_tag(text: &str) -> Option<Vec<SmolStr>> {
+    let at = text.find("@return-tuple(")?;
+    let rest = &text[at + "@return-tuple(".len()..];
+    let inner = &rest[..rest.find(')')?];
+    let names: Vec<SmolStr> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(SmolStr::new)
+        .collect();
+    // At least two comma-separated type names — a "tuple" of fewer carries no positional info.
+    (names.len() >= 2
+        && names.iter().all(|n| {
+            n.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        }))
+    .then_some(names)
 }
 
 fn lower_var(d: &ast::VarDecl) -> VarItem {

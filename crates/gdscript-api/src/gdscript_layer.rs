@@ -22,6 +22,8 @@ pub enum LayerTy {
     Str,
     /// Bare `Array` (`Array[Variant]`).
     Array,
+    /// Bare `Dictionary`.
+    Dictionary,
     /// `Color`.
     Color,
     /// The dynamic `Variant` top type.
@@ -84,7 +86,7 @@ pub fn global_consts() -> Vec<GlobalConst> {
 /// it; these are the ones inference and completion rely on in Phase 2.
 #[must_use]
 pub fn builtin_fns() -> Vec<BuiltinFn> {
-    use LayerTy::{Array, Bool, Color, Int, Str, Unknown, Void};
+    use LayerTy::{Array, Bool, Color, Dictionary, Int, Str, Unknown, Variant, Void};
     vec![
         // Two `@GlobalScope` utility functions the extracted blob omits (the extraction filtered
         // them; they are real bare globals — the corpus calls both). Hand-authored here, exactly
@@ -99,6 +101,57 @@ pub fn builtin_fns() -> Vec<BuiltinFn> {
             name: "is_instance_of",
             min_args: 2,
             max_args: Some(2),
+            ret: Bool,
+        },
+        // The REST of the `@GDScript` pseudo-class surface (vendor .../doc/classes/@GDScript.xml
+        // lists 15 methods; these complete the set). They exist in no extracted table — with the
+        // A1 `UNDEFINED_FUNCTION` armed, an uncovered one false-flags common code (`print_debug`).
+        BuiltinFn {
+            name: "convert",
+            min_args: 2,
+            max_args: Some(2),
+            ret: Variant,
+        },
+        BuiltinFn {
+            name: "dict_to_inst",
+            min_args: 1,
+            max_args: Some(1),
+            ret: Variant,
+        },
+        BuiltinFn {
+            name: "get_stack",
+            min_args: 0,
+            max_args: Some(0),
+            ret: Array,
+        },
+        BuiltinFn {
+            name: "inst_to_dict",
+            min_args: 1,
+            max_args: Some(1),
+            ret: Dictionary,
+        },
+        BuiltinFn {
+            name: "ord",
+            min_args: 1,
+            max_args: Some(1),
+            ret: Int,
+        },
+        BuiltinFn {
+            name: "print_debug",
+            min_args: 0,
+            max_args: None,
+            ret: Void,
+        },
+        BuiltinFn {
+            name: "print_stack",
+            min_args: 0,
+            max_args: Some(0),
+            ret: Void,
+        },
+        BuiltinFn {
+            name: "type_exists",
+            min_args: 1,
+            max_args: Some(1),
             ret: Bool,
         },
         // `preload(path)` resolves to a script/resource — opaque in Phase 2 (the seam).

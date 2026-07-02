@@ -25,12 +25,19 @@ struct Located<'a> {
 fn flatten<'a>(results: &'a [FileDiagnostics<'a>]) -> Vec<Located<'a>> {
     let mut out = Vec::new();
     for fd in results {
+        // Diagnostics are only produced for TARGET files, which always carry a line index
+        // (context files never reach a reporter).
+        let li = fd
+            .file
+            .line_index
+            .as_ref()
+            .expect("reported files are targets and carry a line index");
         for diag in &fd.diagnostics {
             out.push(Located {
                 file: fd.file,
                 diag,
-                start: fd.file.line_index.line_col(&fd.file.text, diag.range.start),
-                end: fd.file.line_index.line_col(&fd.file.text, diag.range.end),
+                start: li.line_col(&fd.file.text, diag.range.start),
+                end: li.line_col(&fd.file.text, diag.range.end),
             });
         }
     }
@@ -304,7 +311,7 @@ mod tests {
         SourceFile {
             id: FileId(0),
             display: display.into(),
-            line_index: LineIndex::new(text),
+            line_index: Some(LineIndex::new(text)),
             text: text.into(),
             path: None,
             is_target: true,
