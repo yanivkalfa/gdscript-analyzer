@@ -75,18 +75,23 @@ one branch with per-bug commits. Kept here as the record + the follow-ups they s
 
 **Follow-ups surfaced by the work (open):**
 
-- [ ] **Assignment-carried flow narrowing for untyped locals.** `var s = useState(0)` is a `Variant`
-      VARIABLE by GDScript semantics (only `:=` infers), so the tuple doesn't project through it —
-      Godot can't check through it either, but the flow framework (Workstream 2) could carry the
-      RHS's inferred type as a narrowing fact (widen-only value-add, same class as `is`-narrowing).
-      Needed for the guitkx `.casll` end-to-end with verbatim user code (which writes `var s = …`).
+- [x] **Assignment-carried flow narrowing for untyped locals — DONE (0.5.4, the sound subset).**
+      Landed as **initializer narrowing** (ADR-0007): an untyped local that is effectively
+      single-assignment (never rebound / index-stored anywhere in the body, lambda bodies included)
+      takes its initializer's inferred type as the binding type — no flow⇄inference fixpoint
+      needed. `var s = useState(0)` + `s[1].casll(1)` now errors end-to-end. The REMAINING piece
+      (re-narrowing after rebinds, `x = other` → typeof(other)) still needs the fixpoint and stays
+      post-1.0 (see the Stage-5 assessment below).
 - [ ] **A4 parity for the remaining `while !self.at(Dedent)` blocks**: `property_body`, `match_stmt`
       arms, inner-class `members(&[Dedent])` — an over-indented line there still cascades (low
       real-world incidence).
-- [ ] **Closed-builtin receiver misses: severity parity study.** `c.casll()` on a `Callable` (a
-      CLOSED builtin type) is arguably a hard compile error in Godot, but we emit the opt-in
-      `UNSAFE_METHOD_ACCESS` — silent under project defaults. Promoting builtin-receiver misses to a
-      hard diagnostic needs its own corpus study (Object receivers must STAY opt-in — Godot parity).
+- [x] **Closed-builtin receiver misses: severity parity study — DONE (0.5.4).** Probed on Godot
+      4.7: builtin member misses ARE hard compile errors (methods + properties, typed + `:=`),
+      Dictionary property access is keyed sugar (silent for any name, reads and writes),
+      Object/script receivers silent. Landed as `UNDEFINED_METHOD` / `UNDEFINED_PROPERTY` (ERROR
+      default, no completeness claim — the tables are bundled and closed; newer-engine projects
+      fall back to `UNSAFE_*`). Corpus study: 111 first-run FPs, all the Dictionary-sugar shape,
+      driven to 0 at the root (ADR-0008).
 - [ ] **guitkx (ReactiveUI-Godot) side for the tuple e2e**: the virtual doc must emit hook calls as
       `Hooks.useState(...)` field-calls (its `var useState = Hooks.useState` alias loses the
       signature — locals carry no return type), plus the `## @return-tuple` tags in `core/hooks.gd`.

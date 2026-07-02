@@ -26,3 +26,5 @@
   - [ADR-0004: Lightweight RFC process + graduation trigger](adr/0004-rfc-graduation-trigger.md)
   - [ADR-0005: Absence diagnostics gate on loader-asserted completeness](adr/0005-absence-diagnostics-completeness-gate.md)
   - [ADR-0006: `@return-tuple` doc-tag + synthesized `Ty::Tuple`](adr/0006-return-tuple-doc-tag.md)
+  - [ADR-0007: Initializer narrowing for untyped locals](adr/0007-initializer-narrowing.md)
+  - [ADR-0008: Built-in member misses are errors](adr/0008-builtin-member-miss-errors.md)

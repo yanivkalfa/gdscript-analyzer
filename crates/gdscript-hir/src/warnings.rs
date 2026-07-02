@@ -139,6 +139,14 @@ pub enum WarningCode {
     UndefinedFunction,
     /// A bare identifier that resolves to nothing anywhere.
     UndefinedIdentifier,
+    /// A method call on a BUILT-IN receiver (`Callable`, `String`, `Vector2`, …) whose method does
+    /// not exist. Builtin member tables are closed and bundled, so — unlike `Object` receivers,
+    /// where a script can attach methods at runtime — this needs NO workspace-completeness claim:
+    /// Godot itself reports it as a compile error (`Function "casll()" not found in base Callable`).
+    UndefinedMethod,
+    /// A property/constant access on a BUILT-IN receiver that does not exist (`v.zzz` on a
+    /// `Vector2`). Same closed-table reasoning as [`Self::UndefinedMethod`].
+    UndefinedProperty,
 }
 
 /// Godot's `WarnLevel` (`gdscript_warning.h`): the resolved severity of a code.
@@ -241,6 +249,8 @@ impl WarningCode {
         Self::OnreadyWithExport,
         Self::UndefinedFunction,
         Self::UndefinedIdentifier,
+        Self::UndefinedMethod,
+        Self::UndefinedProperty,
     ];
 
     /// The stable serialized identity — what `Diagnostic.code` carries (e.g. `INTEGER_DIVISION`).
@@ -299,6 +309,8 @@ impl WarningCode {
             Self::OnreadyWithExport => "ONREADY_WITH_EXPORT",
             Self::UndefinedFunction => "UNDEFINED_FUNCTION",
             Self::UndefinedIdentifier => "UNDEFINED_IDENTIFIER",
+            Self::UndefinedMethod => "UNDEFINED_METHOD",
+            Self::UndefinedProperty => "UNDEFINED_PROPERTY",
         }
     }
 
@@ -404,6 +416,12 @@ impl WarningCode {
                 "An identifier is not declared anywhere in the loaded project (a compile error in Godot). \
                  Analyzer-specific code; fires only when the loader declared the workspace complete."
             }
+            Self::UndefinedMethod => {
+                "A method called on a built-in type does not exist on it (a compile error in Godot; the bundled built-in tables are closed, so no completeness claim is needed)."
+            }
+            Self::UndefinedProperty => {
+                "A property accessed on a built-in type does not exist on it (a compile error in Godot; the bundled built-in tables are closed, so no completeness claim is needed)."
+            }
         }
     }
 
@@ -428,7 +446,9 @@ impl WarningCode {
             | Self::GetNodeDefaultWithoutOnready
             | Self::OnreadyWithExport
             | Self::UndefinedFunction
-            | Self::UndefinedIdentifier => WarnLevel::Error,
+            | Self::UndefinedIdentifier
+            | Self::UndefinedMethod
+            | Self::UndefinedProperty => WarnLevel::Error,
             // Everything else defaults to WARN.
             _ => WarnLevel::Warn,
         }
@@ -975,7 +995,7 @@ mod tests {
             assert_eq!(WarningCode::from_setting_name(&c.setting_name()), Some(c));
         }
         // The set is the catalog; a missed `ALL` entry shows up as a short count.
-        assert_eq!(seen.len(), 51);
+        assert_eq!(seen.len(), 53);
     }
 
     #[test]
